@@ -4,6 +4,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 )
 
 func TestBuildAuditObservabilityInsights(t *testing.T) {
+	t.Parallel()
 	processedRun := ProcessedRun{
 		Run: WorkflowRun{
 			Turns:          11,
@@ -24,9 +26,11 @@ func TestBuildAuditObservabilityInsights(t *testing.T) {
 		MCPFailures:  []MCPFailureReport{{ServerName: "github"}},
 		MissingData:  []MissingDataReport{{DataType: "issue_body"}},
 		FirewallAnalysis: &FirewallAnalysis{
-			TotalRequests:   20,
-			BlockedRequests: 8,
-			AllowedRequests: 12,
+			AnalysisBase: AnalysisBase{
+				TotalRequests:   20,
+				BlockedRequests: 8,
+				AllowedRequests: 12,
+			},
 		},
 		RedactedDomainsAnalysis: &RedactedDomainsAnalysis{TotalDomains: 3},
 	}
@@ -56,16 +60,17 @@ func TestBuildAuditObservabilityInsights(t *testing.T) {
 }
 
 func TestBuildLogsObservabilityInsights(t *testing.T) {
+	t.Parallel()
 	processedRuns := []ProcessedRun{
 		{
 			Run:              WorkflowRun{WorkflowName: "triage", Conclusion: "failure", Turns: 3, SafeItemsCount: 0},
 			MissingTools:     []MissingToolReport{{Tool: "terraform"}},
-			FirewallAnalysis: &FirewallAnalysis{TotalRequests: 10, BlockedRequests: 1},
+			FirewallAnalysis: &FirewallAnalysis{AnalysisBase: AnalysisBase{TotalRequests: 10, BlockedRequests: 1}},
 		},
 		{
 			Run:              WorkflowRun{WorkflowName: "triage", Conclusion: "failure", Turns: 9, SafeItemsCount: 1},
 			MCPFailures:      []MCPFailureReport{{ServerName: "github"}},
-			FirewallAnalysis: &FirewallAnalysis{TotalRequests: 10, BlockedRequests: 7},
+			FirewallAnalysis: &FirewallAnalysis{AnalysisBase: AnalysisBase{TotalRequests: 10, BlockedRequests: 7}},
 		},
 		{
 			Run: WorkflowRun{WorkflowName: "docs", Conclusion: "success", Turns: 2, SafeItemsCount: 1},
@@ -73,8 +78,8 @@ func TestBuildLogsObservabilityInsights(t *testing.T) {
 	}
 
 	toolUsage := []ToolUsageSummary{
-		{Name: "bash", TotalCalls: 14},
-		{Name: "github_issue_read", TotalCalls: 6},
+		{ToolUsageStatsBase: ToolUsageStatsBase{ToolName: "bash", CallCount: 14}},
+		{ToolUsageStatsBase: ToolUsageStatsBase{ToolName: "github_issue_read", CallCount: 6}},
 	}
 
 	insights := buildLogsObservabilityInsights(processedRuns, toolUsage)
@@ -95,14 +100,17 @@ func TestBuildLogsObservabilityInsights(t *testing.T) {
 }
 
 func TestBuildAuditObservabilityInsightsSuppressesHighSeverityAtFirewallCap(t *testing.T) {
+	t.Parallel()
 	// blocked == firewallBlockedRequestCap: the absolute-count trigger (>=10) should
 	// not elevate to "high" because the proxy may have truncated the real count.
 	processedRun := ProcessedRun{
 		Run: WorkflowRun{Turns: 3},
 		FirewallAnalysis: &FirewallAnalysis{
-			TotalRequests:   200,
-			BlockedRequests: firewallBlockedRequestCap, // 50 — at cap
-			AllowedRequests: 150,
+			AnalysisBase: AnalysisBase{
+				TotalRequests:   200,
+				BlockedRequests: firewallBlockedRequestCap, // 50 — at cap
+				AllowedRequests: 150,
+			},
 		},
 	}
 
@@ -120,13 +128,16 @@ func TestBuildAuditObservabilityInsightsSuppressesHighSeverityAtFirewallCap(t *t
 }
 
 func TestBuildAuditObservabilityInsightsHighSeverityWhenHighBlockRate(t *testing.T) {
+	t.Parallel()
 	// Even at cap, a >=50% block rate should still produce high severity.
 	processedRun := ProcessedRun{
 		Run: WorkflowRun{Turns: 3},
 		FirewallAnalysis: &FirewallAnalysis{
-			TotalRequests:   60,
-			BlockedRequests: firewallBlockedRequestCap, // 50 out of 60 → 83% block rate
-			AllowedRequests: 10,
+			AnalysisBase: AnalysisBase{
+				TotalRequests:   60,
+				BlockedRequests: firewallBlockedRequestCap, // 50 out of 60 → 83% block rate
+				AllowedRequests: 10,
+			},
 		},
 	}
 
@@ -144,15 +155,18 @@ func TestBuildAuditObservabilityInsightsHighSeverityWhenHighBlockRate(t *testing
 }
 
 func TestBuildLogsObservabilityInsightsSuppressesHighSeverityAtFirewallCap(t *testing.T) {
+	t.Parallel()
 	// A workflow with blocked == firewallBlockedRequestCap and a low block rate
 	// should produce a "medium" network hotspot, not "high".
 	processedRuns := []ProcessedRun{
 		{
 			Run: WorkflowRun{WorkflowName: "w1", Conclusion: "success", Turns: 5},
 			FirewallAnalysis: &FirewallAnalysis{
-				TotalRequests:   500,
-				BlockedRequests: firewallBlockedRequestCap, // 50/500 = 10% → low rate but >=10
-				AllowedRequests: 450,
+				AnalysisBase: AnalysisBase{
+					TotalRequests:   500,
+					BlockedRequests: firewallBlockedRequestCap, // 50/500 = 10% → low rate but >=10
+					AllowedRequests: 450,
+				},
 			},
 		},
 	}
@@ -171,6 +185,7 @@ func TestBuildLogsObservabilityInsightsSuppressesHighSeverityAtFirewallCap(t *te
 }
 
 func TestBuildAuditDataIncludesObservabilityInsights(t *testing.T) {
+	t.Parallel()
 	processedRun := ProcessedRun{
 		Run: WorkflowRun{
 			DatabaseID:     42,
@@ -193,12 +208,13 @@ func TestBuildAuditDataIncludesObservabilityInsights(t *testing.T) {
 		},
 	}
 
-	auditData := buildAuditData(processedRun, metrics, nil)
+	auditData := buildAuditData(context.Background(), processedRun, metrics, nil)
 	require.NotEmpty(t, auditData.ObservabilityInsights, "audit data should expose observability insights")
 	assert.Equal(t, "execution", auditData.ObservabilityInsights[0].Category)
 }
 
 func TestRenderObservabilityInsightsUsesConsoleFormatting(t *testing.T) {
+	t.Parallel()
 	var output bytes.Buffer
 
 	renderObservabilityInsightsTo(&output, []ObservabilityInsight{

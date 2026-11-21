@@ -14,9 +14,11 @@ permissions:
   contents: read
   pull-requests: read
   issues: read
+  copilot-requests: write
+model: router/economy
 engine:
   id: codex
-  model: gpt-5.4
+  model-provider: github
 strict: true
 safe-outputs:
   push-to-pull-request-branch:
@@ -43,6 +45,8 @@ network:
     - go
 tools:
   cli-proxy: true
+  github:
+    mode: local
   bash:
     - "*"
   edit:
@@ -52,9 +56,13 @@ imports:
 
 
   - shared/otlp.md
-sandbox:
-  agent:
-    sudo: false
+  - shared/graders.md
+evals:
+  - id: changeset-created
+    question: Did the agent create a valid changeset file for the labeled pull request?
+  - id: content-accurate
+    question: Does the changeset accurately summarize the changes described in the pull request?
+
 ---
 
 # Changeset Generator

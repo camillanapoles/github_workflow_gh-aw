@@ -24,8 +24,7 @@ jobs:
 `
 
 	b.ReportAllocs()
-	//nolint:intrange // Use the standard testing.B loop form for broad tool compatibility.
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if err := compiler.validateTemplateInjection(yamlContent, "", "", nil); err != nil {
 			b.Fatalf("validateTemplateInjection() error = %v", err)
 		}
@@ -54,8 +53,8 @@ jobs:
 	b.ResetTimer()
 	b.ReportAllocs()
 	for b.Loop() {
-		if err := validateNoGitHubExpressionsInRunScriptsFromParsed(parsed); err != nil {
-			b.Fatalf("validateNoGitHubExpressionsInRunScriptsFromParsed() error = %v", err)
+		if err := validateRunScriptExpressions(parsed, true); err != nil {
+			b.Fatalf("validateRunScriptExpressions(, true) error = %v", err)
 		}
 	}
 }

@@ -3,14 +3,17 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { createRequire } from "node:module";
+import { buildSafeOutputExecutions } from "./safe_output_execution.cjs";
+import { VERSION } from "./safe_output_authorization.cjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const { withSafeOutputInvocation } = createRequire(import.meta.url)("./safe_output_execution.cjs");
 
-// Paths match what upload_artifact.cjs computes at runtime.
-// When RUNNER_TEMP is unset (test default), STAGING_DIR falls back to /tmp/gh-aw/.
-const STAGING_DIR = "/tmp/gh-aw/safeoutputs/upload-artifacts/";
-const RESOLVER_FILE = "/tmp/gh-aw/artifact-resolver.json";
+const TEST_ROOT = path.join(fs.realpathSync(process.cwd()), `.gh-aw-upload-artifact-${process.pid}`);
+const STAGING_DIR = path.join(TEST_ROOT, "gh-aw", "safeoutputs", "upload-artifacts") + path.sep;
+const RESOLVER_FILE = path.join(TEST_ROOT, "artifact-resolver.json");
 
 describe("upload_artifact.cjs", () => {
   let mockCore;
@@ -87,8 +90,10 @@ describe("upload_artifact.cjs", () => {
     originalEnv = { ...process.env };
 
     delete process.env.GH_AW_SAFE_OUTPUTS_STAGED;
-    // Clear RUNNER_TEMP so the handler falls back to /tmp, matching the test's STAGING_DIR
-    delete process.env.RUNNER_TEMP;
+    process.env.RUNNER_TEMP = TEST_ROOT;
+    process.env.GH_AW_ARTIFACT_RESOLVER_FILE = RESOLVER_FILE;
+    delete process.env.GH_AW_WORK_QUEUE_ENABLED;
+    delete process.env.GH_AW_WORK_QUEUE_ROLE;
 
     // Ensure staging dir exists and is clean
     if (fs.existsSync(STAGING_DIR)) {
@@ -105,9 +110,72 @@ describe("upload_artifact.cjs", () => {
   afterEach(() => {
     process.env = originalEnv;
     delete global.__createArtifactClient;
+    fs.rmSync(TEST_ROOT, { recursive: true, force: true });
+    vi.restoreAllMocks();
   });
 
   describe("path-based upload", () => {
+    it.each(["deny", "changed_artifact"])("does not upload after %s at the prepared invocation boundary", async mode => {
+      writeStaging("protected.txt", "original");
+      process.env.ACTIONS_ID_TOKEN_REQUEST_URL = "https://oidc.example.org/token";
+      process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN = "bootstrap";
+      process.env.GITHUB_RUN_ID = "456";
+      mockCore.setSecret = vi.fn();
+      const audience = "https://authority.example.org/gh-aw";
+      vi.spyOn(global, "fetch").mockImplementation(async (_url, options) => {
+        if (options.method === "GET") {
+          const payload = Buffer.from(JSON.stringify({ aud: audience, exp: Math.floor(Date.now() / 1000) + 60 })).toString("base64url");
+          return Response.json({ value: `header.${payload}.signature` });
+        }
+        const request = JSON.parse(options.body);
+        if (mode === "changed_artifact") writeStaging("protected.txt", "changed after preparation");
+        return Response.json({
+          version: VERSION,
+          decision: mode === "deny" ? "deny" : "allow",
+          request_digest: request.request_digest,
+          invocation_id: request.invocation.invocation_id,
+          run_attempt: "1",
+          policy_revision: "policy-v1",
+          decision_id: "decision-v1",
+          issued_at: new Date().toISOString(),
+          expires_at: new Date(Date.now() + 20000).toISOString(),
+        });
+      });
+      const state = {
+        requirement: { endpoint: "https://authority.example.org/authorize", audience, source: "local" },
+        batchDigest: "b".repeat(64),
+        recordIndex: 0,
+        invocation: {
+          caller: {
+            host: "https://github.com",
+            repository_id: "123",
+            workflow_ref: "owner/repo/.github/workflows/test.lock.yml@refs/heads/main",
+            workflow_sha: "a".repeat(40),
+            workflow_hash: "b".repeat(64),
+            run_id: "456",
+            run_attempt: "1",
+          },
+          output: { type: "upload_artifact", name: "upload_artifact", executor: "manager", implementation_digest: "a".repeat(64) },
+          context: {},
+        },
+      };
+      const results = await withSafeOutputInvocation(state, () => runHandler(buildConfig(), [{ type: "upload_artifact", path: "protected.txt" }]));
+      expect(results[0].success).toBe(false);
+      expect(results[0].error).toContain(mode === "deny" ? "denied" : "changed after approval");
+      expect(mockArtifactClient.uploadArtifact).not.toHaveBeenCalled();
+    });
+
+    it.each(["7", "400"])("uses expression-resolved retention %s", async retention => {
+      writeStaging("report.json");
+      await runHandler(buildConfig({ "retention-days": retention }), [{ type: "upload_artifact", path: "report.json" }]);
+      expect(mockArtifactClient.uploadArtifact.mock.calls[0][3].retentionDays).toBe(Number(retention));
+    });
+
+    it.each(["", "0", "-1", "401", "7days", "1.5", true, {}, []])("rejects invalid resolved retention %j", async retention => {
+      await expect(runHandler(buildConfig({ "retention-days": retention }), [])).rejects.toThrow("retention-days must resolve to an integer between 1 and 400");
+      expect(mockArtifactClient.uploadArtifact).not.toHaveBeenCalled();
+    });
+
     it("uploads a single file using config retention days", async () => {
       writeStaging("report.json", '{"result": "ok"}');
 
@@ -115,6 +183,7 @@ describe("upload_artifact.cjs", () => {
 
       expect(mockCore.setFailed).not.toHaveBeenCalled();
       expect(results[0].success).toBe(true);
+      expect(results[0].staged).toBe(false);
       expect(mockArtifactClient.uploadArtifact).toHaveBeenCalledOnce();
       const [name, files, rootDir, opts] = mockArtifactClient.uploadArtifact.mock.calls[0];
       expect(name).toBe("report.json");
@@ -186,6 +255,15 @@ describe("upload_artifact.cjs", () => {
     it("fails when path does not exist in staging dir", async () => {
       await runHandler(buildConfig(), [{ type: "upload_artifact", path: "nonexistent.json" }]);
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("does not exist in staging directory"));
+      expect(mockArtifactClient.uploadArtifact).not.toHaveBeenCalled();
+    });
+
+    it("rejects a staged file with a leading-dash filename", async () => {
+      writeStaging("-T");
+
+      await runHandler(buildConfig(), [{ type: "upload_artifact", path: "-T" }]);
+
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining('filenames beginning with "-" are not allowed'));
       expect(mockArtifactClient.uploadArtifact).not.toHaveBeenCalled();
     });
 
@@ -351,6 +429,21 @@ describe("upload_artifact.cjs", () => {
   });
 
   describe("allowed-paths policy", () => {
+    it("publishes Daily Cracktro screenshots using its staging-relative policy", async () => {
+      const source = fs.readFileSync(path.join(__dirname, "../../../.github/workflows/daily-cracktro-maintainer.md"), "utf8");
+      const policy = source.match(/allowed-paths: \[("[^"]+")\]/);
+      if (!policy) throw new Error("Daily Cracktro must declare an artifact path policy");
+      const allowedPaths = [JSON.parse(policy[1])];
+      writeStaging("cracktro-review/slide.png");
+      writeStaging("unrelated/secret.env");
+
+      const results = await runHandler(buildConfig({ "allowed-paths": allowedPaths }), [{ type: "upload_artifact", path: "cracktro-review" }]);
+
+      expect(results[0].success).toBe(true);
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+      expect(mockArtifactClient.uploadArtifact.mock.calls[0][1]).toEqual([path.join(STAGING_DIR, "cracktro-review/slide.png")]);
+    });
+
     it("filters out files not in allowed-paths", async () => {
       writeStaging("dist/app.js");
       writeStaging("secret.env");
@@ -385,18 +478,24 @@ describe("upload_artifact.cjs", () => {
 
       expect(mockCore.setFailed).not.toHaveBeenCalled();
       expect(results[0].success).toBe(true);
+      expect(results[0].staged).toBe(true);
       expect(mockArtifactClient.uploadArtifact).not.toHaveBeenCalled();
       expect(mockCore.setOutput).toHaveBeenCalledWith("slot_0_tmp_id", expect.stringMatching(/^aw_[A-Za-z0-9]{8}$/));
     });
 
     it("skips upload client call when staged=true in config", async () => {
+      process.env.GH_AW_SAFE_OUTPUTS_STAGED = "false";
       writeStaging("report.json");
 
       const results = await runHandler(buildConfig({ staged: true }), [{ type: "upload_artifact", path: "report.json" }]);
 
       expect(mockCore.setFailed).not.toHaveBeenCalled();
       expect(results[0].success).toBe(true);
+      expect(results[0].staged).toBe(true);
       expect(mockArtifactClient.uploadArtifact).not.toHaveBeenCalled();
+      const [outcome] = buildSafeOutputExecutions([{ type: "upload_artifact", messageIndex: 0, success: true, result: results[0] }], false);
+      expect(outcome).toMatchObject({ type: "upload_artifact", status: "staged", staged: true });
+      expect(outcome).not.toHaveProperty("url");
     });
 
     it("emits a staged mode preview summary when staged mode is active", async () => {
@@ -600,16 +699,19 @@ describe("upload_artifact.cjs", () => {
   });
 
   describe("auto-copy from outside staging directory", () => {
-    const WORKSPACE_DIR = "/tmp/gh-aw-test-workspace";
+    const WORKSPACE_DIR = path.join(TEST_ROOT, "workspace");
 
     beforeEach(() => {
       if (fs.existsSync(WORKSPACE_DIR)) {
         fs.rmSync(WORKSPACE_DIR, { recursive: true });
       }
       fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
+      // Set GITHUB_WORKSPACE so auto-copy is allowed from WORKSPACE_DIR.
+      process.env.GITHUB_WORKSPACE = WORKSPACE_DIR;
     });
 
     afterEach(() => {
+      delete process.env.GITHUB_WORKSPACE;
       if (fs.existsSync(WORKSPACE_DIR)) {
         fs.rmSync(WORKSPACE_DIR, { recursive: true });
       }
@@ -638,6 +740,18 @@ describe("upload_artifact.cjs", () => {
       // The file should have been copied into the staging directory.
       expect(fs.existsSync(path.join(STAGING_DIR, "report.json"))).toBe(true);
       expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("Auto-copied file"));
+    });
+
+    it("rejects leading-dash filenames before copying them into staging", async () => {
+      const absFile = path.join(WORKSPACE_DIR, "-T");
+      writeWorkspace("-T");
+
+      const results = await runHandler(buildConfig(), [{ type: "upload_artifact", path: absFile }]);
+
+      expect(results[0].success).toBe(false);
+      expect(results[0].error).toContain('filenames beginning with "-" are not allowed');
+      expect(fs.existsSync(path.join(STAGING_DIR, "-T"))).toBe(false);
+      expect(mockArtifactClient.uploadArtifact).not.toHaveBeenCalled();
     });
 
     it("auto-copies a directory from an absolute path", async () => {
@@ -713,7 +827,7 @@ describe("upload_artifact.cjs", () => {
   });
 
   describe("RUNNER_TEMP staging directory", () => {
-    const CUSTOM_TEMP = "/tmp/gh-aw-test-runner-temp";
+    const CUSTOM_TEMP = path.join(TEST_ROOT, "runner");
     const CUSTOM_STAGING = path.join(CUSTOM_TEMP, "gh-aw", "safeoutputs", "upload-artifacts");
 
     beforeEach(() => {
@@ -746,18 +860,118 @@ describe("upload_artifact.cjs", () => {
     });
 
     it("falls back to /tmp when RUNNER_TEMP is unset", async () => {
-      // Clear RUNNER_TEMP to verify the fallback
       delete process.env.RUNNER_TEMP;
-
-      writeStaging("fallback-report.json", '{"ok": true}');
-
+      const exists = fs.existsSync.bind(fs);
+      vi.spyOn(fs, "existsSync").mockImplementation(filename => (String(filename).startsWith("/tmp/gh-aw") ? false : exists(filename)));
       const results = await runHandler(buildConfig(), [{ type: "upload_artifact", path: "fallback-report.json" }]);
+      expect(results[0].error).toContain("The staging directory is empty — did you forget to copy files to /tmp/gh-aw/safeoutputs/upload-artifacts/");
+      expect(mockArtifactClient.uploadArtifact).not.toHaveBeenCalled();
+    });
+  });
 
-      expect(mockCore.setFailed).not.toHaveBeenCalled();
+  describe("path validation (security)", () => {
+    const WORKSPACE_DIR = path.join(TEST_ROOT, "security-workspace");
+
+    beforeEach(() => {
+      if (fs.existsSync(WORKSPACE_DIR)) {
+        fs.rmSync(WORKSPACE_DIR, { recursive: true });
+      }
+      fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
+      process.env.GITHUB_WORKSPACE = WORKSPACE_DIR;
+    });
+
+    afterEach(() => {
+      delete process.env.GITHUB_WORKSPACE;
+      if (fs.existsSync(WORKSPACE_DIR)) {
+        fs.rmSync(WORKSPACE_DIR, { recursive: true });
+      }
+    });
+
+    it("rejects an absolute path under /etc", async () => {
+      if (!fs.existsSync("/etc/hosts")) return;
+      const stat = (() => {
+        try {
+          return fs.lstatSync("/etc/hosts");
+        } catch {
+          return null;
+        }
+      })();
+      if (!stat || stat.isSymbolicLink()) return;
+
+      await runHandler(buildConfig(), [{ type: "upload_artifact", path: "/etc/hosts" }]);
+
+      // macOS canonicalizes /etc to /private/etc, which the allowed-root check rejects.
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringMatching(/^ERR_VALIDATION: upload_artifact: path (refers to a system directory|is outside allowed source roots)/));
+      expect(mockArtifactClient.uploadArtifact).not.toHaveBeenCalled();
+    });
+
+    it("rejects a path containing a .git directory component", async () => {
+      const gitDir = path.join(WORKSPACE_DIR, ".git");
+      const gitConfig = path.join(gitDir, "config");
+      fs.mkdirSync(gitDir, { recursive: true });
+      fs.writeFileSync(gitConfig, "[core]\n  repositoryformatversion = 0\n");
+
+      await runHandler(buildConfig(), [{ type: "upload_artifact", path: gitConfig }]);
+
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("sensitive repository metadata"));
+      expect(mockArtifactClient.uploadArtifact).not.toHaveBeenCalled();
+    });
+
+    it("rejects an absolute path outside allowed roots (GITHUB_WORKSPACE, staging)", async () => {
+      const outsideDir = path.join(TEST_ROOT, "outside");
+      try {
+        fs.mkdirSync(outsideDir, { recursive: true });
+        const outsideFile = path.join(outsideDir, "data.json");
+        fs.writeFileSync(outsideFile, "{}");
+
+        // Unset GITHUB_WORKSPACE so the outsideDir is not covered.
+        delete process.env.GITHUB_WORKSPACE;
+
+        await runHandler(buildConfig(), [{ type: "upload_artifact", path: outsideFile }]);
+
+        expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("outside allowed source roots"));
+        expect(mockArtifactClient.uploadArtifact).not.toHaveBeenCalled();
+      } finally {
+        try {
+          fs.rmSync(outsideDir, { recursive: true, force: true });
+        } catch {}
+      }
+    });
+
+    it("rejects a nested .git directory during recursive auto-copy", async () => {
+      const srcDir = path.join(WORKSPACE_DIR, "project");
+      const gitDir = path.join(srcDir, ".git");
+      fs.mkdirSync(gitDir, { recursive: true });
+      fs.writeFileSync(path.join(gitDir, "config"), "[core]\n  repositoryformatversion = 0\n");
+      fs.writeFileSync(path.join(srcDir, "readme.md"), "hello");
+
+      await runHandler(buildConfig(), [{ type: "upload_artifact", path: srcDir }]);
+
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("sensitive repository metadata"));
+      expect(mockArtifactClient.uploadArtifact).not.toHaveBeenCalled();
+    });
+
+    it("allows a path within GITHUB_WORKSPACE", async () => {
+      const wsFile = path.join(WORKSPACE_DIR, "output.json");
+      fs.writeFileSync(wsFile, '{"result":"ok"}');
+
+      const results = await runHandler(buildConfig(), [{ type: "upload_artifact", path: wsFile }]);
+
       expect(results[0].success).toBe(true);
-      const [, files, rootDir] = mockArtifactClient.uploadArtifact.mock.calls[0];
-      expect(files).toContain(path.join(STAGING_DIR, "fallback-report.json"));
-      expect(rootDir).toBe(STAGING_DIR);
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+      expect(mockArtifactClient.uploadArtifact).toHaveBeenCalledOnce();
+    });
+
+    it("sets restrictive permissions (0o600) on auto-copied staged files", async () => {
+      const wsFile = path.join(WORKSPACE_DIR, "secure.json");
+      fs.writeFileSync(wsFile, "secure data");
+
+      await runHandler(buildConfig(), [{ type: "upload_artifact", path: wsFile }]);
+
+      const stagedFile = path.join(STAGING_DIR, "secure.json");
+      expect(fs.existsSync(stagedFile)).toBe(true);
+      const stat = fs.statSync(stagedFile);
+      expect(stat.mode & 0o777).toBe(0o600);
     });
   });
 });

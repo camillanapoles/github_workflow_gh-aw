@@ -708,37 +708,37 @@ func TestParseSchedule(t *testing.T) {
 		{
 			name:         "every 1d",
 			input:        "every 1d",
-			expectedCron: "0 0 * * *",
+			expectedCron: "FUZZY:DAILY * * *",
 			expectedOrig: "every 1d",
 		},
 		{
 			name:         "every 2d",
 			input:        "every 2d",
-			expectedCron: "0 0 */2 * *",
+			expectedCron: "FUZZY:DAILY_INTERVAL/2 * * *",
 			expectedOrig: "every 2d",
 		},
 		{
 			name:         "every 1w",
 			input:        "every 1w",
-			expectedCron: "0 0 * * 0",
+			expectedCron: "FUZZY:WEEKLY * * *",
 			expectedOrig: "every 1w",
 		},
 		{
 			name:         "every 2w",
 			input:        "every 2w",
-			expectedCron: "0 0 */14 * *",
+			expectedCron: "FUZZY:DAILY_INTERVAL/14 * * *",
 			expectedOrig: "every 2w",
 		},
 		{
 			name:         "every 1mo",
 			input:        "every 1mo",
-			expectedCron: "0 0 1 * *",
+			expectedCron: "FUZZY:MONTHLY_INTERVAL/1 * * *",
 			expectedOrig: "every 1mo",
 		},
 		{
 			name:         "every 2mo",
 			input:        "every 2mo",
-			expectedCron: "0 0 1 */2 *",
+			expectedCron: "FUZZY:MONTHLY_INTERVAL/2 * * *",
 			expectedOrig: "every 2mo",
 		},
 
@@ -798,37 +798,37 @@ func TestParseSchedule(t *testing.T) {
 		{
 			name:         "every 2 days",
 			input:        "every 2 days",
-			expectedCron: "0 0 */2 * *",
+			expectedCron: "FUZZY:DAILY_INTERVAL/2 * * *",
 			expectedOrig: "every 2 days",
 		},
 		{
 			name:         "every 3 days",
 			input:        "every 3 days",
-			expectedCron: "0 0 */3 * *",
+			expectedCron: "FUZZY:DAILY_INTERVAL/3 * * *",
 			expectedOrig: "every 3 days",
 		},
 		{
 			name:         "every 7 days",
 			input:        "every 7 days",
-			expectedCron: "0 0 */7 * *",
+			expectedCron: "FUZZY:DAILY_INTERVAL/7 * * *",
 			expectedOrig: "every 7 days",
 		},
 		{
 			name:         "every 10 days",
 			input:        "every 10 days",
-			expectedCron: "0 0 */10 * *",
+			expectedCron: "FUZZY:DAILY_INTERVAL/10 * * *",
 			expectedOrig: "every 10 days",
 		},
 		{
 			name:         "every 14 days",
 			input:        "every 14 days",
-			expectedCron: "0 0 */14 * *",
+			expectedCron: "FUZZY:DAILY_INTERVAL/14 * * *",
 			expectedOrig: "every 14 days",
 		},
 		{
 			name:         "every 1 day",
 			input:        "every 1 day",
-			expectedCron: "0 0 * * *",
+			expectedCron: "FUZZY:DAILY * * *",
 			expectedOrig: "every 1 day",
 		},
 
@@ -1081,7 +1081,7 @@ func TestParseSchedule(t *testing.T) {
 			if tt.shouldError {
 				require.Error(t, err, "ParseSchedule(%q) should return an error", tt.input)
 				if tt.errorSubstring != "" {
-					assert.Contains(t, err.Error(), tt.errorSubstring,
+					require.ErrorContains(t, err, tt.errorSubstring,
 						"error for %q should contain %q", tt.input, tt.errorSubstring)
 				}
 				return
@@ -1092,6 +1092,42 @@ func TestParseSchedule(t *testing.T) {
 				"ParseSchedule(%q) cron expression mismatch", tt.input)
 			assert.Equal(t, tt.expectedOrig, orig,
 				"ParseSchedule(%q) original string mismatch", tt.input)
+		})
+	}
+}
+
+// TestErrUnsupportedSyntaxIs verifies that all four "explicitly unsupported
+// syntax" branches wrap ErrUnsupportedSyntax so that errors.Is works, and
+// that an ordinary parse error (unrecognised keyword) does not.
+func TestErrUnsupportedSyntaxIs(t *testing.T) {
+	tests := []struct {
+		name            string
+		input           string
+		wantUnsupported bool
+	}{
+		// daily at <time> — first unsupported-syntax branch
+		{name: "daily at time", input: "daily at 2pm", wantUnsupported: true},
+		// weekly on <weekday> at <time> — second unsupported-syntax branch
+		{name: "weekly on weekday at time", input: "weekly on friday at 5pm", wantUnsupported: true},
+		// monthly on <day> — third unsupported-syntax branch
+		{name: "monthly on day", input: "monthly on 15", wantUnsupported: true},
+		// monthly on <day> at <time> — fourth unsupported-syntax branch
+		{name: "monthly on day at time", input: "monthly on 15 at 9am", wantUnsupported: true},
+		// ordinary parse error: unrecognised schedule keyword
+		{name: "ordinary parse error (yearly)", input: "yearly", wantUnsupported: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := ParseSchedule(tt.input)
+			require.Error(t, err)
+			if tt.wantUnsupported {
+				assert.ErrorIs(t, err, ErrUnsupportedSyntax,
+					"expected errors.Is(err, ErrUnsupportedSyntax) for input %q; got: %v", tt.input, err)
+			} else {
+				assert.NotErrorIs(t, err, ErrUnsupportedSyntax,
+					"expected errors.Is(err, ErrUnsupportedSyntax)==false for input %q; got: %v", tt.input, err)
+			}
 		})
 	}
 }

@@ -6,6 +6,12 @@ description: Tests compiler error message quality by introducing syntax errors i
 on:
   schedule: daily
   workflow_dispatch:
+if: >
+  github.event_name != 'push' &&
+  fromJSON(github.event.inputs.aw_context || '{}').event_type != 'push'
+concurrency:
+  group: "daily-syntax-error-quality-${{ github.ref }}"
+  cancel-in-progress: true
 permissions:
   contents: read
   issues: read
@@ -14,12 +20,12 @@ permissions:
 
 sandbox:
   agent:
-    sudo: false
-
+    id: awf
 tracker-id: daily-syntax-error-quality
+model: copilot/claude-haiku-5.5
 engine:
-  id: copilot
-  copilot-sdk: true
+  id: langgraph
+max-turns: 20
 tools:
   cli-proxy: true
   bash: true
@@ -56,8 +62,16 @@ steps:
       fi
       gh aw --version
 imports:
+  - shared/langgraph.md
   - shared/reporting.md
   - shared/otlp.md
+evals:
+  - id: errors_tested
+    question: Did the agent introduce syntax errors into candidate workflows and evaluate the quality of the resulting compiler error messages?
+  - id: issue_created_or_noop
+    question: Was a quality report issue created with improvement suggestions, or was noop used when all error messages already met quality standards?
+features:
+  gh-aw-detection: true
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}
@@ -332,4 +346,6 @@ Begin your analysis now. Focus on evaluating error messages from a developer exp
 
 ### Output Format
 
-Structure reports as: overview → key metrics/issues → collapsible detail → next actions.
+- Use `###` (h3) or lower for all report headers; never use `#` or `##` inside the report body.
+- Wrap long lists, tables, and detailed findings in `<details><summary><b>...</b></summary>...</details>` blocks to reduce scrolling.
+- Structure reports as: overview → key metrics/issues → collapsible detail → next actions.

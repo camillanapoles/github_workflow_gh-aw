@@ -7,6 +7,18 @@ import { writeFileSync, readFileSync, mkdtempSync, rmSync } from "fs";
 
 const req = createRequire(import.meta.url);
 
+// Set up global.core mock before loading the module under test so shim.cjs
+// sees it already present and does not overwrite it with its stderr-based shim.
+const mockCore = {
+  info: vi.fn(),
+  warning: vi.fn(),
+  error: vi.fn(),
+  setFailed: vi.fn(),
+  setOutput: vi.fn(),
+  setSecret: vi.fn(),
+};
+global.core = mockCore;
+
 // Load send_otlp_span.cjs first so we can patch its exports before run() calls require()
 // inside action_setup_otlp.cjs. Both share the same CJS module cache, so patching the
 // exports object here is reflected when run() destructures from require(...send_otlp_span.cjs).
@@ -16,7 +28,7 @@ const originalIsValidTraceId = sendOtlpModule.isValidTraceId;
 const originalIsValidSpanId = sendOtlpModule.isValidSpanId;
 
 // Load the module under test after patching is possible
-const { run } = req("./action_setup_otlp.cjs");
+const { run, writeEnvLine } = req("./action_setup_otlp.cjs");
 
 const mockSendJobSetupSpan = vi.fn();
 
@@ -39,7 +51,6 @@ describe("action_setup_otlp.cjs", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.spyOn(console, "log").mockImplementation(() => {});
 
     // Patch the shared CJS module exports — run() re-destructures on every call
     sendOtlpModule.sendJobSetupSpan = mockSendJobSetupSpan;
@@ -66,6 +77,7 @@ describe("action_setup_otlp.cjs", () => {
       INPUT_OTLP_OIDC_TOKEN: process.env.INPUT_OTLP_OIDC_TOKEN,
       GH_AW_OTLP_ENDPOINTS: process.env.GH_AW_OTLP_ENDPOINTS,
       OTEL_EXPORTER_OTLP_HEADERS: process.env.OTEL_EXPORTER_OTLP_HEADERS,
+      GH_AW_OTLP_ALL_HEADERS: process.env.GH_AW_OTLP_ALL_HEADERS,
     };
 
     delete process.env.GH_AW_OTLP_ENDPOINTS;
@@ -79,6 +91,7 @@ describe("action_setup_otlp.cjs", () => {
     delete process.env.INPUT_OTLP_OIDC_TOKEN;
     delete process.env["INPUT_OTLP_OIDC_TOKEN"];
     delete process.env.OTEL_EXPORTER_OTLP_HEADERS;
+    delete process.env.GH_AW_OTLP_ALL_HEADERS;
     process.env.GITHUB_OUTPUT = outputFile;
     process.env.GITHUB_ENV = envFile;
   });
@@ -101,11 +114,141 @@ describe("action_setup_otlp.cjs", () => {
     expect(typeof run).toBe("function");
   });
 
+  describe("writeEnvLine", () => {
+    it.each(["\n", "\r", "\r\n"])("rejects line breaks %j in keys and values without logging them", lineBreak => {
+      const malicious = `synthetic-secret${lineBreak}INJECTED_VAR=malicious-value`;
+      writeFileSync(envFile, "EXISTING_VAR=preserved\n");
+
+      writeEnvLine(envFile, malicious, "safe", malicious, "GITHUB_ENV");
+      writeEnvLine(envFile, "SAFE_KEY", malicious, malicious, "GITHUB_ENV");
+
+      expect(readFileSync(envFile, "utf8")).toBe("EXISTING_VAR=preserved\n");
+      expect(mockCore.warning).toHaveBeenCalledTimes(2);
+      expect(mockCore.warning).toHaveBeenCalledWith("[otlp] refusing to write a key or value containing line breaks");
+      expect(mockCore.info).not.toHaveBeenCalled();
+      expect(mockCore.warning.mock.calls.flat().join("\n")).not.toContain("synthetic-secret");
+      expect(mockCore.warning.mock.calls.flat().join("\n")).not.toContain("INJECTED_VAR");
+    });
+
+    it("preserves valid single-line values", () => {
+      writeEnvLine(envFile, "SAFE_KEY", "value=with,delimiters", "SAFE_KEY", "GITHUB_ENV");
+
+      expect(readFileSync(envFile, "utf8")).toBe("SAFE_KEY=value=with,delimiters\n");
+      expect(mockCore.warning).not.toHaveBeenCalled();
+    });
+  });
+
+  it.each(["OTEL_EXPORTER_OTLP_HEADERS", "GH_AW_OTLP_ALL_HEADERS", "GH_AW_OTLP_ENDPOINTS"])("does not register plain placeholders from %s as standalone runner masks", async variable => {
+    const headers = [
+      "X-No-Auth=true",
+      "X-False=false",
+      "X-Null=null",
+      "X-Short=abcd",
+      "X-Seven=abcdefg",
+      "X-Digits=12345678",
+      "X-Encoded-Boolean=%74%72%75%65",
+      "X-Encoded-Short=%61%62%63%64",
+      "X-Encoded-Digits=%31%32%33%34%35%36%37%38",
+      "X-Key=abcdefgh",
+      "X-Encoded-Key=%61bcdefgh",
+    ].join(",");
+    process.env[variable] = variable === "GH_AW_OTLP_ENDPOINTS" ? JSON.stringify([{ url: "", headers }]) : headers;
+    mockSendJobSetupSpan.mockImplementationOnce(async () => {
+      expect(mockCore.setSecret.mock.calls.map(([value]) => value).sort()).toEqual([headers, "abcdefgh", "%61bcdefgh"].sort());
+      return { traceId: VALID_TRACE_ID, spanId: VALID_SPAN_ID };
+    });
+
+    await run();
+
+    expect(mockCore.setSecret.mock.calls.map(([value]) => value).sort()).toEqual([headers, "abcdefgh", "%61bcdefgh"].sort());
+  });
+
+  it.each(["Bearer abcd", "bearer 1234", "Bearer true", "Bearer abc", "Basic dTp0cnVl", "basic dToxMjM0"])("preserves short auth credential runner masks for %s", async authorization => {
+    const encoded = encodeURIComponent(authorization);
+    const headers = `Authorization=${encoded}`;
+    process.env.OTEL_EXPORTER_OTLP_HEADERS = headers;
+    const credential = authorization.split(" ")[1];
+    const expected = new Set([headers, encoded, authorization]);
+    if (credential.length >= 4) expected.add(credential);
+    if (authorization.toLowerCase().startsWith("basic ")) {
+      const decoded = Buffer.from(credential, "base64").toString("utf8");
+      expected.add(decoded);
+      expected.add(decoded.split(":")[1]);
+    }
+
+    await run();
+
+    expect(mockCore.setSecret.mock.calls.map(([value]) => value).sort()).toEqual([...expected].sort());
+  });
+
+  it("masks decoded OTLP credentials before sending spans without changing configured headers", async () => {
+    const password = "synthetic-grafana-cloud-token";
+    const basic = `Basic ${Buffer.from(`123456:${password}`).toString("base64")}`;
+    const headers = `Authorization=${basic}`;
+    process.env.GH_AW_OTLP_ENDPOINTS = JSON.stringify([{ url: "https://grafana.example.com", headers }]);
+    process.env.OTEL_EXPORTER_OTLP_HEADERS = "Authorization=Bearer synthetic-primary-token";
+    process.env.GH_AW_OTLP_ALL_HEADERS = "x-sentry-auth=synthetic-consolidated-token";
+    mockSendJobSetupSpan.mockImplementationOnce(async () => {
+      expect(mockCore.setSecret).toHaveBeenCalledWith(password);
+      expect(mockCore.setSecret).toHaveBeenCalledWith("synthetic-primary-token");
+      expect(mockCore.setSecret).toHaveBeenCalledWith("synthetic-consolidated-token");
+      return { traceId: VALID_TRACE_ID, spanId: VALID_SPAN_ID };
+    });
+
+    await run();
+
+    expect(JSON.parse(process.env.GH_AW_OTLP_ENDPOINTS || "[]")[0].headers).toBe(headers);
+    expect(process.env.OTEL_EXPORTER_OTLP_HEADERS).toBe("Authorization=Bearer synthetic-primary-token");
+    expect(mockCore.info.mock.calls.flat().join("\n")).not.toContain(password);
+  });
+
+  it.each(["GH_AW_OTLP_ALL_HEADERS", "OTEL_EXPORTER_OTLP_HEADERS"])("masks repeated Authorization headers in %s even when the middle endpoint URL is empty", async headerVariable => {
+    const passwords = ["synthetic-first-password", "synthetic-middle-password", "synthetic-last-password"];
+    const headers = passwords.map(password => `Authorization=${encodeURIComponent(`Basic ${Buffer.from(`123456:${password}`).toString("base64")}`)}`);
+    const endpoints = [
+      { url: "https://first.example.com", headers: headers[0] },
+      { url: "", headers: headers[1] },
+      { url: "https://last.example.com", headers: headers[2] },
+    ];
+    process.env.GH_AW_OTLP_ENDPOINTS = JSON.stringify(endpoints);
+    process.env[headerVariable] = headers.join(",Authorization=%invalid,");
+    mockSendJobSetupSpan.mockImplementationOnce(async () => {
+      for (const password of passwords) {
+        expect(mockCore.setSecret).toHaveBeenCalledWith(password);
+      }
+      return { traceId: VALID_TRACE_ID, spanId: VALID_SPAN_ID };
+    });
+
+    await run();
+
+    expect(JSON.parse(process.env.GH_AW_OTLP_ENDPOINTS || "[]")).toEqual(endpoints);
+    expect(process.env[headerVariable]).toBe(headers.join(",Authorization=%invalid,"));
+  });
+
+  it("registers escaped passwords and credentials from disabled endpoints before eval output can stream", async () => {
+    const password = 'synthetic-otlp-"password\\tail';
+    const decoded = `123456:${password}`;
+    const encoded = Buffer.from(decoded).toString("base64");
+    const headers = `Authorization=${encodeURIComponent(`Basic ${encoded}`)}`;
+    process.env.GH_AW_OTLP_ENDPOINTS = JSON.stringify([{ url: "", headers }]);
+    mockSendJobSetupSpan.mockImplementationOnce(async () => {
+      for (const value of [password, decoded, encoded, JSON.stringify(password).slice(1, -1), encodeURIComponent(`Basic ${encoded}`)]) {
+        expect(mockCore.setSecret).toHaveBeenCalledWith(value);
+      }
+      return { traceId: VALID_TRACE_ID, spanId: VALID_SPAN_ID };
+    });
+
+    await run();
+
+    expect(mockCore.info.mock.calls.flat().join("\n")).not.toContain(password);
+    expect(JSON.parse(process.env.GH_AW_OTLP_ENDPOINTS || "[]")).toEqual([{ url: "", headers }]);
+  });
+
   describe("when GH_AW_OTLP_ENDPOINTS is not set", () => {
     it("should log that OTLP export is being skipped", async () => {
       await run();
 
-      expect(console.log).toHaveBeenCalledWith("[otlp] GH_AW_OTLP_ENDPOINTS not set, skipping setup span");
+      expect(mockCore.info).toHaveBeenCalledWith("[otlp] GH_AW_OTLP_ENDPOINTS not set, skipping setup span");
     });
 
     it("should still call sendJobSetupSpan for JSONL mirror", async () => {
@@ -117,7 +260,7 @@ describe("action_setup_otlp.cjs", () => {
     it("should not log 'sending setup span to' when endpoint is absent", async () => {
       await run();
 
-      const logged = vi.mocked(console.log).mock.calls.flat();
+      const logged = vi.mocked(mockCore.info).mock.calls.flat();
       expect(logged.some(msg => typeof msg === "string" && msg.includes("sending setup span to"))).toBe(false);
     });
   });
@@ -130,7 +273,7 @@ describe("action_setup_otlp.cjs", () => {
     it("should log sending the setup span to the configured endpoint", async () => {
       await run();
 
-      expect(console.log).toHaveBeenCalledWith("[otlp] sending setup span to configured endpoints");
+      expect(mockCore.info).toHaveBeenCalledWith("[otlp] sending setup span to configured endpoints");
     });
 
     it("should call sendJobSetupSpan exactly once", async () => {
@@ -142,24 +285,100 @@ describe("action_setup_otlp.cjs", () => {
     it("should log setup span sent with traceId and spanId", async () => {
       await run();
 
-      expect(console.log).toHaveBeenCalledWith(expect.stringContaining(`traceId=${VALID_TRACE_ID}`));
-      expect(console.log).toHaveBeenCalledWith(expect.stringContaining(`spanId=${VALID_SPAN_ID}`));
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining(`traceId=${VALID_TRACE_ID}`));
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining(`spanId=${VALID_SPAN_ID}`));
     });
 
     it("should log the resolved trace ID", async () => {
       await run();
 
-      expect(console.log).toHaveBeenCalledWith(expect.stringContaining(`trace-id=${VALID_TRACE_ID}`));
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining(`trace-id=${VALID_TRACE_ID}`));
+    });
+
+    it("disables OTLP for later steps when the Authorization secret is empty", async () => {
+      process.env.GH_AW_OTLP_ENDPOINTS = JSON.stringify([{ url: "https://traces.example.com", headers: "Authorization=" }]);
+      process.env.OTEL_EXPORTER_OTLP_ENDPOINT = "https://traces.example.com";
+      process.env.OTEL_EXPORTER_OTLP_HEADERS = "Authorization=";
+
+      await run();
+
+      expect(process.env.OTEL_EXPORTER_OTLP_ENDPOINT).toBe("");
+      expect(process.env.OTEL_EXPORTER_OTLP_HEADERS).toBe("");
+      expect(readFileSync(envFile, "utf8")).toContain("OTEL_EXPORTER_OTLP_ENDPOINT=\n");
+      expect(readFileSync(envFile, "utf8")).toContain("OTEL_EXPORTER_OTLP_HEADERS=\n");
+      expect(mockCore.info).toHaveBeenCalledWith("[otlp] no OTLP endpoints have usable credentials, skipping setup span");
+      expect(mockCore.info).not.toHaveBeenCalledWith(expect.stringContaining("[otlp] setup span sent"));
+    });
+
+    it("promotes the next configured endpoint when the first Authorization secret is empty", async () => {
+      process.env.GH_AW_OTLP_ENDPOINTS = JSON.stringify([
+        { url: "https://sentry.example.com", headers: "x-sentry-auth=" },
+        { url: "https://grafana.example.com", headers: "Authorization=******" },
+      ]);
+      process.env.OTEL_EXPORTER_OTLP_ENDPOINT = "https://sentry.example.com";
+      process.env.OTEL_EXPORTER_OTLP_HEADERS = "x-sentry-auth=";
+
+      await run();
+
+      expect(process.env.OTEL_EXPORTER_OTLP_ENDPOINT).toBe("https://grafana.example.com");
+      expect(process.env.OTEL_EXPORTER_OTLP_HEADERS).toBe("Authorization=******");
+    });
+
+    it("preserves explicit exporter overrides when the primary endpoint is unavailable", async () => {
+      process.env.GH_AW_OTLP_ENDPOINTS = JSON.stringify([
+        { url: "https://sentry.example.com", headers: "x-sentry-auth=" },
+        { url: "https://grafana.example.com", headers: "Authorization=******" },
+      ]);
+      process.env.OTEL_EXPORTER_OTLP_ENDPOINT = "https://custom.example.com";
+      process.env.OTEL_EXPORTER_OTLP_HEADERS = "Authorization=custom";
+
+      await run();
+
+      expect(process.env.OTEL_EXPORTER_OTLP_ENDPOINT).toBe("https://custom.example.com");
+      expect(process.env.OTEL_EXPORTER_OTLP_HEADERS).toBe("Authorization=custom");
     });
   });
 
   describe("OTLP OIDC token header injection", () => {
+    it.each(["\n", "\r", "\r\n"])("rejects tokens containing %j without injecting environment variables", async lineBreak => {
+      const token = `synthetic-oidc-token${lineBreak}INJECTED_VAR=malicious-value`;
+      const headers = "X-Tenant=acme";
+      const endpoints = JSON.stringify([{ url: "https://otlp.example.com", headers }]);
+      process.env.INPUT_OTLP_OIDC_TOKEN = token;
+      process.env.OTEL_EXPORTER_OTLP_HEADERS = headers;
+      process.env.GH_AW_OTLP_ENDPOINTS = endpoints;
+
+      await run();
+
+      expect(process.env.OTEL_EXPORTER_OTLP_HEADERS).toBe(headers);
+      expect(process.env.GH_AW_OTLP_ENDPOINTS).toBe(endpoints);
+      expect(readFileSync(envFile, "utf8")).toMatch(new RegExp(`^GITHUB_AW_OTEL_TRACE_ID=${VALID_TRACE_ID}\nGITHUB_AW_OTEL_PARENT_SPAN_ID=${VALID_SPAN_ID}\nGITHUB_AW_OTEL_JOB_START_MS=\\d+\n$`));
+      expect(mockCore.warning).toHaveBeenCalledWith("[otlp] ignoring OTLP OIDC token containing line breaks");
+      const logs = [...mockCore.info.mock.calls.flat(), ...mockCore.warning.mock.calls.flat()].join("\n");
+      expect(logs).not.toContain("synthetic-oidc-token");
+      expect(logs).not.toContain("INJECTED_VAR");
+    });
+
+    it.each(["\n", "\r", "\r\n"])("does not export merged headers containing %j", async lineBreak => {
+      process.env.INPUT_OTLP_OIDC_TOKEN = "synthetic-oidc-token";
+      process.env.OTEL_EXPORTER_OTLP_HEADERS = `X-Tenant=acme${lineBreak}INJECTED_VAR=malicious-value`;
+
+      await run();
+
+      const contents = readFileSync(envFile, "utf8");
+      expect(contents).not.toContain("OTEL_EXPORTER_OTLP_HEADERS=");
+      expect(contents).not.toContain("INJECTED_VAR");
+      expect(mockCore.warning).toHaveBeenCalledWith("[otlp] refusing to write a key or value containing line breaks");
+      expect(mockCore.warning.mock.calls.flat().join("\n")).not.toContain("synthetic-oidc-token");
+    });
+
     it("injects Authorization header and exports it to GITHUB_ENV when INPUT_OTLP_OIDC_TOKEN is set", async () => {
       const minted = "oidc" + "-" + "token" + "-" + "value";
       process.env.INPUT_OTLP_OIDC_TOKEN = minted;
 
       await run();
 
+      expect(mockCore.setSecret).toHaveBeenCalledWith(minted);
       expect(process.env.OTEL_EXPORTER_OTLP_HEADERS).toContain("Authorization=Bearer ");
       expect(process.env.OTEL_EXPORTER_OTLP_HEADERS).toContain(minted);
       expect(readFileSync(envFile, "utf8")).toContain("OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer ");
@@ -271,13 +490,13 @@ describe("action_setup_otlp.cjs", () => {
 
       await run();
 
-      expect(console.log).toHaveBeenCalledWith(expect.stringContaining("INPUT_TRACE_ID=abcdef0123456789abcdef0123456789"));
+      expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("INPUT_TRACE_ID=abcdef0123456789abcdef0123456789"));
     });
 
     it("should log that INPUT_TRACE_ID is not set when absent", async () => {
       await run();
 
-      expect(console.log).toHaveBeenCalledWith("[otlp] INPUT_TRACE_ID not set, a new trace ID will be generated");
+      expect(mockCore.info).toHaveBeenCalledWith("[otlp] INPUT_TRACE_ID not set, a new trace ID will be generated");
     });
 
     it("should accept the hyphen form INPUT_TRACE-ID as a fallback", async () => {
@@ -326,7 +545,7 @@ describe("action_setup_otlp.cjs", () => {
 
       await run();
 
-      expect(console.log).toHaveBeenCalledWith("[otlp] INPUT_PARENT_SPAN_ID=aabbccddeeff0011 (will parent setup span)");
+      expect(mockCore.info).toHaveBeenCalledWith("[otlp] INPUT_PARENT_SPAN_ID=aabbccddeeff0011 (will parent setup span)");
     });
 
     it("should accept the hyphen form INPUT_PARENT-SPAN-ID as a fallback", async () => {
@@ -377,7 +596,7 @@ describe("action_setup_otlp.cjs", () => {
     it("should log that trace-id was written to GITHUB_OUTPUT", async () => {
       await run();
 
-      expect(console.log).toHaveBeenCalledWith(`[otlp] trace-id=${VALID_TRACE_ID} written to GITHUB_OUTPUT`);
+      expect(mockCore.info).toHaveBeenCalledWith(`[otlp] trace-id=${VALID_TRACE_ID} written to GITHUB_OUTPUT`);
     });
 
     it("should write parent-span-id to GITHUB_OUTPUT when parent span ID is valid", async () => {
@@ -466,19 +685,19 @@ describe("action_setup_otlp.cjs", () => {
     it("should log the GITHUB_AW_OTEL_TRACE_ID write", async () => {
       await run();
 
-      expect(console.log).toHaveBeenCalledWith("[otlp] GITHUB_AW_OTEL_TRACE_ID written to GITHUB_ENV");
+      expect(mockCore.info).toHaveBeenCalledWith("[otlp] GITHUB_AW_OTEL_TRACE_ID written to GITHUB_ENV");
     });
 
     it("should log the GITHUB_AW_OTEL_PARENT_SPAN_ID write", async () => {
       await run();
 
-      expect(console.log).toHaveBeenCalledWith("[otlp] GITHUB_AW_OTEL_PARENT_SPAN_ID written to GITHUB_ENV");
+      expect(mockCore.info).toHaveBeenCalledWith("[otlp] GITHUB_AW_OTEL_PARENT_SPAN_ID written to GITHUB_ENV");
     });
 
     it("should log the GITHUB_AW_OTEL_JOB_START_MS write", async () => {
       await run();
 
-      expect(console.log).toHaveBeenCalledWith("[otlp] GITHUB_AW_OTEL_JOB_START_MS written to GITHUB_ENV");
+      expect(mockCore.info).toHaveBeenCalledWith("[otlp] GITHUB_AW_OTEL_JOB_START_MS written to GITHUB_ENV");
     });
   });
 

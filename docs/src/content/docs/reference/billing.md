@@ -25,7 +25,7 @@ There are two billing paths for the Copilot engine (`engine: copilot`, the defau
 
 1. The organization has centralized billing enabled for Copilot requests in its Copilot policies. Enable it under **Organization → Settings → Copilot → Policies → Copilot CLI → "Allow use of Copilot CLI billed to the organization"**. See also [Authentication](/gh-aw/reference/auth/#copilot-requests-write-permission).
 
-2. The workflow declares `copilot_requests: write` under `permissions`:
+2. The workflow declares `copilot-requests: write` under `permissions`:
 
        permissions:
          contents: read
@@ -33,9 +33,22 @@ There are two billing paths for the Copilot engine (`engine: copilot`, the defau
 
 3. The workflow has been compiled (`gh aw compile`) and the updated `.lock.yml` committed to the repository.
 
+`gh aw compile` does **not** auto-inject `copilot-requests: write` into arbitrary workflow source. The permission must be declared in the workflow frontmatter. Some authoring flows such as `gh aw add` can insert it when the author explicitly chooses Copilot org billing, but the compiler otherwise only emits an informational tip.
+
+For Claude workflows that use the GitHub Copilot provider (for example `engine: { id: claude, model-provider: github }` or a `copilot/` model), the compiler emits a warning instead of a tip when `copilot-requests: write` is missing, because the `COPILOT_GITHUB_TOKEN` fallback may be rejected when loading the Copilot model catalog. Setting `copilot-requests: none` also silences this warning.
+
+To use individual/seat billing without receiving this tip on future compilations, explicitly disable organization billing:
+
+```yaml
+permissions:
+  copilot-requests: none
+```
+
 **Individual/seat billing** — If the above conditions are not met, the workflow must be configured with a user-supplied [`COPILOT_GITHUB_TOKEN`](/gh-aw/reference/auth/#copilot_github_token). In this case inference is attributed to (and limited by) the PAT owner's Copilot entitlements rather than being billed centrally through the organization.
 
 See [Engines](/gh-aw/reference/engines/) for a full list of engines and their authentication requirements, and [Authentication](/gh-aw/reference/auth/) for configuration details. For Copilot model pricing and AIC rates, see [GitHub Copilot models and pricing](https://docs.github.com/copilot/reference/copilot-billing/models-and-pricing).
+
+An `Authentication failed with provider ... (HTTP 403)` message from the local API proxy does not necessarily indicate a billing or credential problem. Copilot CLI can emit the same message when the proxy enforces `max-ai-credits`. gh-aw compares the proxy's token-usage total with the configured cap to identify budget exhaustion and avoid retrying against an exhausted budget. Failure reports use the budget category instead of organization billing guidance when that evidence is present.
 
 ### Anthropic (Claude)
 
@@ -51,4 +64,17 @@ When using [`engine: gemini`](/gh-aw/reference/engines/) or passing `GEMINI_API_
 
 ## Estimating and Monitoring Costs
 
-Use `gh aw logs` to view per-run AI Credits (AIC) and duration, and `gh aw audit <run-id>` for a detailed breakdown of token usage and inference spend. See [Cost Management](/gh-aw/reference/cost-management/) for monitoring strategies, cost controls, and techniques for reducing spend.
+Before dispatching a workflow, establish a budget using a recent comparable run or the published model tables. For an existing workflow, inspect recent AIC and duration first, then treat the highest recent run as a conservative pre-run cap:
+
+```bash
+gh aw logs my-workflow --last 5 --json \
+  | jq '.per_run_breakdown[] | {run_id, aic, action_minutes}'
+```
+
+For a new or materially changed workflow, compile first so the checked-in workflow and declared engine/model are final, then compare that configuration against the published pricing tables before enabling broad rollout:
+
+```bash
+gh aw compile .github/workflows/my-workflow.md
+```
+
+Use `gh aw audit <run-id>` after a representative run to validate the estimate against actual token usage and inference spend. See [Cost Management](/gh-aw/reference/cost-management/) for monitoring strategies, budget guardrails, and techniques for reducing spend, and [Model Tables](/gh-aw/reference/model-tables/) for current model pricing inputs.

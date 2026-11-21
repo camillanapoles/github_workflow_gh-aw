@@ -4,6 +4,7 @@ package cli
 
 import (
 	"os"
+	"path/filepath"
 	"runtime"
 	"testing"
 
@@ -172,6 +173,7 @@ func TestDetectShellPrioritizesVersionVariable(t *testing.T) {
 }
 
 func TestShellTypeString(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		shellType ShellType
 		expected  string
@@ -229,7 +231,7 @@ func TestUninstallBashCompletionNotFound(t *testing.T) {
 	// Uninstall should fail when no file found
 	err := uninstallBashCompletion(false)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no bash completion file found")
+	require.ErrorContains(t, err, "no bash completion file found")
 }
 
 func TestUninstallZshCompletion(t *testing.T) {
@@ -271,7 +273,7 @@ func TestUninstallZshCompletionNotFound(t *testing.T) {
 	// Uninstall should fail when no file found
 	err := uninstallZshCompletion(false)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no zsh completion file found")
+	require.ErrorContains(t, err, "no zsh completion file found")
 }
 
 func TestUninstallFishCompletion(t *testing.T) {
@@ -313,7 +315,7 @@ func TestUninstallFishCompletionNotFound(t *testing.T) {
 	// Uninstall should fail when no file found
 	err := uninstallFishCompletion(false)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no fish completion file found")
+	require.ErrorContains(t, err, "no fish completion file found")
 }
 
 func TestUninstallShellCompletion(t *testing.T) {
@@ -405,11 +407,29 @@ func TestUninstallShellCompletion(t *testing.T) {
 			if tt.expectError {
 				require.Error(t, err)
 				if tt.errorMessage != "" {
-					assert.Contains(t, err.Error(), tt.errorMessage)
+					require.ErrorContains(t, err, tt.errorMessage)
 				}
 			} else {
 				require.NoError(t, err)
 			}
 		})
 	}
+}
+
+func TestValidateRcPath(t *testing.T) {
+	t.Parallel()
+	t.Run("returns cleaned path for absolute path", func(t *testing.T) {
+		homeDir := t.TempDir()
+		cleanPath, err := validateRcPath("bashrc", filepath.Join(homeDir, ".", ".bashrc"))
+		require.NoError(t, err)
+		require.Equal(t, filepath.Join(homeDir, ".bashrc"), cleanPath)
+	})
+
+	t.Run("returns actionable error for relative path", func(t *testing.T) {
+		_, err := validateRcPath("zshrc", ".zshrc")
+		require.Error(t, err)
+		require.ErrorContains(t, err, `zshrc path ".zshrc" is not an absolute path`)
+		require.ErrorContains(t, err, "expected an absolute path such as '/home/user/.zshrc'")
+		require.ErrorContains(t, err, "set $HOME to an absolute home directory and retry")
+	})
 }

@@ -189,6 +189,11 @@ Line 2`,
 			expected: "Line 1\nLine 2\nLine 3",
 		},
 		{
+			name:     "normalizes CRLF line endings",
+			input:    "Line 1\r\n\r\n\r\nLine 2",
+			expected: "Line 1\n\nLine 2",
+		},
+		{
 			name: "handles empty lines at start",
 			input: `
 
@@ -376,7 +381,7 @@ func TestCollectPromptSections_GitHubMCPAndSafeOutputsConsistency(t *testing.T) 
 	})
 }
 
-// TestCollectPromptSections_CliProxy tests that when the cli-proxy feature flag is
+// TestCollectPromptSections_CliProxy tests that when GitHub gh-proxy mode is
 // enabled, the cli-proxy prompt is used instead of the GitHub MCP tools prompt,
 // and that the GitHub MCP server guidance is never injected.
 func TestCollectPromptSections_CliProxy(t *testing.T) {
@@ -384,8 +389,8 @@ func TestCollectPromptSections_CliProxy(t *testing.T) {
 		compiler := &Compiler{}
 
 		data := &WorkflowData{
+			Tools:       map[string]any{"github": map[string]any{"mode": "gh-proxy"}},
 			ParsedTools: NewTools(map[string]any{"github": true}),
-			Features:    map[string]any{"cli-proxy": true},
 			SafeOutputs: nil,
 		}
 
@@ -439,8 +444,8 @@ func TestCollectPromptSections_CliProxy(t *testing.T) {
 		compiler := &Compiler{}
 
 		data := &WorkflowData{
+			Tools:       map[string]any{"github": map[string]any{"mode": "gh-proxy"}},
 			ParsedTools: NewTools(map[string]any{"github": true}),
-			Features:    map[string]any{"cli-proxy": true},
 			SafeOutputs: &SafeOutputsConfig{
 				MissingData: &MissingDataConfig{},
 				NoOp:        &NoOpConfig{},
@@ -469,7 +474,7 @@ func TestCollectPromptSections_CliProxy(t *testing.T) {
 		}
 	})
 
-	t.Run("cli-proxy enabled without github tool still adds cli-proxy prompt", func(t *testing.T) {
+	t.Run("legacy features flag does not enable cli-proxy prompt", func(t *testing.T) {
 		compiler := &Compiler{}
 
 		data := &WorkflowData{
@@ -480,15 +485,11 @@ func TestCollectPromptSections_CliProxy(t *testing.T) {
 
 		sections := compiler.collectPromptSections(data)
 
-		// Should include cli-proxy prompt even without github tool configured
-		var cliProxySection *PromptSection
 		for i := range sections {
 			if sections[i].IsFile && sections[i].Content == cliProxyPromptFile {
-				cliProxySection = &sections[i]
-				break
+				t.Fatal("legacy features flag must not add cli_proxy_prompt.md")
 			}
 		}
-		require.NotNil(t, cliProxySection, "Should include cli_proxy_prompt.md when cli-proxy is enabled regardless of tools.github")
 	})
 
 	t.Run("cli-proxy disabled uses GitHub MCP tools prompt when github tool is enabled", func(t *testing.T) {
@@ -547,9 +548,8 @@ func TestCollectPromptSections_PRCommentPushToPRBranchGuidance(t *testing.T) {
 		}
 
 		require.NotNil(t, guidanceSection, "Should include push-to-PR-branch guidance for PR comment workflows")
-		assert.NotEmpty(t, guidanceSection.ShellCondition, "Guidance should be conditionally injected for PR-comment events")
-		assert.Contains(t, guidanceSection.ShellCondition, "issue_comment")
-		assert.Equal(t, "${{ github.event.issue.pull_request && 'true' || '' }}", guidanceSection.EnvVars["GH_AW_IS_PR_COMMENT"])
+		assert.Equal(t, "GH_AW_INCLUDE_PR_CONTEXT", guidanceSection.ConditionEnvVar, "Guidance should be conditionally injected for PR-comment events")
+		assert.Contains(t, guidanceSection.EnvVars["GH_AW_INCLUDE_PR_CONTEXT"], "github.event_name")
 	})
 
 	t.Run("includes guidance when pull_request_review_comment triggers and push-to-pr-branch is configured", func(t *testing.T) {
@@ -572,8 +572,7 @@ func TestCollectPromptSections_PRCommentPushToPRBranchGuidance(t *testing.T) {
 		}
 
 		require.NotNil(t, guidanceSection, "Should include push-to-PR-branch guidance for pull_request_review_comment workflows")
-		assert.NotEmpty(t, guidanceSection.ShellCondition, "Guidance should be conditionally injected for PR-comment events")
-		assert.Contains(t, guidanceSection.ShellCondition, "pull_request_review_comment")
+		assert.Equal(t, "GH_AW_INCLUDE_PR_CONTEXT", guidanceSection.ConditionEnvVar, "Guidance should be conditionally injected for PR-comment events")
 	})
 
 	t.Run("does not include guidance when push-to-pr-branch is not configured", func(t *testing.T) {
@@ -605,4 +604,174 @@ func TestCollectPromptSections_PRCommentPushToPRBranchGuidance(t *testing.T) {
 				"Should not include push-to-PR-branch guidance when SafeOutputs is nil")
 		}
 	})
+}
+
+// TestGenerateUnifiedPromptCreationStep_TrailingWhitespace verifies that trailing
+// whitespace is stripped from every user-prompt content line.
+func TestGenerateUnifiedPromptCreationStep_TrailingWhitespace(t *testing.T) {
+	compiler := &Compiler{}
+	data := &WorkflowData{
+		ParsedTools: NewTools(map[string]any{}),
+	}
+	builtinSections := compiler.collectPromptSections(data)
+
+	// Chunk lines with assorted trailing whitespace
+	userPromptChunks := []string{"line one   \nline two\t\nline three  \t  "}
+
+	var sb strings.Builder
+	compiler.generateUnifiedPromptCreationStep(&sb, builtinSections, userPromptChunks, nil, data)
+	output := sb.String()
+
+	assert.NotContains(t, output, "line one   ", "trailing spaces should be stripped")
+	assert.NotContains(t, output, "line two\t", "trailing tab should be stripped")
+	assert.NotContains(t, output, "line three  \t  ", "mixed trailing whitespace should be stripped")
+	assert.Contains(t, output, `line one\nline two\nline three\n`, "normalized content should be stored in a data environment variable")
+}
+
+// TestGenerateUnifiedPromptCreationStep_BlankRunCapWithinChunk verifies that a run of
+// more than maxConsecutiveBlankLines blank lines inside a single chunk is capped.
+func TestGenerateUnifiedPromptCreationStep_BlankRunCapWithinChunk(t *testing.T) {
+	compiler := &Compiler{}
+	data := &WorkflowData{
+		ParsedTools: NewTools(map[string]any{}),
+	}
+	builtinSections := compiler.collectPromptSections(data)
+
+	// Four consecutive blank lines between content lines – should be collapsed to two.
+	userPromptChunks := []string{"# Start\n\n\n\n\n# End"}
+
+	var sb strings.Builder
+	compiler.generateUnifiedPromptCreationStep(&sb, builtinSections, userPromptChunks, nil, data)
+	output := sb.String()
+
+	assert.Contains(t, output, "# Start", "start marker should be present")
+	assert.Contains(t, output, "# End", "end marker should be present")
+
+	// At most maxConsecutiveBlankLines (2) blank lines should appear between them.
+	startIdx := strings.Index(output, "# Start")
+	endIdx := strings.Index(output, "# End")
+	require.Less(t, startIdx, endIdx)
+	between := output[startIdx:endIdx]
+	// Three or more consecutive newlines would indicate a blank run of >2.
+	assert.NotContains(t, between, "\n\n\n\n", "blank run should be capped at 2")
+}
+
+// TestGenerateUnifiedPromptCreationStep_BlankRunCapAcrossChunks verifies that a blank
+// run straddling two adjacent chunks is still capped correctly.
+func TestGenerateUnifiedPromptCreationStep_BlankRunCapAcrossChunks(t *testing.T) {
+	compiler := &Compiler{}
+	data := &WorkflowData{
+		ParsedTools: NewTools(map[string]any{}),
+	}
+	builtinSections := compiler.collectPromptSections(data)
+
+	// chunk1 ends with two blank lines; chunk2 starts with two blank lines.
+	// Across the boundary that would be four consecutive blanks; they should be collapsed.
+	userPromptChunks := []string{
+		"# Chunk1\n\n\n",
+		"\n\n# Chunk2",
+	}
+
+	var sb strings.Builder
+	compiler.generateUnifiedPromptCreationStep(&sb, builtinSections, userPromptChunks, nil, data)
+	output := sb.String()
+
+	startIdx := strings.Index(output, "# Chunk1")
+	endIdx := strings.Index(output, "# Chunk2")
+	require.Less(t, startIdx, endIdx)
+	between := output[startIdx:endIdx]
+	assert.NotContains(t, between, "\n\n\n\n", "blank run across chunk boundary should be capped at 2")
+}
+
+// TestGenerateUnifiedPromptCreationStep_BlankRunCapAdjacentToRuntimeImport verifies
+// that blank-run tracking resets correctly around a runtime-import macro so blank lines
+// on both sides of the macro are handled independently.
+func TestGenerateUnifiedPromptCreationStep_BlankRunCapAdjacentToRuntimeImport(t *testing.T) {
+	compiler := &Compiler{}
+	data := &WorkflowData{
+		ParsedTools: NewTools(map[string]any{}),
+	}
+	builtinSections := compiler.collectPromptSections(data)
+
+	// chunk[0] ends with a long blank run, chunk[1] is a runtime-import macro,
+	// chunk[2] starts with a long blank run.
+	userPromptChunks := []string{
+		"# Before\n\n\n\n",
+		"{{#runtime-import docs/task.md}}",
+		"\n\n\n\n# After",
+	}
+
+	var sb strings.Builder
+	compiler.generateUnifiedPromptCreationStep(&sb, builtinSections, userPromptChunks, nil, data)
+	output := sb.String()
+
+	// Runtime-import macro must be present verbatim.
+	assert.Contains(t, output, "{{#runtime-import docs/task.md}}", "runtime-import macro must be emitted verbatim")
+
+	// Content markers must appear.
+	assert.Contains(t, output, "# Before", "before-marker should be present")
+	assert.Contains(t, output, "# After", "after-marker should be present")
+
+	// No run of four or more newlines (i.e., 3+ consecutive blank lines) anywhere.
+	assert.NotContains(t, output, "\n\n\n\n", "blank run should be capped throughout the output")
+}
+
+func TestCollectPromptSections_TrialLogicalRepoGitHubContext(t *testing.T) {
+	compiler := &Compiler{}
+
+	data := &WorkflowData{
+		ParsedTools: NewTools(map[string]any{
+			"github": true,
+		}),
+		Permissions:      "contents: read",
+		On:               "issue_comment",
+		TrialMode:        true,
+		TrialLogicalRepo: "owner/target",
+	}
+
+	sections := compiler.collectPromptSections(data)
+
+	var githubContext string
+	for _, section := range sections {
+		if !section.IsFile && strings.Contains(section.Content, "github-context") {
+			githubContext = section.Content
+			break
+		}
+	}
+	require.NotEmpty(t, githubContext, "Should have a github-context section")
+
+	assert.Contains(t, githubContext, "- **repository**: owner/target",
+		"github-context should report the logical target repository")
+	assert.NotContains(t, githubContext, "**repository**: ${{ github.repository }}",
+		"github-context should not report the host repository in trial mode")
+	assert.Contains(t, githubContext, "trial mode",
+		"github-context should include a trial mode directive")
+}
+
+func TestCollectPromptSections_NoTrialLogicalRepoKeepsHostRepo(t *testing.T) {
+	compiler := &Compiler{}
+
+	data := &WorkflowData{
+		ParsedTools: NewTools(map[string]any{
+			"github": true,
+		}),
+		Permissions: "contents: read",
+		On:          "issue_comment",
+	}
+
+	sections := compiler.collectPromptSections(data)
+
+	var githubContext string
+	for _, section := range sections {
+		if !section.IsFile && strings.Contains(section.Content, "github-context") {
+			githubContext = section.Content
+			break
+		}
+	}
+	require.NotEmpty(t, githubContext, "Should have a github-context section")
+
+	assert.Contains(t, githubContext, "**repository**:",
+		"github-context should report the repository via the github.repository expression")
+	assert.NotContains(t, githubContext, "owner/target",
+		"github-context should not include a logical target when trial mode is off")
 }

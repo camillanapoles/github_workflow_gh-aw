@@ -11,14 +11,21 @@ global.core = {
   debug: vi.fn(),
 };
 
-import { withRetry, isTransientError, getRetryAfterMs, enhanceError, createValidationError, createOperationError, DEFAULT_RETRY_CONFIG, RATE_LIMIT_RETRY_CONFIG } from "./error_recovery.cjs";
+import { withRetry, sleep, isTransientError, getRetryAfterMs, enhanceError, createValidationError, createOperationError, DEFAULT_RETRY_CONFIG, RATE_LIMIT_RETRY_CONFIG } from "./error_recovery.cjs";
+import { TransportIntegrityError } from "./transport_integrity.cjs";
 
 describe("error_recovery", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.spyOn(fs, "appendFileSync").mockImplementation(() => undefined);
   });
+  afterEach(() => vi.restoreAllMocks());
 
   describe("isTransientError", () => {
+    it.each(["network", "timeout", "rate limit", "secondary rate limit", "econnreset"])("never retries transport-integrity errors whose paths contain %s", text => {
+      expect(isTransientError(new TransportIntegrityError(`/tmp/gh-aw/aw-${text}.patch`))).toBe(false);
+    });
+
     it("should identify network errors as transient", () => {
       expect(isTransientError(new Error("Network error occurred"))).toBe(true);
       expect(isTransientError(new Error("ECONNRESET"))).toBe(true);
@@ -35,6 +42,7 @@ describe("error_recovery", () => {
     it("should identify rate limit errors as transient", () => {
       expect(isTransientError(new Error("Rate limit exceeded"))).toBe(true);
       expect(isTransientError(new Error("Secondary rate limit hit"))).toBe(true);
+      expect(isTransientError(new Error("Too Many Requests"))).toBe(true);
       expect(isTransientError(new Error("Abuse detection triggered"))).toBe(true);
     });
 
@@ -48,6 +56,22 @@ describe("error_recovery", () => {
       expect(isTransientError(new Error("<!doctype html>\n<html>..."))).toBe(true);
       // With leading whitespace
       expect(isTransientError(new Error("  <!DOCTYPE html><html>..."))).toBe(true);
+    });
+
+    it("should identify status-only 429 errors as transient even with a non-descriptive message", () => {
+      // Octokit can produce errors where status=429 but the message contains no rate-limit text.
+      expect(isTransientError({ status: 429, message: "Request failed" })).toBe(true);
+      expect(isTransientError({ response: { status: 429 }, message: "Request failed" })).toBe(true);
+    });
+
+    it.each([408, 425, 500, 502, 503, 504])("should identify HTTP %i as transient without relying on message text", status => {
+      expect(isTransientError({ status, message: "Request failed" })).toBe(true);
+      expect(isTransientError({ response: { status }, message: "Request failed" })).toBe(true);
+    });
+
+    it("should not identify non-transient HTTP statuses as transient", () => {
+      expect(isTransientError({ status: 400, message: "Request failed" })).toBe(false);
+      expect(isTransientError({ status: 404, message: "Request failed" })).toBe(false);
     });
 
     it("should not identify validation errors as transient", () => {
@@ -64,6 +88,39 @@ describe("error_recovery", () => {
   });
 
   describe("withRetry", () => {
+    it("succeeds on the first attempt without an ambient Actions core or injected logger", async () => {
+      const actionsCore = global.core;
+      delete global.core;
+      const operation = vi.fn().mockResolvedValue("success");
+      try {
+        await expect(withRetry(operation)).resolves.toBe("success");
+        expect(operation).toHaveBeenCalledOnce();
+      } finally {
+        global.core = actionsCore;
+      }
+    });
+
+    it("uses an injected logger without an ambient Actions core", async () => {
+      const logger = { info: vi.fn(), warning: vi.fn(), debug: vi.fn() };
+      vi.stubGlobal("core", undefined);
+      try {
+        await expect(withRetry(() => Promise.reject(new Error("Invalid input")), { logger, maxRetries: 0 }, "injected")).rejects.toThrow("Invalid input");
+        expect(logger.debug).toHaveBeenCalledWith("injected failed with non-retryable error: Invalid input");
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("routes retry diagnostics to the injected logger", async () => {
+      const logger = { info: vi.fn(), warning: vi.fn(), debug: vi.fn() };
+      const operation = vi.fn().mockRejectedValueOnce(new Error("Network timeout")).mockResolvedValue("success");
+      await expect(withRetry(operation, { logger, maxRetries: 1, sleep: async () => {} }, "injected")).resolves.toBe("success");
+      expect(logger.warning).toHaveBeenCalledOnce();
+      expect(logger.info).toHaveBeenCalledWith(expect.stringContaining("succeeded on retry attempt 1"));
+      expect(core.info).not.toHaveBeenCalled();
+      expect(core.warning).not.toHaveBeenCalled();
+    });
+
     it("should succeed on first attempt", async () => {
       const operation = vi.fn().mockResolvedValue("success");
       const result = await withRetry(operation, {}, "test-operation");
@@ -101,6 +158,45 @@ describe("error_recovery", () => {
 
       expect(operation).toHaveBeenCalledTimes(3); // Initial + 2 retries
       expect(core.warning).toHaveBeenCalledWith(expect.stringContaining("failed after 2 retry attempts"));
+    });
+
+    it("should emit E010 RATE_LIMIT_EXCEEDED when rate limit persists after 3 retries", async () => {
+      const rateLimitError = {
+        message: "Too Many Requests",
+        response: { status: 429, headers: { "retry-after": "1" } },
+      };
+      const operation = vi.fn().mockRejectedValue(rateLimitError);
+
+      await expect(withRetry(operation, { maxRetries: 3, initialDelayMs: 1 }, "test-operation")).rejects.toThrow("E010 RATE_LIMIT_EXCEEDED");
+
+      expect(operation).toHaveBeenCalledTimes(4); // Initial + 3 retries
+    });
+
+    it("should emit E010 for exhausted retries on a secondary rate limit", async () => {
+      const rateLimitError = {
+        message: "secondary rate limit",
+        response: { status: 403, headers: { "retry-after": "1", "x-ratelimit-remaining": "0" } },
+      };
+      const operation = vi.fn().mockRejectedValue(rateLimitError);
+
+      await expect(withRetry(operation, { maxRetries: 3, initialDelayMs: 1 }, "test-operation")).rejects.toThrow("E010 RATE_LIMIT_EXCEEDED");
+    });
+
+    it("should emit E010 for exhausted retries on abuse-detection message without status", async () => {
+      const rateLimitError = new Error("Abuse detection mechanism triggered");
+      const operation = vi.fn().mockRejectedValue(rateLimitError);
+
+      await expect(withRetry(operation, { maxRetries: 3, initialDelayMs: 1 }, "test-operation")).rejects.toThrow("E010 RATE_LIMIT_EXCEEDED");
+    });
+
+    it("should emit E010 for status-only 429 with non-descriptive message persisting after 3 retries", async () => {
+      // Verifies that an Octokit-style error with status=429 and a generic message
+      // is retried (isTransientError returns true via isRateLimitError) and emits E010 on exhaustion.
+      const rateLimitError = { status: 429, message: "Request failed" };
+      const operation = vi.fn().mockRejectedValue(rateLimitError);
+
+      await expect(withRetry(operation, { maxRetries: 3, initialDelayMs: 1 }, "test-operation")).rejects.toThrow("E010 RATE_LIMIT_EXCEEDED");
+      expect(operation).toHaveBeenCalledTimes(4); // Initial + 3 retries
     });
 
     it("should use exponential backoff", async () => {
@@ -151,6 +247,27 @@ describe("error_recovery", () => {
       expect(shouldRetry).toHaveBeenCalled();
     });
 
+    it("should use a custom sleep for each calculated retry delay", async () => {
+      const sleep = vi.fn().mockResolvedValue(undefined);
+      const operation = vi.fn().mockRejectedValueOnce(new Error("Network timeout")).mockRejectedValueOnce(new Error("Network timeout")).mockResolvedValue("success");
+
+      await expect(withRetry(operation, { maxRetries: 2, initialDelayMs: 125, jitterMs: 0, sleep }, "test-operation")).resolves.toBe("success");
+
+      expect(sleep.mock.calls).toEqual([[250], [500]]);
+      expect(operation).toHaveBeenCalledTimes(3);
+    });
+
+    it("should stop before the next operation when a custom wait is cancelled", async () => {
+      const cancelled = new Error("Retry deadline exceeded");
+      const sleep = vi.fn().mockRejectedValue(cancelled);
+      const operation = vi.fn().mockRejectedValue(new Error("Network timeout"));
+
+      await expect(withRetry(operation, { maxRetries: 2, sleep, shouldRetry: error => error !== cancelled }, "test-operation")).rejects.toHaveProperty("originalError", cancelled);
+
+      expect(sleep).toHaveBeenCalledOnce();
+      expect(operation).toHaveBeenCalledOnce();
+    });
+
     it("should add random jitter to delay when jitterMs is configured", async () => {
       const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.5);
       const operation = vi.fn().mockRejectedValueOnce(new Error("Network timeout")).mockResolvedValue("success");
@@ -188,6 +305,178 @@ describe("error_recovery", () => {
 
       // Base delay after first failure: 100 * 2 = 200ms, no jitter
       expect(core.info).toHaveBeenCalledWith(expect.stringContaining("after 200ms delay"));
+    });
+
+    it("should cap the delay after adding jitter", async () => {
+      const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.99);
+      const operation = vi.fn().mockRejectedValueOnce(new Error("Network timeout")).mockResolvedValue("success");
+
+      await withRetry(operation, { maxRetries: 1, initialDelayMs: 1000, backoffMultiplier: 2, maxDelayMs: 2000, jitterMs: 1000 }, "test-operation");
+
+      expect(core.info).toHaveBeenCalledWith(expect.stringContaining("after 2000ms delay"));
+      randomSpy.mockRestore();
+    });
+
+    it.each([
+      ["maxRetries", -1],
+      ["initialDelayMs", Number.NaN],
+      ["maxDelayMs", Number.POSITIVE_INFINITY],
+      ["maxDelayMs", 2 ** 31],
+      ["jitterMs", 1.5],
+      ["backoffMultiplier", 0],
+      ["timeoutMs", -1],
+      ["timeoutMs", Number.NaN],
+      ["timeoutMs", 2 ** 31],
+      ["deadline", Number.NaN],
+    ])("should reject invalid %s configuration", async (key, value) => {
+      const operation = vi.fn();
+
+      await expect(withRetry(operation, { [key]: value }, "test-operation")).rejects.toThrow(`Retry configuration ${key}`);
+      expect(operation).not.toHaveBeenCalled();
+    });
+
+    it("should accept the largest supported timer delay", async () => {
+      const operation = vi.fn().mockResolvedValue("success");
+
+      await expect(withRetry(operation, { maxDelayMs: 2 ** 31 - 1 }, "test-operation")).resolves.toBe("success");
+    });
+
+    it("should reject a non-function retry predicate", async () => {
+      // @ts-expect-error Deliberately exercise runtime input validation.
+      await expect(withRetry(vi.fn(), { shouldRetry: true }, "test-operation")).rejects.toThrow("Retry configuration shouldRetry must be a function");
+    });
+    it("should reject a non-function sleep before executing the operation", async () => {
+      const operation = vi.fn();
+      // @ts-expect-error Deliberately exercise runtime input validation.
+      await expect(withRetry(operation, { sleep: true }, "test-operation")).rejects.toThrow("Retry configuration sleep must be a function");
+      expect(operation).not.toHaveBeenCalled();
+    });
+    it.each(["now", "timeoutError"])("should reject a non-function %s", async key => {
+      const operation = vi.fn();
+      await expect(withRetry(operation, { [key]: true }, "test-operation")).rejects.toThrow(`Retry configuration ${key} must be a function`);
+      expect(operation).not.toHaveBeenCalled();
+    });
+
+    describe("timeout and deadline budgets", () => {
+      beforeEach(() => vi.useFakeTimers());
+      afterEach(() => {
+        vi.useRealTimers();
+        vi.restoreAllMocks();
+      });
+
+      it("should preserve the no-argument operation call without a budget", async () => {
+        const operation = vi.fn().mockResolvedValue("success");
+        await expect(withRetry(operation)).resolves.toBe("success");
+        expect(operation).toHaveBeenCalledExactlyOnceWith();
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("should time out and abort a noncooperative operation", async () => {
+        let signal;
+        const operation = vi.fn(current => {
+          signal = current;
+          return new Promise(() => {});
+        });
+        const assertion = expect(withRetry(operation, { maxRetries: 0, timeoutMs: 100, now: () => Date.now() })).rejects.toThrow("Operation timeout exceeded");
+        await vi.advanceTimersByTimeAsync(100);
+        await assertion;
+        expect(signal.aborted).toBe(true);
+        expect(operation).toHaveBeenCalledOnce();
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("should include synchronous setup in the operation timeout", async () => {
+        const start = Date.now();
+        const operation = vi.fn(() => {
+          vi.advanceTimersByTime(50);
+          return new Promise(() => {});
+        });
+        const assertion = expect(withRetry(operation, { maxRetries: 0, timeoutMs: 100, now: () => Date.now() })).rejects.toThrow("Operation timeout exceeded");
+        await vi.advanceTimersByTimeAsync(50);
+        await assertion;
+        expect(Date.now() - start).toBe(100);
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("should cap each operation at the shared deadline", async () => {
+        const start = Date.now();
+        const timeout = new Error("Custom deadline");
+        const operation = vi.fn(() => new Promise(() => {}));
+        const assertion = expect(withRetry(operation, { timeoutMs: 100, deadline: start + 60, now: () => Date.now(), timeoutError: () => timeout })).rejects.toHaveProperty("originalError", timeout);
+        await vi.advanceTimersByTimeAsync(60);
+        await assertion;
+        expect(Date.now() - start).toBe(60);
+        expect(operation).toHaveBeenCalledOnce();
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("should reject late success even when the timeout callback has not run", async () => {
+        const start = Date.now();
+        const operation = vi.fn(async () => {
+          vi.setSystemTime(start + 101);
+          return "late success";
+        });
+        await expect(withRetry(operation, { maxRetries: 0, timeoutMs: 100, now: () => Date.now() })).rejects.toThrow("Operation timeout exceeded");
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("should cancel backoff at the deadline without starting another attempt", async () => {
+        const start = Date.now();
+        const operation = vi.fn().mockRejectedValue(new Error("Network timeout"));
+        const assertion = expect(withRetry(operation, { maxRetries: 2, initialDelayMs: 100, jitterMs: 0, timeoutMs: 10, deadline: start + 100, now: () => Date.now() })).rejects.toThrow("Operation timeout exceeded");
+        await vi.advanceTimersByTimeAsync(100);
+        await assertion;
+        expect(operation).toHaveBeenCalledOnce();
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("should retry operation timeouts within the overall budget", async () => {
+        const start = Date.now();
+        const operation = vi
+          .fn()
+          .mockImplementationOnce(() => new Promise(() => {}))
+          .mockResolvedValueOnce("recovered");
+        const assertion = expect(withRetry(operation, { maxRetries: 1, initialDelayMs: 5, jitterMs: 0, timeoutMs: 100, deadline: start + 1000, now: () => Date.now() })).resolves.toBe("recovered");
+        await vi.advanceTimersByTimeAsync(110);
+        await assertion;
+        expect(operation).toHaveBeenCalledTimes(2);
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("should not invoke operations after an expired deadline or zero timeout", async () => {
+        const operation = vi.fn();
+        await expect(withRetry(operation, { deadline: Date.now(), now: () => Date.now() })).rejects.toThrow("Operation timeout exceeded");
+        await expect(withRetry(operation, { deadline: -1, now: () => 0 })).rejects.toThrow("Operation timeout exceeded");
+        await expect(withRetry(operation, { maxRetries: 0, timeoutMs: 0, now: () => Date.now() })).rejects.toThrow("Operation timeout exceeded");
+        expect(operation).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("should reject invalid clocks and unsafe deadline timers before invoking operations", async () => {
+        const operation = vi.fn();
+        await expect(withRetry(operation, { maxRetries: 0, timeoutMs: 100, now: () => Number.NaN })).rejects.toThrow("Retry clock must return a finite number");
+        await expect(withRetry(operation, { deadline: Date.now() + 2 ** 31, now: () => Date.now() })).rejects.toThrow("Retry deadline must be within");
+        expect(operation).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("should remove the cancellation listener after a successful sleep", async () => {
+        const controller = new AbortController();
+        const remove = vi.spyOn(controller.signal, "removeEventListener");
+        const promise = sleep(100, controller.signal);
+        await vi.advanceTimersByTimeAsync(100);
+        await promise;
+        expect(remove).toHaveBeenCalledWith("abort", expect.any(Function));
+        expect(vi.getTimerCount()).toBe(0);
+      });
+
+      it("should not schedule a sleep that is already aborted", async () => {
+        const controller = new AbortController();
+        const reason = new Error("Already cancelled");
+        controller.abort(reason);
+        await expect(sleep(100, controller.signal)).rejects.toBe(reason);
+        expect(vi.getTimerCount()).toBe(0);
+      });
     });
   });
 
@@ -369,11 +658,28 @@ describe("error_recovery", () => {
       // 403 without x-ratelimit-remaining: 0 is not a rate-limit response
       const error403 = { response: { status: 403, headers: { "retry-after": "60", "x-ratelimit-remaining": "100" } } };
       expect(getRetryAfterMs(error403)).toBeNull();
+      const secondaryRateLimitWithoutRemaining = { response: { status: 403, headers: { "retry-after": "60" } } };
+      expect(getRetryAfterMs(secondaryRateLimitWithoutRemaining)).toBeNull();
     });
 
     it("should extract retry-after seconds from response headers on 429", () => {
       const error = { response: { status: 429, headers: { "retry-after": "60" } } };
       expect(getRetryAfterMs(error)).toBe(60000);
+    });
+
+    it("should extract retry-after seconds from a 403 secondary rate-limit response", () => {
+      const error = { response: { status: 403, headers: { "retry-after": "30", "x-ratelimit-remaining": "0" } } };
+      expect(getRetryAfterMs(error)).toBe(30000);
+    });
+
+    it("should extract retry-after seconds from a 503 response", () => {
+      const error = { response: { status: 503, headers: { "retry-after": "15" } } };
+      expect(getRetryAfterMs(error)).toBe(15000);
+    });
+
+    it("should read case-insensitive headers from a Fetch Headers instance", () => {
+      const error = { response: { status: 429, headers: new Headers({ "Retry-After": "20" }) } };
+      expect(getRetryAfterMs(error)).toBe(20000);
     });
 
     it("should extract retry-after seconds from top-level headers on 429", () => {
@@ -426,6 +732,14 @@ describe("error_recovery", () => {
       const error = { response: { status: 429, headers: { "retry-after": "not-a-number" } } };
       expect(getRetryAfterMs(error)).toBeNull();
     });
+
+    it("should parse retry-after HTTP-date on 429", () => {
+      const retryAt = new Date(Date.now() + 60000).toUTCString();
+      const error = { response: { status: 429, headers: { "retry-after": retryAt } } };
+      const result = getRetryAfterMs(error);
+      expect(result).toBeGreaterThan(55000);
+      expect(result).toBeLessThan(65000);
+    });
   });
 
   describe("withRetry with Retry-After header", () => {
@@ -454,6 +768,19 @@ describe("error_recovery", () => {
 
       expect(result).toBe("success");
       // The delay used should be 1000ms (from Retry-After: 1) rather than 20ms (10 * 2)
+      expect(core.info).toHaveBeenCalledWith(expect.stringContaining("Retry-After header detected for test-operation: next retry will wait 1000ms"));
+    });
+
+    it("should use Retry-After delay for a status-only 503 response", async () => {
+      const retryAfterError = {
+        message: "Request failed",
+        response: { status: 503, headers: { "retry-after": "1" } },
+      };
+      const operation = vi.fn().mockRejectedValueOnce(retryAfterError).mockResolvedValue("success");
+
+      const result = await withRetry(operation, { maxRetries: 1, initialDelayMs: 10, backoffMultiplier: 2, jitterMs: 0 }, "test-operation");
+
+      expect(result).toBe("success");
       expect(core.info).toHaveBeenCalledWith(expect.stringContaining("Retry-After header detected for test-operation: next retry will wait 1000ms"));
     });
 

@@ -417,7 +417,7 @@ describe("update_handler_factory.cjs", () => {
   });
 
   describe("createStandardResolveNumber", () => {
-    it("should create a resolve function that uses resolveTarget helper", async () => {
+    it("UI-001 defaults an omitted target to the triggering issue", async () => {
       const resolveNumber = factoryModule.createStandardResolveNumber({
         itemType: "update_issue",
         itemNumberField: "issue_number",
@@ -425,11 +425,67 @@ describe("update_handler_factory.cjs", () => {
         supportsIssue: true,
       });
 
-      const item = { issue_number: 42 };
+      const result = resolveNumber({ issue_number: 99 }, undefined, mockContext);
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(42);
+    });
+
+    it("UI-002 ignores a conflicting issue_number when target is triggering", async () => {
+      const resolveNumber = factoryModule.createStandardResolveNumber({
+        itemType: "update_issue",
+        itemNumberField: "issue_number",
+        supportsPR: false,
+        supportsIssue: true,
+      });
+
+      const item = { issue_number: 99 };
       const updateTarget = "triggering";
       const context = mockContext;
 
       const result = resolveNumber(item, updateTarget, context);
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(42);
+    });
+
+    it("UI-003 ignores a conflicting issue_number when target is fixed", async () => {
+      const resolveNumber = factoryModule.createStandardResolveNumber({
+        itemType: "update_issue",
+        itemNumberField: "issue_number",
+        supportsPR: false,
+        supportsIssue: true,
+      });
+
+      const result = resolveNumber({ issue_number: 99 }, "17", mockContext);
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(17);
+    });
+
+    it("UI-004 accepts issue_number when target is wildcard", async () => {
+      const resolveNumber = factoryModule.createStandardResolveNumber({
+        itemType: "update_issue",
+        itemNumberField: "issue_number",
+        supportsPR: false,
+        supportsIssue: true,
+      });
+
+      const result = resolveNumber({ issue_number: 99 }, "*", mockContext);
+
+      expect(result.success).toBe(true);
+      expect(result.number).toBe(99);
+    });
+
+    it("UI-005 ignores unresolved temporary IDs when target is triggering", async () => {
+      const resolveNumber = factoryModule.createStandardResolveNumber({
+        itemType: "update_issue",
+        itemNumberField: "issue_number",
+        supportsPR: false,
+        supportsIssue: true,
+      });
+
+      const result = resolveNumber({ issue_number: "aw_pending" }, "triggering", mockContext, {});
 
       expect(result.success).toBe(true);
       expect(result.number).toBe(42);
@@ -629,6 +685,7 @@ describe("update_handler_factory.cjs", () => {
   describe("authentication: github-token and cross-repo routing", () => {
     it("should use the global github client when no github-token in config", async () => {
       // Capture which github client is passed to executeUpdate
+      /** @type {any} */
       let capturedClient = null;
       const mockExecuteUpdate = vi.fn().mockImplementation(async (githubClient, context, num, data) => {
         capturedClient = githubClient;
@@ -654,6 +711,7 @@ describe("update_handler_factory.cjs", () => {
     });
 
     it("should route to target-repo when no message.repo is set", async () => {
+      /** @type {any} */
       let capturedContext = null;
       const mockExecuteUpdate = vi.fn().mockImplementation(async (githubClient, context, num, data) => {
         capturedContext = context;
@@ -679,6 +737,7 @@ describe("update_handler_factory.cjs", () => {
     });
 
     it("should route to message.repo when it matches the configured target-repo", async () => {
+      /** @type {any} */
       let capturedContext = null;
       const mockExecuteUpdate = vi.fn().mockImplementation(async (githubClient, context, num, data) => {
         capturedContext = context;
@@ -732,6 +791,7 @@ describe("update_handler_factory.cjs", () => {
     });
 
     it("should inject _workflowRepo into updateData before calling executeUpdate", async () => {
+      /** @type {any} */
       let capturedUpdateData = null;
       const mockExecuteUpdate = vi.fn().mockImplementation(async (githubClient, context, num, data) => {
         capturedUpdateData = data;
@@ -758,6 +818,7 @@ describe("update_handler_factory.cjs", () => {
     });
 
     it("should route to message.repo when target-repo is wildcard", async () => {
+      /** @type {any} */
       let capturedContext = null;
       const mockExecuteUpdate = vi.fn().mockImplementation(async (githubClient, context, num, data) => {
         capturedContext = context;

@@ -3,7 +3,8 @@ private: true
 emoji: "🧪"
 name: Smoke Project
 description: Smoke Project - Test project operations
-on: 
+on:
+  schedule: every 2 days
   slash_command:
     name: smoke-project
     strategy: centralized
@@ -35,6 +36,7 @@ safe-outputs:
       hide-older-comments: true
       max: 2
     create-pull-request:
+      draft: true
       title-prefix: "[smoke-project] "
       if-no-changes: "warn"
       labels: [ai-generated]
@@ -88,10 +90,16 @@ experiments:
     notify:
       issue: 37302
 imports:
+  - shared/pr-safe-output-defaults.md
   - shared/otlp.md
   - shared/token-telemetry-check.md
+  - shared/reporting.md
 features:
   gh-aw-detection: false
+evals:
+  - id: prompt_style_test_goal_met
+    question: Does the agent output show that the objective for experiment prompt_style_test was successfully completed?
+
 ---
 
 # Smoke Test: Project Operations Validation

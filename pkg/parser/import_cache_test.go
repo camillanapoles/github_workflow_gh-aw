@@ -57,6 +57,27 @@ func TestImportCache(t *testing.T) {
 	})
 }
 
+func TestImportCacheReadOnly(t *testing.T) {
+	cache := NewImportCache(t.TempDir())
+	cache.SetReadOnly(true)
+	_, err := cache.Set("owner", "repo", "shared.md", "sha", []byte("new"))
+	require.ErrorContains(t, err, "read-only import cache")
+	require.NoDirExists(t, cache.GetCacheDir())
+
+	cache.SetReadOnly(false)
+	path, err := cache.Set("owner", "repo", "shared.md", "sha", []byte("original"))
+	require.NoError(t, err)
+	cache.SetReadOnly(true)
+	_, err = cache.Set("owner", "repo", "shared.md", "sha", []byte("replacement"))
+	require.ErrorContains(t, err, "read-only import cache")
+	gotPath, found := cache.Get("owner", "repo", "shared.md", "sha")
+	require.True(t, found)
+	require.Equal(t, path, gotPath)
+	content, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, "original", string(content))
+}
+
 func TestImportCacheDirectory(t *testing.T) {
 	tempDir := t.TempDir()
 
@@ -286,7 +307,7 @@ func TestValidatePathComponents(t *testing.T) {
 			err := validatePathComponents(tt.owner, tt.repo, tt.path, tt.sha)
 			if tt.shouldErr {
 				require.Error(t, err, "should return error for: %s", tt.name)
-				assert.Contains(t, err.Error(), tt.errMsg, "error message should mention: %s", tt.errMsg)
+				require.ErrorContains(t, err, tt.errMsg, "error message should mention: %s", tt.errMsg)
 			} else {
 				require.NoError(t, err, "should not return error for valid components")
 			}
@@ -364,7 +385,7 @@ func TestImportCacheSet_Validation(t *testing.T) {
 			_, err := cache.Set(tt.owner, tt.repo, tt.path, tt.sha, tt.content)
 			if tt.shouldErr {
 				require.Error(t, err, "Set should reject: %s", tt.name)
-				assert.Contains(t, err.Error(), tt.errMsg, "error message should contain %q", tt.errMsg)
+				require.ErrorContains(t, err, tt.errMsg, "error message should contain %q", tt.errMsg)
 			} else {
 				assert.NoError(t, err, "Set should succeed for: %s", tt.name)
 			}
@@ -391,13 +412,16 @@ func TestImportCacheSetIdempotent(t *testing.T) {
 	assert.Equal(t, string(secondContent), string(content), "file should contain second (latest) content")
 }
 
-func TestImportCacheGetDoesNotValidateComponents(t *testing.T) {
-	// Document that Get does not validate components (unlike Set).
-	// If validation is added in the future, this test should be updated.
+func TestImportCacheGetValidatesComponents(t *testing.T) {
 	tempDir := t.TempDir()
 	cache := NewImportCache(tempDir)
+
+	traversalTarget := filepath.Join(tempDir, ".github", "aw", "etc", "repo", "sha", "test.md")
+	require.NoError(t, os.MkdirAll(filepath.Dir(traversalTarget), 0700))
+	require.NoError(t, os.WriteFile(traversalTarget, []byte("decoy"), 0600))
 
 	// Should return not-found (not panic or error), even with suspicious inputs.
 	_, found := cache.Get("../etc", "repo", "test.md", "sha")
 	assert.False(t, found, "Get with path traversal input should return not-found, not panic")
+	require.FileExists(t, traversalTarget)
 }

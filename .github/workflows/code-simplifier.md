@@ -1,5 +1,15 @@
 ---
 private: true
+engine:
+  id: copilot
+  copilot-sdk: true
+skip-if-decision:
+  - >-
+    Do @/tmp/gh-aw/agent/code-simplifier/recent-context.json and
+    @/tmp/gh-aw/agent/code-simplifier/source-files.json conclusively establish
+    that no recently modified production code is eligible for simplification
+    under this run's scope? Abstain if either dataset is invalid, incomplete,
+    inconsistent, or contains an eligible candidate.
 emoji: "🔧"
 name: Code Simplifier
 description: Analyzes recently modified code and creates pull requests with simplifications that improve clarity, consistency, and maintainability while preserving functionality
@@ -17,6 +27,7 @@ permissions:
 tracker-id: code-simplifier
 
 imports:
+  - shared/mcp-pagination.md
   - uses: shared/skip-if-issue-open.md
     with:
       title-prefix: "[code-simplifier]"
@@ -32,17 +43,15 @@ imports:
           - .github/extensions/
 
   - shared/otlp.md
+  - shared/graders.md
 network:
   allowed:
     - go
 
-sandbox:
-  agent:
-    sudo: false
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [default]
   bash: ["*"]
 
@@ -134,9 +143,18 @@ steps:
 
 timeout-minutes: 30
 strict: true
+evals:
+  - id: code_analyzed
+    question: Did the agent analyze recently modified code for simplification opportunities? Return UNKNOWN when the output records a skip-if-decision no-op before agent execution.
+  - id: pr_created_or_noop
+    question: Was a pull request created with simplifications, or was noop used when no improvements were needed?
+
 ---
 
 # Code Simplifier Agent
+
+The AWF decision gate checks the prepared scope before invocation and may skip
+when no production-code candidates remain. Uncertain evidence preserves execution.
 
 Preserve behavior exactly while simplifying recently changed production code for readability and maintainability.
 
@@ -188,9 +206,9 @@ Code simplifier has nothing to process today.
 
 For each file in `source-files.json`:
 
-1. Use `scope-filter` (`model: small`) to confirm the file should be simplified and detect language.
+1. Use `scope-filter` (`model: claude-haiku-4.5`) to confirm the file should be simplified and detect language.
 2. Apply only the matching language skill guidance (do not load unrelated language guidance).
-3. Use `simplification-scout` (`model: small`) for extractive opportunity scoring.
+3. Use `simplification-scout` (`model: claude-haiku-4.5`) for extractive opportunity scoring.
 4. Make targeted edits that preserve behavior.
 
 Priorities:
@@ -253,14 +271,14 @@ You MUST finish by calling exactly one safe-output tool:
 2. `noop` with the no-beneficial-simplifications message above
 3. `noop` with the run-budget-ceiling message above
 4. `create_pull_request` when meaningful validated simplifications are ready
-5. `missing_tool` when blocked by unavailable tooling
-6. `missing_data` when blocked by missing required data
+5. `report_missing_tool` when blocked by unavailable tooling
+6. `report_missing_data` when blocked by missing required data
 
 Do not finish with plain text only. The safe-output tool call is required.
 ## agent: `scope-filter`
 ---
 description: Decides whether a candidate file should be simplified and labels its primary language
-model: small
+model: claude-haiku-4.5
 ---
 Input is a single file path string. Return strict JSON only:
 `{"path":"...","include":true|false,"language":"go|typescript|javascript|python|csharp|other","reason":"..."}`
@@ -270,7 +288,7 @@ Set `include` to false for tests, generated files, lockfiles, vendored code, or 
 ## agent: `simplification-scout`
 ---
 description: Extractive scout that proposes low-risk simplification opportunities per file
-model: small
+model: claude-haiku-4.5
 ---
 Given file content, return strict JSON only:
 `{"path":"...","opportunities":[{"kind":"clarity|duplication|complexity|naming","summary":"...","risk":"low|medium"}]}`

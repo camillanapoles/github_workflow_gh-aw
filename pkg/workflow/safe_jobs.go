@@ -5,6 +5,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/logger"
@@ -15,27 +16,39 @@ var safeJobsLog = logger.New("workflow:safe_jobs")
 
 // SafeJobConfig defines a safe job configuration with GitHub Actions job properties
 type SafeJobConfig struct {
+	Authorization *SafeOutputAuthorization `yaml:"authorization,omitempty"`
+	Staged        *TemplatableBool         `yaml:"staged,omitempty"`
 	// Standard GitHub Actions job properties
-	Name        string            `yaml:"name,omitempty"`
-	Description string            `yaml:"description,omitempty"`
-	RunsOn      any               `yaml:"runs-on,omitempty"`
-	If          string            `yaml:"if,omitempty"`
-	Needs       []string          `yaml:"needs,omitempty"`
-	Steps       []any             `yaml:"steps,omitempty"`
-	Env         map[string]string `yaml:"env,omitempty"`
-	Permissions map[string]string `yaml:"permissions,omitempty"`
+	Name           string            `yaml:"name,omitempty"`
+	Description    string            `yaml:"description,omitempty"`
+	RunsOn         string            `yaml:"runs-on,omitempty"`
+	If             string            `yaml:"if,omitempty"`
+	Needs          []string          `yaml:"needs,omitempty"`
+	Steps          []any             `yaml:"steps,omitempty"`
+	Env            map[string]string `yaml:"env,omitempty"`
+	Outputs        map[string]string `yaml:"outputs,omitempty"`
+	Permissions    map[string]string `yaml:"permissions,omitempty"`
+	RawPermissions any               `yaml:"-"`
 
 	// Additional safe-job specific properties
 	Inputs      map[string]*InputDefinition `yaml:"inputs,omitempty"`
 	GitHubToken string                      `yaml:"github-token,omitempty"`
 	Output      string                      `yaml:"output,omitempty"`
 	Max         int                         `yaml:"max,omitempty"` // Maximum number of times this output type may be emitted per run (default: 1)
+	// Artifacts declares additional agent-job filesystem paths (files, directories, or globs
+	// rooted under /tmp/gh-aw/) that this job's steps depend on. The compiler persists these
+	// paths in the unified "agent" artifact upload so the job can read them after the agent
+	// job completes. Without declaring a path here, any file the agent writes outside the
+	// compiler's built-in known paths is silently dropped and never reaches this job.
+	Artifacts      []string `yaml:"artifacts,omitempty"`
+	runsOnError    error    `yaml:"-"`
+	artifactsError error    `yaml:"-"`
 }
 
 // parseSafeJobsConfig parses safe-jobs configuration from a jobs map.
 // This function expects a map of job configurations directly (from safe-outputs.jobs).
 // The top-level "safe-jobs" key is NOT supported - only "safe-outputs.jobs" is valid.
-func (c *Compiler) parseSafeJobsConfig(jobsMap map[string]any) map[string]*SafeJobConfig {
+func (c *Compiler) parseSafeJobsConfig(jobsMap map[string]any) map[string]*SafeJobConfig { //nolint:largefunc // Sequential field-by-field parsing of the safe-job config map; splitting would obscure the direct mapping to frontmatter keys.
 	if jobsMap == nil {
 		return nil
 	}
@@ -50,6 +63,8 @@ func (c *Compiler) parseSafeJobsConfig(jobsMap map[string]any) map[string]*SafeJ
 		}
 
 		safeJob := &SafeJobConfig{}
+		safeJob.Authorization = parseLocalSafeOutputAuthorization(jobConfig["authorization"])
+		safeJob.Staged = parseAuthorizationStaged(jobConfig["staged"])
 
 		// Parse name
 		if name, exists := jobConfig["name"]; exists {
@@ -65,11 +80,14 @@ func (c *Compiler) parseSafeJobsConfig(jobsMap map[string]any) map[string]*SafeJ
 			}
 		}
 
-		// Parse runs-on (also accept "runner" as alias)
-		if runsOn, exists := jobConfig["runs-on"]; exists {
-			safeJob.RunsOn = runsOn
-		} else if runner, exists := jobConfig["runner"]; exists {
-			safeJob.RunsOn = runner
+		// Parse runs-on using the shared custom-job parser.
+		runsOnJob := &Job{}
+		if err := c.extractCustomJobRunsOn(runsOnJob, jobName, jobConfig); err != nil {
+			safeJob.runsOnError = err
+		} else if isEmptySafeJobRunsOn(jobConfig["runs-on"]) {
+			safeJob.RunsOn = ""
+		} else {
+			safeJob.RunsOn = runsOnJob.RunsOn
 		}
 
 		// Parse if condition
@@ -111,8 +129,13 @@ func (c *Compiler) parseSafeJobsConfig(jobsMap map[string]any) map[string]*SafeJ
 			}
 		}
 
+		outputsJob := &Job{}
+		extractCustomJobOutputs(outputsJob, jobName, jobConfig)
+		safeJob.Outputs = outputsJob.Outputs
+
 		// Parse permissions
 		if permissions, exists := jobConfig["permissions"]; exists {
+			safeJob.RawPermissions = permissions
 			if permMap, ok := permissions.(map[string]any); ok {
 				safeJob.Permissions = make(map[string]string)
 				for key, value := range permMap {
@@ -172,6 +195,28 @@ func (c *Compiler) parseSafeJobsConfig(jobsMap map[string]any) map[string]*SafeJ
 			}
 		}
 
+		// Parse artifacts: additional agent-job filesystem paths this job depends on.
+		// Each entry must be rooted under /tmp/gh-aw/ so the compiler's secret redaction
+		// step (which only scans that subtree) covers it before upload.
+		if artifacts, exists := jobConfig["artifacts"]; exists {
+			if artifactsList, ok := artifacts.([]any); ok {
+				for _, artifact := range artifactsList {
+					artifactStr, ok := artifact.(string)
+					if !ok {
+						safeJob.artifactsError = fmt.Errorf("safe-job %q: artifacts entries must be strings", jobName)
+						break
+					}
+					if err := validateSafeJobArtifactPath(artifactStr); err != nil {
+						safeJob.artifactsError = fmt.Errorf("safe-job %q: %w", jobName, err)
+						break
+					}
+					safeJob.Artifacts = append(safeJob.Artifacts, artifactStr)
+				}
+			} else {
+				safeJob.artifactsError = fmt.Errorf("safe-job %q: artifacts must be an array of strings", jobName)
+			}
+		}
+
 		safeJobsLog.Printf("Parsed safe-job configuration: name=%s, has_steps=%v, has_inputs=%v, max=%d", jobName, len(safeJob.Steps) > 0, len(safeJob.Inputs) > 0, safeJob.Max)
 		result[jobName] = safeJob
 	}
@@ -179,8 +224,82 @@ func (c *Compiler) parseSafeJobsConfig(jobsMap map[string]any) map[string]*SafeJ
 	return result
 }
 
+// validateSafeJobArtifactPath validates a single safe-job "artifacts" entry.
+//
+// Two properties must hold before the path is trusted for inclusion in the unified
+// agent artifact upload:
+//  1. It must be rooted under /tmp/gh-aw/ so the compiler's secret-redaction step,
+//     which only scans that subtree, covers it before upload. Path traversal segments
+//     ("..") are rejected outright since they could otherwise be used to smuggle a
+//     path that resolves outside /tmp/gh-aw/ past this prefix check.
+//  2. It must not reference hidden files or directories (any path segment starting
+//     with "."), because the unified "actions/upload-artifact" step does not set
+//     include-hidden-files, whose default is false. A declared hidden path would
+//     therefore pass validation but still be silently dropped from the artifact.
+func validateSafeJobArtifactPath(path string) error {
+	if strings.Contains(path, "${{") {
+		return fmt.Errorf("artifact path %q must be literal and must not contain GitHub Actions expressions", path)
+	}
+	if strings.IndexFunc(path, unicode.IsControl) >= 0 {
+		return fmt.Errorf("artifact path %q must not contain control characters", path)
+	}
+	if !strings.HasPrefix(path, constants.TmpGhAwDirSlash) {
+		return fmt.Errorf("artifact path %q must be rooted under %q so it is covered by secret redaction", path, constants.TmpGhAwDirSlash)
+	}
+	for segment := range strings.SplitSeq(path, "/") {
+		if segment == ".." {
+			return fmt.Errorf("artifact path %q must not contain \"..\" path traversal segments", path)
+		}
+		if strings.HasPrefix(segment, ".") && segment != "" {
+			return fmt.Errorf("artifact path %q must not reference hidden files or directories (segment %q starts with \".\"), which are silently dropped by the unified artifact upload", path, segment)
+		}
+	}
+	if !isPathScannedBySecretRedaction(path) {
+		return fmt.Errorf("artifact path %q must end with \"/\" for a directory or use a file extension covered by secret redaction", path)
+	}
+	return nil
+}
+
+// collectSafeJobArtifactPaths gathers all declared artifact paths from custom safe-outputs
+// jobs, sorted by normalized job name for deterministic compiled output. Directory
+// declarations are restricted to recursive globs for extensions covered by secret redaction.
+func collectSafeJobArtifactPaths(jobs map[string]*SafeJobConfig) []string {
+	if len(jobs) == 0 {
+		return nil
+	}
+
+	names := make([]string, 0, len(jobs))
+	for name := range jobs {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+
+	var paths []string
+	for _, name := range names {
+		if job := jobs[name]; job != nil {
+			for _, artifactPath := range job.Artifacts {
+				if strings.HasSuffix(artifactPath, "/") {
+					for _, ext := range secretRedactionScannedExtensions {
+						paths = append(paths, artifactPath+"**/*"+ext)
+					}
+					continue
+				}
+				paths = append(paths, artifactPath)
+			}
+		}
+	}
+	return paths
+}
+
+func isEmptySafeJobRunsOn(value any) bool {
+	if _, isObject := value.(map[string]any); isObject {
+		return false
+	}
+	return isEmptyRunsOnValue(value)
+}
+
 // buildSafeJobs creates custom safe-output jobs defined in SafeOutputs.Jobs
-func (c *Compiler) buildSafeJobs(data *WorkflowData, threatDetectionEnabled bool) ([]string, error) {
+func (c *Compiler) buildSafeJobs(data *WorkflowData, threatDetectionEnabled bool) ([]string, error) { //nolint:largefunc // Existing orchestration of job needs, condition, steps, and permissions remains explicit and ordered.
 	if data.SafeOutputs == nil || len(data.SafeOutputs.Jobs) == 0 {
 		return nil, nil
 	}
@@ -210,6 +329,8 @@ func (c *Compiler) buildSafeJobs(data *WorkflowData, threatDetectionEnabled bool
 		job := &Job{
 			Name:        normalizedJobName,
 			Environment: c.indentYAMLLines(resolveSafeOutputsEnvironment(data), "    "),
+			Env:         c.buildJobLevelSafeOutputEnvVars(data, GetWorkflowIDFromPath(c.markdownPath)),
+			Outputs:     maps.Clone(jobConfig.Outputs),
 		}
 
 		// Set custom job name if specified
@@ -229,30 +350,29 @@ func (c *Compiler) buildSafeJobs(data *WorkflowData, threatDetectionEnabled bool
 		// Add any additional dependencies from the config
 		job.Needs = append(job.Needs, jobConfig.Needs...)
 
-		// Set runs-on
-		if jobConfig.RunsOn != nil {
-			if runsOnStr, ok := jobConfig.RunsOn.(string); ok {
-				job.RunsOn = "runs-on: " + runsOnStr
-			} else if runsOnList, ok := jobConfig.RunsOn.([]any); ok {
-				// Handle array format
-				var runsOnItems []string
-				for _, item := range runsOnList {
-					if itemStr, ok := item.(string); ok {
-						runsOnItems = append(runsOnItems, "      - "+itemStr)
-					}
-				}
-				if len(runsOnItems) > 0 {
-					job.RunsOn = "runs-on:\n" + strings.Join(runsOnItems, "\n")
-				}
-			}
-		} else {
-			job.RunsOn = "runs-on: ubuntu-latest" // Default
+		const defaultRunsOn = "ubuntu-latest"
+
+		// Set runs-on, defaulting to ubuntu-latest when omitted.
+		if jobConfig.runsOnError != nil {
+			return nil, fmt.Errorf("invalid runs-on for safe-job '%s': %w", normalizedJobName, jobConfig.runsOnError)
 		}
+
+		// Reject invalid artifacts declarations up front with a clear, actionable error
+		// rather than letting them surface later as an opaque step-ordering compiler bug.
+		if jobConfig.artifactsError != nil {
+			return nil, fmt.Errorf("invalid artifacts for safe-job '%s': %w", normalizedJobName, jobConfig.artifactsError)
+		}
+		runsOn := jobConfig.RunsOn
+		if runsOn == "" {
+			runsOn = "runs-on: " + defaultRunsOn
+		}
+		job.RunsOn = runsOn
 
 		// Set if condition - combine safe output type check with user-provided condition
 		// Custom safe jobs should only run if the agent output contains the job name (tool call)
 		// Use normalized job name to match the underscore format in output_types
 		safeOutputCondition := BuildSafeOutputType(normalizedJobName) // min=0 means check for the tool in output_types
+		safeOutputCondition = requireSafeOutputsAgentSuccess(safeOutputCondition, data.SafeOutputs)
 
 		// When detection is expression-controlled the detection job may be skipped at runtime.
 		// Wrap the condition with always() + detection-passed so the safe-job still runs when
@@ -263,6 +383,8 @@ func (c *Compiler) buildSafeJobs(data *WorkflowData, threatDetectionEnabled bool
 				BuildAnd(BuildFunctionCall("always"), safeOutputCondition),
 				buildDetectionPassedCondition(),
 			)
+		} else if threatDetectionEnabled {
+			baseCondition = BuildAnd(safeOutputCondition, buildDetectionSuccessCondition())
 		}
 
 		if jobConfig.If != "" {
@@ -282,12 +404,18 @@ func (c *Compiler) buildSafeJobs(data *WorkflowData, threatDetectionEnabled bool
 		// Safe-jobs depend on the agent job, so the prefix comes from needs.agent.outputs.
 		agentArtifactPrefix := artifactPrefixExprForAgentDownstreamJob(data)
 		downloadSteps := buildArtifactDownloadSteps(ArtifactDownloadConfig{
-			ArtifactName: agentArtifactPrefix + constants.AgentArtifactName,
-			DownloadPath: SafeJobsDownloadDirExpr,
-			SetupEnvStep: false, // We'll handle env vars separately to add job-specific ones
-			StepName:     "Download agent output artifact",
+			ArtifactName:     agentArtifactPrefix + constants.AgentArtifactName.String(),
+			FallbackArtifact: agentArtifactPrefix + constants.AgentOutputFallbackArtifactName.String(),
+			DownloadPath:     SafeJobsDownloadDirExpr,
+			SetupEnvStep:     false, // We'll handle env vars separately to add job-specific ones
+			StepName:         "Download agent output artifact",
 		}, c.getActionPin)
 		steps = append(steps, downloadSteps...)
+		authorizationRequired := data.SafeOutputs.AuthorizationRequirements[normalizedJobName] != nil
+		if authorizationRequired {
+			steps = append(steps, c.buildSafeOutputsSetupSteps(data)...)
+		}
+		authorStepOffset := len(steps)
 
 		// the download artifacts always creates a folder, then unpacks in that folder
 
@@ -297,7 +425,10 @@ func (c *Compiler) buildSafeJobs(data *WorkflowData, threatDetectionEnabled bool
 			// GH_AW_AGENT_OUTPUT uses the runner.temp Actions expression so the path is
 			// resolved by the runner without requiring a $GITHUB_OUTPUT write.
 			setupEnvVars := map[string]string{
-				"GH_AW_AGENT_OUTPUT": SafeJobsDownloadDirExpr + constants.AgentOutputFilename,
+				"GH_AW_AGENT_OUTPUT": SafeJobsDownloadDirExpr + constants.AgentOutputFilename.String(),
+			}
+			if threatDetectionEnabled {
+				setupEnvVars["GH_AW_DETECTION_CONCLUSION"] = fmt.Sprintf("${{ needs.%s.outputs.detection_conclusion }}", constants.DetectionJobName)
 			}
 			// All job-specific env vars (literal or expression-based) are injected with
 			// their original values. Nothing goes through $GITHUB_OUTPUT.
@@ -320,6 +451,20 @@ func (c *Compiler) buildSafeJobs(data *WorkflowData, threatDetectionEnabled bool
 							typedStep.Env[k] = v
 						}
 					}
+					typedStep.Env["GH_AW_JOB_CHECK_RUN_ID"] = "${{ job.check_run_id }}"
+					if authorizationRequired {
+						gateCondition := fmt.Sprintf("steps.authorize_%s.outputs.authorized == 'true'", normalizedJobName)
+						if typedStep.If != "" {
+							gateCondition += " && (" + stripExpressionWrapper(c.extractExpressionFromIfString(typedStep.If)) + ")"
+						}
+						typedStep.If = gateCondition
+					}
+					if condition := safeJobUnstagedCondition(data.SafeOutputs.Staged, jobConfig.Staged); condition != "" {
+						if typedStep.If != "" {
+							condition += " && (" + stripExpressionWrapper(c.extractExpressionFromIfString(typedStep.If)) + ")"
+						}
+						typedStep.If = condition
+					}
 
 					// Apply action pinning using type-safe version
 					pinnedStep, err := applyActionPinToTypedStep(typedStep, data)
@@ -337,15 +482,37 @@ func (c *Compiler) buildSafeJobs(data *WorkflowData, threatDetectionEnabled bool
 			}
 		}
 
+		if authorizationRequired {
+			implementation := map[string]any{"configuration": jobConfig, "steps": steps[authorStepOffset:]}
+			gate, err := c.buildAuthorizationGateStep(data, normalizedJobName, "job", implementation, jobConfig.Staged,
+				authorizationGateOptions{OutputPath: SafeJobsDownloadDirExpr + constants.AgentOutputFilename.String()})
+			if err != nil {
+				return nil, err
+			}
+			steps = slices.Insert(steps, authorStepOffset, gate...)
+			steps = append(steps, c.buildAuthorizationEvidenceUploadStep(data, normalizedJobName)...)
+		}
 		job.Steps = steps
 
 		// Set permissions if specified
-		if len(jobConfig.Permissions) > 0 {
-			// Build Permissions struct from map
+		if jobConfig.RawPermissions != nil {
+			job.Permissions = NewPermissionsParserFromValue(jobConfig.RawPermissions).ToPermissions().RenderToYAML()
+		} else if len(jobConfig.Permissions) > 0 {
 			perms := NewPermissions()
 			for perm, level := range jobConfig.Permissions {
 				perms.Set(PermissionScope(perm), PermissionLevel(level))
 			}
+			job.Permissions = perms.RenderToYAML()
+		}
+		if authorizationRequired && !isHandlerStaged(templatableBoolIsTrue(data.SafeOutputs.Staged), jobConfig.Staged) {
+			perms := NewPermissionsParserFromValue(jobConfig.RawPermissions).ToPermissions()
+			if jobConfig.Permissions["id-token"] == "none" || jobConfig.RawPermissions == "read-all" {
+				return nil, fmt.Errorf("safe-output job %q authorization requires id-token: write; remove the conflicting permission restriction", normalizedJobName)
+			}
+			for permission, level := range jobConfig.Permissions {
+				perms.Set(PermissionScope(permission), PermissionLevel(level))
+			}
+			perms.Set(PermissionScope("id-token"), PermissionWrite)
 			job.Permissions = perms.RenderToYAML()
 		}
 
@@ -360,6 +527,19 @@ func (c *Compiler) buildSafeJobs(data *WorkflowData, threatDetectionEnabled bool
 
 	safeJobsLog.Printf("Successfully built %d safe-jobs", len(safeJobNames))
 	return safeJobNames, nil
+}
+
+func safeJobUnstagedCondition(global, local *TemplatableBool) string {
+	var conditions []string
+	for _, staged := range []*TemplatableBool{global, local} {
+		if templatableBoolIsTrue(staged) {
+			return "false"
+		}
+		if isTemplatableStagedExpression(staged) {
+			conditions = append(conditions, "format('{0}', "+stripExpressionWrapper(string(*staged))+") != 'true'")
+		}
+	}
+	return strings.Join(conditions, " && ")
 }
 
 // extractSafeJobsFromFrontmatter extracts safe-jobs configuration from frontmatter.

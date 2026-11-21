@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+
+	"github.com/github/gh-aw/pkg/logger"
 )
 
-var permissionsValidationLog = newValidationLogger("permissions")
+var permissionsValidationLog = logger.New("workflow:permissions_validation")
 
 //go:embed data/github_toolsets_permissions.json
 var githubToolsetsPermissionsJSON []byte
@@ -39,6 +41,9 @@ var getToolsetPermissionsMap = sync.OnceValue(func() map[string]GitHubToolsetPer
 
 	var data GitHubToolsetsData
 	if err := json.Unmarshal(githubToolsetsPermissionsJSON, &data); err != nil {
+		// Build-time invariant: the embedded GitHub toolsets JSON is validated by
+		// TestToolsetPermissionsLoadedFromJSON; unmarshal can only fail for corrupted
+		// release data, never dynamic user input.
 		panic(fmt.Sprintf("BUG: failed to load GitHub toolsets permissions from JSON: %v", err))
 	}
 

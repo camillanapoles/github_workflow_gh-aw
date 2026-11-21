@@ -6,18 +6,35 @@ description: Reviews pull requests using Impeccable skills and applies the most 
 on:
   pull_request:
     types: [ready_for_review]
+    # Scoped to the repo's only real UI/design surface (the docs site).
+    # gh-aw itself is a CLI/compiler with no frontend; running Impeccable's
+    # UI skill (audit/critique/harden/distill/extract/clarify) against
+    # backend Go/JS PRs gave it no applicable mode, so it fell back to
+    # exhaustive manual codebase exploration (80+ bash calls) and routinely
+    # hit the engine timeout - see #66819.
+    paths:
+      - 'docs/src/components/**'
+      - 'docs/src/styles/**'
+      - 'docs/src/pages/**'
+      - 'docs/src/assets/**'
+      - 'docs/src/lib/**'
+      - 'docs/src/og/**'
+      - 'docs/src/scripts/**'
   workflow_dispatch:
 permissions:
   contents: read
   pull-requests: read
   copilot-requests: write
-sandbox:
-  agent:
-    sudo: false
+features:
+  gh-aw-detection: true
 
+network:
+  allowed: [defaults, go, node]
+
+model: router/economy
 engine:
   id: copilot
-  model: claude-sonnet-4.6
+  copilot-sdk: true
   max-continuations: 6
 imports:
   - uses: shared/pr-review-base.md
@@ -25,32 +42,18 @@ imports:
       min-integrity: approved
   - shared/reporting.md
   - shared/otlp.md
-pre-agent-steps:
-  - name: Pre-fetch PR diff
-    env:
-      GH_TOKEN: ${{ github.token }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
-      EXPR_GITHUB_REPOSITORY: ${{ github.repository }}
-      PR_DIFF_MAX_LINES: "3000"
-    run: |
-      set -euo pipefail
-      mkdir -p /tmp/gh-aw/agent
-      { gh pr diff "$PR_NUMBER" --repo $EXPR_GITHUB_REPOSITORY \
-          --exclude '**/*.lock.yml' \
-          --exclude '**/generated/**' \
-          --exclude '**/dist/**' \
-          --exclude '**/build/**' \
-          || true; } | head -n "${PR_DIFF_MAX_LINES}" > /tmp/gh-aw/agent/pr-diff.patch
-      LINES=$(wc -l < /tmp/gh-aw/agent/pr-diff.patch)
-      gh pr view "$PR_NUMBER" \
-        --repo $EXPR_GITHUB_REPOSITORY \
-        --json number,title,body,headRefName,additions,deletions,changedFiles,files \
-        > /tmp/gh-aw/agent/pr-meta.json
-      echo "Pre-fetched PR diff (${LINES} lines) and metadata"
+  - shared/pr-diff-data-fetch.md
+skills:
+  - pbakaus/impeccable/.agents/skills/impeccable@924bbd194d02e5e15a227e75b5901fb0d7a4ecad
 tools:
   cli-proxy: true
   github:
     mode: gh-proxy
+cache:
+  key: pr-prefetch-v2-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+  path: /tmp/gh-aw/agent
+  restore-keys:
+    - pr-prefetch-v2-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}-
 safe-outputs:
   add-comment:
     hide-older-comments: true
@@ -67,7 +70,9 @@ safe-outputs:
     run-success: "🧵 [{workflow_name}]({run_url}) has completed the skills-based review. ✅"
     run-failure: "🧵 [{workflow_name}]({run_url}) {status} during the skills-based review."
 max-daily-ai-credits: 10000
-timeout-minutes: 15
+# Raised from 15m: skill-driven PR reviews on larger diffs were hitting the
+# engine step's hard timeout mid-review (not a hang) - see #66819.
+timeout-minutes: 30
 
 ---
 
@@ -95,32 +100,71 @@ A successful review:
 - **PR Title**: "${{ github.event.pull_request.title }}"
 - **Author**: ${{ github.actor }}
 
+## Available Impeccable Review Modes
+
+The installed `/impeccable` skill provides these review-relevant modes:
+
+- **`audit`** — check accessibility, performance, responsive behavior, and technical UI quality
+- **`critique`** — evaluate UX, hierarchy, information architecture, and cognitive load
+- **`harden`** — find missing error, empty, loading, internationalization, and other edge states
+- **`distill`** — identify unnecessary visual or interaction complexity
+- **`extract`** — identify reusable components, tokens, and design-system patterns
+- **`clarify`** — improve labels, UX copy, validation, and error messages
+
+## Investigation Budget
+
+Treat the pre-fetched diff and the mode guidance above as your primary source of truth. If you need to read additional repository files beyond the diff (e.g. the installed skill, a component's surrounding context), bound that exploration to roughly 15 tool calls. If you reach that budget without a clear picture, stop investigating and submit the best review supported by the evidence gathered so far rather than continuing to trace the codebase — note any remaining uncertainty in the review body.
+
 ## Process
 
-1. Read pre-fetched PR files only:
+1. Verify the required pre-fetched PR files exist and are non-empty before reviewing:
+
+   ```bash
+   test -s /tmp/gh-aw/agent/pr-meta.json && test -s /tmp/gh-aw/agent/pr-diff.patch
+   ```
+
+   If either file is missing or empty, call `noop` with the message: `pre-fetch step failed: required PR metadata or diff file is missing or empty`, then stop.
+
+2. Read pre-fetched PR files only:
 
    - `/tmp/gh-aw/agent/pr-meta.json`
    - `/tmp/gh-aw/agent/pr-diff.patch`
+   - `/tmp/gh-aw/agent/pr-review-comments.json` — existing review comments (each: `id`, `path`, `line`, `body`, `user`); use to avoid duplication before adding new comments
 
-2. List installed skills and inspect the skill docs you need:
+   **Do not** call `gh pr diff`, `gh pr view`, or `get_review_comments` — all data is pre-fetched and available on disk.
+
+3. Locate the installed Impeccable skill:
 
    ```bash
-   find /tmp/gh-aw/.github/skills "${RUNNER_TEMP}/gh-aw/.github/skills" -name "SKILL.md" 2>/dev/null | head -40
+   find /tmp/gh-aw "${RUNNER_TEMP}/gh-aw" -path "*/impeccable/SKILL.md" 2>/dev/null | head -1
    ```
 
-3. Select the most relevant skills for the detected change type and risk areas.
+   Use the inline mode guidance above by default. Read the installed `SKILL.md` only when that guidance is insufficient.
 
-   If no external skills are installed, perform a normal high-signal review focused on correctness and security.
+4. Select 1–2 Impeccable modes using the first matching row:
 
-4. Add up to 10 high-impact inline review comments using `create-pull-request-review-comment`.
+   | Signal in the changed files or PR title/body | `change_type` | Impeccable modes |
+   | --- | --- | --- |
+   | Only test files (`*.test.*`, `*.spec.*`, `test/**`, `tests/**`) | `tests_only` | `audit` |
+   | Fix, bug, regression, broken, crash, or error-state changes | `bug_fix` | `harden`, `audit` |
+   | New UI, component, page, flow, or feature | `new_feature` | `critique`, `audit` |
+   | Refactor, cleanup, design-system, token, or shared-component changes | `refactor_cleanup` | `distill`, `extract` |
+   | Only documentation or copy changes | `documentation` | `clarify` |
+   | Anything else | `mixed_unclear` | `critique`, `audit` |
 
-5. Submit an overall review using `submit-pull-request-review`:
+   Prioritize non-generated changed files with the largest `additions + deletions` in `pr-meta.json`, most-changed first.
+
+   **Fallback:** If the Impeccable skill cannot be found or read, do not abort. Apply the same table and inline mode guidance directly. If no row or mode fits the changed UI, perform a normal high-signal review focused on correctness and security.
+
+5. Add up to 10 high-impact inline review comments using `create-pull-request-review-comment`.
+
+6. Submit an overall review using `submit-pull-request-review`:
 
    - `REQUEST_CHANGES` when blocking issues exist
    - `COMMENT` when only non-blocking suggestions exist
    - `APPROVE` when no actionable issues are found
 
-6. Optionally post one concise summary via `add-comment` for large or complex reviews.
+7. Optionally post one concise summary via `add-comment` for large or complex reviews.
 
 ## Review Constraints
 

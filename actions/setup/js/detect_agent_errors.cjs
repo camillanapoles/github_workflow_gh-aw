@@ -1,10 +1,11 @@
 // @ts-check
 
 /**
- * Detect agent engine errors in the agent stdio log.
+ * Detect agent engine errors in the agent stdio log and AWF firewall audit log.
  *
- * Scans the agent stdio log for known error patterns and sets GitHub Actions
- * output variables for each detected error class:
+ * Scans the agent stdio log for known error patterns and the AWF firewall audit
+ * JSONL log for structured error events, then sets GitHub Actions output variables
+ * for each detected error class:
  *
  *   - inference_access_error: The COPILOT_GITHUB_TOKEN does not have valid
  *     access to inference (e.g., "Access denied by policy settings").
@@ -13,20 +14,52 @@
  *   - agentic_engine_timeout: A timeout signature was detected in engine logs.
  *     This includes process termination by signal (SIGTERM/SIGKILL/SIGINT),
  *     typically due to step timeout-minutes, and SDK idle-timeout messages
- *     ("Timeout after <n>ms waiting for session.idle").
+ *     ("Timeout after <n>ms waiting for session.idle"). It is also set when the
+ *     engine execution step failed after running for its full `timeout-minutes`
+ *     budget, which is how GitHub Actions step-level timeouts surface for engines
+ *     that leave no timeout signature in the agent log.
  *   - model_not_supported_error: The configured model is invalid or unsupported
  *     for the selected engine/account (for example unknown model name, model not
  *     found, or model unavailable for the plan).
+ *   - model_endpoint_mismatch_error: The configured model cannot serve the request
+ *     endpoint or tool protocol; changing the model or endpoint is required.
  *   - http_400_response_error: The engine surfaced a generic HTTP 400 Bad Request
  *     response (for example "Response status code does not indicate success: 400 (Bad Request)").
  *   - capi_quota_exceeded_error: The Copilot CAPI quota has been exhausted
  *     or rate-limited (e.g., "CAPIError: 429 429 quota exceeded",
- *     "CAPIError: Too Many Requests"). All matched forms are treated as
- *     non-retryable because the Copilot SDK has already retried internally
- *     before surfacing the error.
- *
+ *     "CAPIError: Too Many Requests", or the Copilot CLI's own
+ *     retry-exhaustion message "Failed to get response from the AI model;
+ *     retried N times ... Last error: 429" which carries no "CAPIError:"
+ *     prefix). Quota errors are non-retryable because the Copilot CLI/SDK has
+ *     already retried internally before surfacing the error.
+ *   - capi_server_error: The Copilot CLI exhausted its internal retries on a
+ *     5xx response. This is retryable by the harness because it may recover
+ *     during harness backoff.
+ *   - invocation_cap_exceeded: The per-run pooled LLM invocation cap is
+ *     fully exhausted (e.g., "CAPIError: 429 Maximum LLM invocations exceeded (N/N)"
+ *     or `"type":"max_runs_exceeded"`). This is more specific than generic
+ *     CAPI quota exhaustion and takes precedence in step outputs.
+ *   - missing_model_pricing_error / missing_model_pricing_model_name: The AWF API
+ *     proxy rejected a request because the model has no AI credits pricing entry.
+ *     Detected from the agent stdio log (text pattern) and the AWF firewall audit
+ *     JSONL log (`unknown_model_ai_credits` event type). Both sources are checked
+ *     and their results merged.
+ *   - shell_expansion_guard_rejected: The sandbox's shell command-injection guard
+ *     rejected a shell command for containing (or appearing to contain) bash
+ *     expansion patterns (command substitution, indirect expansion, parameter
+ *     transformation, etc.), e.g. "...could enable arbitrary code execution.
+ *     Please rewrite the command without these expansion patterns." This can
+ *     misfire on benign quoted payloads. Agents must not repeat the denied
+ *     command or bypass the guard with an unapproved shell workaround.
  * This replaces the individual bash scripts (detect_inference_access_error.sh,
  * detect_mcp_policy_error.sh) with a single JavaScript step.
+ *
+ * In addition to the output variables above, when the engine sets
+ * GH_AW_ENGINE_INTERNAL_LOGS_DIR (via CodingAgentEngine.GetInternalLogsDir) and the execution
+ * step failed, this script tails the most recently modified `*.log` file under that directory
+ * into the step log (see renderInternalEngineLogOnFailure()). Some engines (e.g. Codex CLI)
+ * write their own tracing/diagnostic output to files rather than to stdout/stderr, so a bare
+ * non-zero exit code with no console output can still have a diagnosable error recorded there.
  *
  * Exit codes:
  *   0 — Always succeeds (uses continue-on-error in the workflow step)
@@ -34,85 +67,52 @@
 
 "use strict";
 
+require("./shim.cjs");
+
 const fs = require("fs");
+const path = require("path");
+const errorPatterns = require("./agent_error_patterns.cjs");
+const { detectErrors, buildOutputLines, isStepTimeout, sanitizeModelName } = errorPatterns;
+const { parseUnknownModelAICreditsAndModelFromAuditLog, parseMaxCacheMissesExceededFromEventLog } = require("./ai_credits_context.cjs");
+const { renderLogFromFile } = require("./render_detection_log.cjs");
+const { getErrorMessage } = require("./error_helpers.cjs");
+const { collectAgentExecution, agentErrorDiagnosticText, parseAgentExitCode } = require("./agent_execution.cjs");
+const { writeSessionArtifact } = require("./session_artifact.cjs");
+const { collectAddMaskedValues } = require("./add_mask_redaction.cjs");
 
-const LOG_FILE = "/tmp/gh-aw/agent-stdio.log";
-
-// Pattern: Copilot CLI inference access denied
-const INFERENCE_ACCESS_ERROR_PATTERN = /Access denied by policy settings|invalid access to inference/;
-
-// Pattern: MCP servers blocked by enterprise/organization policy
-const MCP_POLICY_BLOCKED_PATTERN = /MCP servers were blocked by policy:/;
-
-// Pattern: Agentic engine timeout.
-// Covers both timeout signatures observed in engine logs:
-//   1) Process killed by signal after step timeout-minutes:
-//      [copilot-harness] ... process closed exitCode=1 signal=SIGTERM ...
-//   2) Copilot SDK idle-timeout while waiting for session.idle:
-//      [sdk-driver] error: Timeout after 870000ms waiting for session.idle
-// The second form can occur even when the driver collected output, and should
-// still be classified as a timeout for conclusion/reporting purposes.
-const AGENTIC_ENGINE_TIMEOUT_PATTERN = /(?:signal=SIG(?:TERM|KILL|INT)|Timeout after \d+ms waiting for session\.idle)/;
-
-// Pattern: Configured model is invalid or unavailable.
-// Covers common engine/provider variants:
-//   - "The requested model is not supported"
-//   - "invalid model name '...'"
-//   - "unknown model <id>"
-//   - "model ... not found"
-//   - "model ... does not exist"
-//   - "Model not found" (standalone, e.g. AIC api-proxy 404: "404 Not Found: Model not found")
-const MODEL_NOT_SUPPORTED_PATTERN =
-  /(?:The requested model is not supported|invalid model(?:\s+name)?\s+['"`]?[a-z0-9._:/@-]+['"`]?(?=(?:\s*$|\s*[\n\r.,;:!?)]))|unknown model\s+['"`]?[a-z0-9._:/@-]+['"`]?(?=(?:\s*$|\s*[\n\r.,;:!?)]))|model(?:\s+name)?\s+['"`]?[a-z0-9._:/@-]+['"`]?\s+(?:is\s+)?(?:not found|does not exist|not supported|not available|unavailable)|404\b[^\n]*\bModel\s+not\s+found)/i;
-
-// Pattern: Generic HTTP 400 Bad Request responses emitted by engine / SDK wrappers.
-// NOTE: keep in sync with HTTP_400_RESPONSE_ERROR_PATTERN in copilot_harness.cjs.
-// Also matches "400 400 400 no model endpoints available given user constraints" which is emitted
-// by the Copilot SDK when no model endpoints are available for the user's configured constraints.
-// Also matches "400 400 400 stream_options: Extra inputs are not permitted" which is emitted when
-// the Copilot SDK sends an OpenAI-only field to an Anthropic-type provider.
-// The non-first alternatives are anchored to a leading "400" to avoid false positives from unrelated
-// diagnostic or informational messages that might contain the phrase.
-const HTTP_400_RESPONSE_ERROR_PATTERN =
-  /(?:Response status code does not indicate success:\s*400(?:\s*\(Bad Request\))?|400[^\n]*no model endpoints available given user constraints|400[^\n]*stream_options:\s*Extra inputs are not permitted)/i;
-
-// Pattern: Copilot/CAPI quota exhaustion and rate-limit responses.
-// Matches all observed forms:
-//   "CAPIError: 429 429 quota exceeded"  (original observed form)
-//   "CAPIError: 429 Too Many Requests"   (HTTP 429 form)
-//   "CAPIError: Too Many Requests"       (no status code in message)
-// All forms are treated as non-retryable; the Copilot SDK has already retried
-// internally before surfacing this error (evidenced by "retried 5 times" context).
-const CAPI_QUOTA_EXCEEDED_PATTERN = /CAPIError:\s*(?:429\s+)?(?:429\s+quota exceeded|Too Many Requests)/i;
+// File written by the engine execution step with the epoch milliseconds at which the
+// engine CLI was started. Used to measure how long the engine ran before it was killed.
+const AGENT_CLI_START_MS_FILE = "/tmp/gh-aw/agent_cli_start_ms.txt";
 
 /**
- * Determines if the collected output contains the observed Copilot/CAPI quota exhaustion error.
- * @param {string} output - Collected stdout+stderr from the process
- * @returns {boolean}
+ * Read the engine CLI start timestamp (epoch milliseconds) written by the execution step.
+ * @returns {number} Epoch milliseconds, or NaN when unavailable/unparsable
  */
-function isCAPIQuotaExceededError(output) {
-  return CAPI_QUOTA_EXCEEDED_PATTERN.test(output);
+function readAgentCLIStartMs() {
+  try {
+    if (!fs.existsSync(AGENT_CLI_START_MS_FILE)) return NaN;
+    return parseInt(fs.readFileSync(AGENT_CLI_START_MS_FILE, "utf8").trim(), 10);
+  } catch {
+    return NaN;
+  }
 }
 
 /**
- * Detect known error patterns in a log string and return detection results.
- * @param {string} logContent - Contents of the agent stdio log
- * @returns {{ inferenceAccessError: boolean, mcpPolicyError: boolean, agenticEngineTimeout: boolean, modelNotSupportedError: boolean, http400ResponseError: boolean, capiQuotaExceededError: boolean }}
+ * Detect a step-level timeout from the current environment and on-disk start timestamp.
+ * @returns {boolean}
  */
-function detectErrors(logContent) {
-  return {
-    inferenceAccessError: INFERENCE_ACCESS_ERROR_PATTERN.test(logContent),
-    mcpPolicyError: MCP_POLICY_BLOCKED_PATTERN.test(logContent),
-    agenticEngineTimeout: AGENTIC_ENGINE_TIMEOUT_PATTERN.test(logContent),
-    modelNotSupportedError: MODEL_NOT_SUPPORTED_PATTERN.test(logContent),
-    http400ResponseError: HTTP_400_RESPONSE_ERROR_PATTERN.test(logContent),
-    capiQuotaExceededError: isCAPIQuotaExceededError(logContent),
-  };
+function detectStepTimeoutFromEnvironment() {
+  return isStepTimeout({
+    outcome: process.env.GH_AW_AGENTIC_EXECUTION_OUTCOME,
+    timeoutMinutes: process.env.GH_AW_ENGINE_STEP_TIMEOUT_MINUTES,
+    startMs: readAgentCLIStartMs(),
+    nowMs: Date.now(),
+  });
 }
 
 /**
  * Write GitHub Actions outputs to $GITHUB_OUTPUT.
- * @param {{ inferenceAccessError: boolean, mcpPolicyError: boolean, agenticEngineTimeout: boolean, modelNotSupportedError: boolean, http400ResponseError: boolean, capiQuotaExceededError: boolean }} results
+ * @param {ReturnType<typeof detectErrors>} results
  */
 function writeOutputs(results) {
   const outputFile = process.env.GITHUB_OUTPUT;
@@ -120,28 +120,175 @@ function writeOutputs(results) {
     process.stderr.write("[detect-agent-errors] GITHUB_OUTPUT not set — skipping output\n");
     return;
   }
-
-  const lines = [
-    `inference_access_error=${results.inferenceAccessError}`,
-    `mcp_policy_error=${results.mcpPolicyError}`,
-    `agentic_engine_timeout=${results.agenticEngineTimeout}`,
-    `model_not_supported_error=${results.modelNotSupportedError}`,
-    `http_400_response_error=${results.http400ResponseError}`,
-    `capi_quota_exceeded_error=${results.capiQuotaExceededError}`,
-  ];
-  fs.appendFileSync(outputFile, lines.join("\n") + "\n");
+  const lines = buildOutputLines(results);
+  try {
+    fs.appendFileSync(outputFile, lines.join("\n") + "\n");
+  } catch (err) {
+    process.stderr.write(`[detect-agent-errors] Failed to write to GITHUB_OUTPUT: ${getErrorMessage(err)}\n`);
+  }
 }
 
-function main() {
-  let logContent = "";
+function hasModelEndpointMismatchRecord(rootDir = process.env.GH_AW_TMP_DIR || "/tmp/gh-aw") {
+  try {
+    const record = JSON.parse(fs.readFileSync(path.join(rootDir, "agent", "model-endpoint-mismatch.json"), "utf8"));
+    return (
+      record?.category === "model_endpoint_mismatch" &&
+      ["startup", "runtime"].includes(record.phase) &&
+      ["configured_model", "resolved_model", "wire_api", "wire_api_source", "detail", "fix"].every(key => typeof record[key] === "string") &&
+      Array.isArray(record.supported_endpoints) &&
+      record.supported_endpoints.every(endpoint => typeof endpoint === "string")
+    );
+  } catch {
+    return false;
+  }
+}
 
-  if (fs.existsSync(LOG_FILE)) {
-    logContent = fs.readFileSync(LOG_FILE, "utf8");
-  } else {
-    process.stderr.write(`[detect-agent-errors] Log file not found: ${LOG_FILE}\n`);
+/**
+ * Finds the most recently modified `*.log` file under `dir`, recursing into subdirectories.
+ * @param {string} dir
+ * @returns {string | undefined}
+ */
+function findMostRecentLogFile(dir) {
+  /** @type {{ path: string, mtimeMs: number }[]} */
+  const logFiles = [];
+
+  /** @param {string} current */
+  function walk(current) {
+    let entries;
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const entryPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        walk(entryPath);
+      } else if (entry.isFile() && entry.name.endsWith(".log")) {
+        try {
+          logFiles.push({ path: entryPath, mtimeMs: fs.statSync(entryPath).mtimeMs });
+        } catch {
+          // Ignore files that disappear or fail to stat between readdir and stat.
+        }
+      }
+    }
   }
 
-  const results = detectErrors(logContent);
+  walk(dir);
+  if (logFiles.length === 0) {
+    return undefined;
+  }
+
+  logFiles.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return logFiles[0].path;
+}
+
+/**
+ * Renders the most recently modified log file under the engine-provided internal logs
+ * directory (GH_AW_ENGINE_INTERNAL_LOGS_DIR) to the step log, when the engine execution
+ * step failed.
+ *
+ * Some engines (e.g. Codex CLI) write their own tracing/diagnostic output to files rather
+ * than to stdout/stderr, so a bare non-zero exit code with no console output can still have
+ * a diagnosable error recorded there. Without this, such failures are invisible black-box
+ * "exit code 1" crashes even though the engine logged the real cause internally.
+ *
+ * This reuses the same renderLogFromFile helper used for the threat-detection log, so the
+ * rendered content gets the same secret redaction and `::stop-commands::` wrapping
+ * (preventing `::`-shaped log lines from being interpreted as workflow commands) without
+ * duplicating that logic in shell.
+ *
+ * This is a no-op when GH_AW_ENGINE_INTERNAL_LOGS_DIR is not set, the execution outcome was
+ * not "failure", or no log files are found under the directory.
+ * @returns {Promise<void>}
+ */
+async function renderInternalEngineLogOnFailure() {
+  const internalLogsDir = process.env.GH_AW_ENGINE_INTERNAL_LOGS_DIR;
+  if (!internalLogsDir) {
+    return;
+  }
+
+  const outcome = process.env.GH_AW_AGENTIC_EXECUTION_OUTCOME;
+  if (outcome !== "failure") {
+    return;
+  }
+
+  const logFile = findMostRecentLogFile(internalLogsDir);
+  if (!logFile) {
+    process.stderr.write(`[detect-agent-errors] No engine internal log files found under ${internalLogsDir}\n`);
+    return;
+  }
+
+  await renderLogFromFile(logFile, `Engine internal logs (${internalLogsDir})`, { tailLines: 200 });
+}
+
+/**
+ * @param {string} logContent
+ * @param {ReturnType<typeof detectErrors>} results
+ * @param {string} [rootDir]
+ */
+function persistAgentExecution(logContent, results, rootDir = process.env.GH_AW_TMP_DIR || "/tmp/gh-aw") {
+  const exitPath = path.join(rootDir, "agent_execution_exit_code.txt");
+  const execution = collectAgentExecution({
+    content: logContent,
+    ...(process.env.GH_AW_ENGINE_ID === "aider" ? { rawSourceEngine: "aider" } : {}),
+    categories: buildOutputLines(results)
+      .filter(line => line.endsWith("=true"))
+      .map(line => line.slice(0, -5)),
+    ...(fs.existsSync(exitPath) ? { exitCode: parseAgentExitCode(fs.readFileSync(exitPath, "utf8")) } : {}),
+  });
+  writeSessionArtifact(path.join(rootDir, "agent-errors.jsonl"), execution ? [execution] : [], collectAddMaskedValues(logContent));
+}
+
+async function main({ rootDir = process.env.GH_AW_TMP_DIR || "/tmp/gh-aw" } = {}) {
+  let logContent = "";
+  const logFile = path.join(rootDir, "agent-stdio.log");
+
+  if (fs.existsSync(logFile)) {
+    try {
+      logContent = fs.readFileSync(logFile, "utf8");
+    } catch (err) {
+      throw new Error(`Failed to read file ${logFile}: ${getErrorMessage(err)}`, { cause: err });
+    }
+  } else {
+    process.stderr.write(`[detect-agent-errors] Log file not found: ${logFile}\n`);
+  }
+
+  const stdioResults = detectErrors(agentErrorDiagnosticText(logContent, process.env.GH_AW_ENGINE_ID === "aider" ? "aider" : undefined));
+
+  // Also check the AWF firewall structured JSONL logs for the `unknown_model_ai_credits`
+  // event — the API proxy event log is preferred and the audit log is used as a fallback.
+  // These logs carry both the error type and the model name, providing a more reliable
+  // detection source than text-scanning the stdio log.
+  const { detected: auditMissingPricing, modelName: auditModelName } = parseUnknownModelAICreditsAndModelFromAuditLog();
+  if (auditMissingPricing && !stdioResults.missingModelPricingError) {
+    process.stderr.write(`[detect-agent-errors] Detected missing model pricing from firewall structured log: model "${auditModelName}" has no AI credits pricing configured\n`);
+  }
+
+  // Also check the AWF API proxy event logs for the `max_cache_misses_exceeded` structured
+  // event. This covers all engines since the proxy guardrail fires independently of the
+  // underlying AI engine.
+  const eventLogCacheMissesExceeded = parseMaxCacheMissesExceededFromEventLog();
+  if (eventLogCacheMissesExceeded && !stdioResults.maxCacheMissesExceeded) {
+    process.stderr.write("[detect-agent-errors] Detected max cache misses exceeded from AWF API proxy event log\n");
+  }
+
+  // A GitHub Actions step-level timeout kills the engine externally and can leave no
+  // timeout signature in the agent log, so it is detected from the step outcome and the
+  // engine run duration instead.
+  const stepTimeout = detectStepTimeoutFromEnvironment();
+  if (stepTimeout && !stdioResults.agenticEngineTimeout) {
+    process.stderr.write(`[detect-agent-errors] Detected step timeout: the engine execution step reached its ${process.env.GH_AW_ENGINE_STEP_TIMEOUT_MINUTES}-minute timeout-minutes budget and was terminated\n`);
+  }
+
+  const results = {
+    ...stdioResults,
+    modelEndpointMismatchError: stdioResults.modelEndpointMismatchError || hasModelEndpointMismatchRecord(rootDir),
+    agenticEngineTimeout: stdioResults.agenticEngineTimeout || stepTimeout,
+    maxCacheMissesExceeded: stdioResults.maxCacheMissesExceeded || eventLogCacheMissesExceeded,
+    missingModelPricingError: stdioResults.missingModelPricingError || auditMissingPricing,
+    missingModelPricingModelName: stdioResults.missingModelPricingModelName || sanitizeModelName(auditModelName),
+  };
 
   if (results.inferenceAccessError) {
     process.stderr.write("[detect-agent-errors] Detected inference access error in agent log\n");
@@ -149,11 +296,14 @@ function main() {
   if (results.mcpPolicyError) {
     process.stderr.write("[detect-agent-errors] Detected MCP policy error in agent log\n");
   }
-  if (results.agenticEngineTimeout) {
+  if (stdioResults.agenticEngineTimeout) {
     process.stderr.write("[detect-agent-errors] Detected agentic engine timeout signature in agent log\n");
   }
   if (results.modelNotSupportedError) {
     process.stderr.write("[detect-agent-errors] Detected model configuration error: configured model is invalid or unavailable for this engine/account\n");
+  }
+  if (results.modelEndpointMismatchError) {
+    process.stderr.write("[detect-agent-errors] Detected model endpoint mismatch: select a model compatible with the configured endpoint and tool protocol; retrying the same configuration will not resolve this error\n");
   }
   if (results.http400ResponseError) {
     process.stderr.write("[detect-agent-errors] Detected HTTP 400 response error in agent log\n");
@@ -161,21 +311,42 @@ function main() {
   if (results.capiQuotaExceededError) {
     process.stderr.write("[detect-agent-errors] Detected CAPI quota exhaustion: Copilot quota has been exceeded\n");
   }
+  if (results.invocationCapExceeded) {
+    process.stderr.write("[detect-agent-errors] Detected invocation cap exhaustion: the pooled per-run LLM invocation budget is fully saturated\n");
+  }
+  if (results.maxCacheMissesExceeded) {
+    process.stderr.write("[detect-agent-errors] Detected max cache misses exceeded: the AWF API proxy consecutive cache miss limit was reached\n");
+  }
+  if (results.missingModelPricingError && !auditMissingPricing) {
+    process.stderr.write(`[detect-agent-errors] Detected missing model pricing: model "${results.missingModelPricingModelName}" has no AI credits pricing configured\n`);
+  }
+  if (results.shellExpansionGuardRejected) {
+    process.stderr.write("[detect-agent-errors] Detected sandbox shell expansion guard rejection: do not repeat the denied command or bypass it with unapproved shell helpers; use an exposed native safe-output tool or report the blocker\n");
+  }
 
   writeOutputs(results);
+
+  persistAgentExecution(logContent, results, rootDir);
+
+  if (buildOutputLines(results).some(line => line.endsWith("=true")) || process.env.GH_AW_AGENTIC_EXECUTION_OUTCOME === "failure") {
+    process.stderr.write("[detect-agent-errors] Debug playbook: https://github.com/github/gh-aw/blob/main/.github/aw/debug-playbook.md#agent-model-and-proxy-classifications\n");
+  }
+
+  await renderInternalEngineLogOnFailure();
 }
 
 if (require.main === module) {
-  main();
+  main().catch(err => {
+    process.stderr.write(`[detect-agent-errors] Unhandled error: ${err instanceof Error && err.stack ? err.stack : getErrorMessage(err)}\n`);
+  });
 }
 
 module.exports = {
-  detectErrors,
-  isCAPIQuotaExceededError,
-  INFERENCE_ACCESS_ERROR_PATTERN,
-  MCP_POLICY_BLOCKED_PATTERN,
-  AGENTIC_ENGINE_TIMEOUT_PATTERN,
-  MODEL_NOT_SUPPORTED_PATTERN,
-  HTTP_400_RESPONSE_ERROR_PATTERN,
-  CAPI_QUOTA_EXCEEDED_PATTERN,
+  ...errorPatterns,
+  hasModelEndpointMismatchRecord,
+  persistAgentExecution,
+  main,
+  detectStepTimeoutFromEnvironment,
+  findMostRecentLogFile,
+  renderInternalEngineLogOnFailure,
 };

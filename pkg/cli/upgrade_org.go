@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -39,11 +40,16 @@ func runUpgradeForOrg(ctx context.Context, org string, repoGlobs []string, opts 
 		AutoYes:  opts.yes,
 		SearchFn: searchOrgLockWorkflowReposFn,
 		ScanFn: func(ctx context.Context, repo string, v bool) (orgRepoPreview, bool, error) {
-			return scanUpgradeRepoFn(ctx, repo, v)
+			preview, include, err := scanUpgradeRepoFn(ctx, repo, v)
+			if err == nil && include && upgradeRepoMatchesVersion(preview, GetVersion()) {
+				fmt.Fprintln(os.Stderr, console.FormatInfoMessage(repo+": "+orgUpgradeVersionMatchStatus))
+				include = false
+			}
+			return preview, include, err
 		},
 		ReportFn: renderOrgUpgradeReport,
 		ApplyFn: func(ctx context.Context, preview orgRepoPreview, v bool) error {
-			return runUpgradeForTargetRepoFn(ctx, preview.Repo, opts, v)
+			return runUpgradeForTargetRepoFn(ctx, preview.Repo, opts, true, v)
 		},
 		IssueFn: func(ctx context.Context, preview orgRepoPreview, v bool) error {
 			return createIssueForUpgradeOrgRepoFn(ctx, preview.Repo, v)
@@ -53,7 +59,7 @@ func runUpgradeForOrg(ctx context.Context, org string, repoGlobs []string, opts 
 		ScanLabel:        "Inspecting",
 		ApplyLabel:       "Upgrading",
 		IssueLabel:       "Creating issue in",
-		NoResultsMsg:     "No repositories with agentic workflows found",
+		NoResultsMsg:     "No repositories require an agentic workflow upgrade",
 		NoResultsStopMsg: "No repositories found before processing stopped",
 		AllFailApplyMsg:  "failed to upgrade any repository",
 		AllFailIssueMsg:  "failed to create issues in any repository",
@@ -61,7 +67,7 @@ func runUpgradeForOrg(ctx context.Context, org string, repoGlobs []string, opts 
 }
 
 // scanUpgradeRepo shallow-clones repo, counts agentic workflow files, and
-// extracts the current compiler version from the first lock file it finds.
+// extracts the distinct compiler versions from all lock file headers.
 // It returns (preview, true, nil) when the repo has workflows, or
 // (orgRepoPreview{}, false, nil) when none are found.
 func scanUpgradeRepo(ctx context.Context, repo string, verbose bool) (orgRepoPreview, bool, error) {
@@ -80,11 +86,14 @@ func scanUpgradeRepo(ctx context.Context, repo string, verbose bool) (orgRepoPre
 		return orgRepoPreview{}, false, err
 	}
 
-	workflowsDir := filepath.Join(checkoutDir, constants.GetWorkflowDir())
+	return previewUpgradeRepoCheckout(repo, checkoutDir, verbose)
+}
 
+func previewUpgradeRepoCheckout(repo, checkoutDir string, verbose bool) (orgRepoPreview, bool, error) {
+	workflowsDir := filepath.Join(checkoutDir, constants.GetWorkflowDir())
 	// Count .md workflow files (excluding lock files).
-	mdCount, err := countWorkflowMDFiles(workflowsDir)
-	if err != nil && !os.IsNotExist(err) {
+	mdCount, missing, err := countUpgradeWorkflowFiles(workflowsDir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return orgRepoPreview{}, false, fmt.Errorf("failed to scan workflows in %s: %w", repo, err)
 	}
 
@@ -96,19 +105,25 @@ func scanUpgradeRepo(ctx context.Context, repo string, verbose bool) (orgRepoPre
 		return orgRepoPreview{}, false, nil
 	}
 
-	// Extract compiler version from lock file metadata.
-	currentVersion := extractCompilerVersionFromWorkflowsDir(workflowsDir)
-	upgradeOrgLog.Printf("Scanned %s: workflows=%d, currentVersion=%s", repo, mdCount, currentVersion)
+	versions, unknown, err := extractCompilerVersionsFromWorkflowsDir(workflowsDir)
+	if err != nil {
+		return orgRepoPreview{}, false, fmt.Errorf("failed to scan compiler versions in %s: %w", repo, err)
+	}
+	preview := orgRepoPreview{
+		Repo:                 repo,
+		TotalWorkflows:       mdCount,
+		CurrentVersions:      versions,
+		UnknownVersionLocks:  unknown,
+		MissingWorkflowLocks: missing,
+	}
+	currentVersions := formatUpgradeCompilerVersions(preview)
+	upgradeOrgLog.Printf("Scanned %s: workflows=%d, compilerVersions=%s", repo, mdCount, currentVersions)
 
 	fmt.Fprintln(os.Stderr, console.FormatInfoMessage(
-		fmt.Sprintf("%s: %d workflow(s)%s", repo, mdCount, formatCurrentVersionSuffix(currentVersion)),
+		fmt.Sprintf("%s: %d workflow(s), compilers: %s", repo, mdCount, currentVersions),
 	))
 
-	return orgRepoPreview{
-		Repo:           repo,
-		TotalWorkflows: mdCount,
-		CurrentVersion: currentVersion,
-	}, true, nil
+	return preview, true, nil
 }
 
 // renderOrgUpgradeReport prints the discovered repositories with their workflow
@@ -120,62 +135,52 @@ func renderOrgUpgradeReport(results []orgRepoPreview, applying bool) {
 	} else {
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Dry-run preview of upgrade pull requests:"))
 	}
+	var allVersions []string
+	unknown, missing := 0, 0
 	for _, r := range results {
-		versionPart := ""
-		currentVersion := normalizeDisplayVersion(r.CurrentVersion)
-		if currentVersion != "" {
-			target := ""
-			if targetVersion != "" && currentVersion != targetVersion {
-				target = " -> " + targetVersion
-			}
-			versionPart = fmt.Sprintf(" (%s%s)", currentVersion, target)
-		} else if r.TotalWorkflows > 0 {
-			versionPart = fmt.Sprintf(" (%d workflow(s))", r.TotalWorkflows)
+		currentVersions := formatUpgradeCompilerVersions(r)
+		target := ""
+		if targetVersion != "" && currentVersions != targetVersion {
+			target = " -> " + targetVersion
 		}
-		fmt.Fprintf(os.Stderr, "- %s%s\n", r.Repo, versionPart)
+		status := ""
+		if upgradeRepoMatchesVersion(r, targetVersion) {
+			status = "; " + orgUpgradeVersionMatchStatus
+		}
+		fmt.Fprintf(os.Stderr, "- %s (%s%s; %d workflow(s)%s)\n", r.Repo, currentVersions, target, r.TotalWorkflows, status)
+		allVersions = append(allVersions, r.CurrentVersions...)
+		unknown += r.UnknownVersionLocks
+		missing += r.MissingWorkflowLocks
+	}
+	if len(results) > 0 {
+		fmt.Fprintln(os.Stderr, "Detected compiler versions: "+formatUpgradeCompilerVersions(orgRepoPreview{
+			CurrentVersions: allVersions, UnknownVersionLocks: unknown, MissingWorkflowLocks: missing,
+		}))
 	}
 }
 
-// countWorkflowMDFiles returns the number of .md files (excluding .lock.yml)
-// in workflowsDir.
-func countWorkflowMDFiles(workflowsDir string) (int, error) {
+// countUpgradeWorkflowFiles counts Markdown workflows and those without lock files.
+func countUpgradeWorkflowFiles(workflowsDir string) (count, missing int, err error) {
 	entries, err := os.ReadDir(workflowsDir)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	count := 0
+	files := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			files[entry.Name()] = struct{}{}
+		}
+	}
 	for _, e := range entries {
 		name := e.Name()
 		if !e.IsDir() && strings.HasSuffix(name, ".md") && !strings.EqualFold(name, "README.md") {
 			count++
+			if _, exists := files[strings.TrimSuffix(name, ".md")+".lock.yml"]; !exists {
+				missing++
+			}
 		}
 	}
-	return count, nil
-}
-
-// extractCompilerVersionFromWorkflowsDir reads the first .lock.yml file in
-// workflowsDir and extracts the compiler_version from its gh-aw-metadata
-// comment. Returns an empty string if no lock file is found or parsing fails.
-func extractCompilerVersionFromWorkflowsDir(workflowsDir string) string {
-	entries, err := os.ReadDir(workflowsDir)
-	if err != nil {
-		return ""
-	}
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".lock.yml") {
-			continue
-		}
-		lockPath := filepath.Join(workflowsDir, e.Name())
-		content, err := os.ReadFile(lockPath)
-		if err != nil {
-			continue
-		}
-		version := extractCompilerVersionFromLockContent(string(content))
-		if version != "" {
-			return version
-		}
-	}
-	return ""
+	return count, missing, nil
 }
 
 // extractCompilerVersionFromLockContent parses the gh-aw-metadata JSON comment
@@ -189,16 +194,6 @@ func extractCompilerVersionFromLockContent(content string) string {
 	return meta.CompilerVersion
 }
 
-// formatCurrentVersionSuffix formats a version string for inline display,
-// e.g. ", compiler: v1.2.3". Returns an empty string when version is empty.
-func formatCurrentVersionSuffix(version string) string {
-	normalized := normalizeDisplayVersion(version)
-	if normalized == "" {
-		return ""
-	}
-	return ", compiler: " + normalized
-}
-
 func normalizeDisplayVersion(version string) string {
 	version = strings.TrimSpace(version)
 	if version == "" {
@@ -209,10 +204,28 @@ func normalizeDisplayVersion(version string) string {
 
 // runUpgradeForTargetRepo checks out repo to a temporary directory, runs the
 // upgrade command inside it, and opens a pull request with the resulting changes.
-func runUpgradeForTargetRepo(ctx context.Context, repo string, opts upgradeOptions, verbose bool) error {
+func runUpgradeForTargetRepo(ctx context.Context, repo string, opts upgradeOptions, createPR bool, verbose bool) error { //nolint:largefunc // Checkout lifetime, upgrade, and PR creation share ordered cleanup.
+	ctx = withUpdateRepository(ctx, repo)
+	if rollout := orgRolloutFromContext(ctx); rollout != nil && rollout.worker && rollout.dryRun {
+		preview, include, err := scanUpgradeRepoFn(ctx, repo, verbose)
+		if err != nil {
+			return err
+		}
+		if !include {
+			return emitOrgRolloutResult(orgRolloutResult{Status: orgUpgradeNoWorkflowsStatus}, ctx)
+		}
+		if upgradeRepoMatchesVersion(preview, GetVersion()) {
+			return emitOrgRolloutResult(orgRolloutResult{Status: orgUpgradeVersionMatchStatus, Preview: &preview}, ctx)
+		}
+		return emitOrgRolloutPreview(preview, include, ctx)
+	}
+	existing, skip, err := prepareOrgRolloutWorker(ctx, repo, ghawUpgradeMarkerPrefix)
+	if err != nil || skip {
+		return err
+	}
 	gitRoot, err := gitutil.FindGitRoot()
 	if err != nil {
-		return fmt.Errorf("--org requires running inside a git repository: %w", err)
+		return fmt.Errorf("--repo/--org requires running inside a git repository: %w", err)
 	}
 
 	updatesDir, err := ensureUpdateTargetRepoGitignore(gitRoot)
@@ -223,6 +236,21 @@ func runUpgradeForTargetRepo(ctx context.Context, repo string, opts upgradeOptio
 	checkoutDir := filepath.Join(updatesDir, sanitizeRepoPath(repo))
 	if err := shallowCloneTargetRepo(ctx, repo, checkoutDir); err != nil {
 		return err
+	}
+
+	var preview *orgRepoPreview
+	if rollout := orgRolloutFromContext(ctx); rollout != nil && rollout.worker {
+		scanned, include, err := previewUpgradeRepoCheckout(repo, checkoutDir, verbose)
+		if err != nil {
+			return err
+		}
+		if !include {
+			return emitOrgRolloutResult(orgRolloutResult{Status: orgUpgradeNoWorkflowsStatus}, ctx)
+		}
+		preview = &scanned
+		if upgradeRepoMatchesVersion(scanned, GetVersion()) {
+			return emitOrgRolloutResult(orgRolloutResult{Status: orgUpgradeVersionMatchStatus, Preview: preview}, ctx)
+		}
 	}
 
 	// Extend sparse checkout to include .github/skills; upgrade also updates
@@ -252,20 +280,35 @@ func runUpgradeForTargetRepo(ctx context.Context, repo string, opts upgradeOptio
 		return fmt.Errorf("failed to change directory to checkout %s: %w", checkoutDir, err)
 	}
 
-	if err := PreflightCheckForCreatePR(verbose); err != nil {
-		return err
+	if createPR {
+		if err := PreflightCheckForCreatePR(verbose); err != nil {
+			return err
+		}
 	}
 
 	// Override fields that must be adjusted for a remote-repo upgrade.
 	// workflowDir is intentionally reset: --dir is a local-machine concept and
 	// must not be forwarded to remote repos where that path may not exist.
 	opts.ctx = ctx
+	if rollout := orgRolloutFromContext(ctx); rollout != nil && rollout.worker {
+		opts.ctx = withUpdateGitHubClient(ctx, verbose)
+	}
 	opts.skipExtensionUpgrade = true
 	opts.verbose = verbose
 	opts.workflowDir = ""
+	if createPR {
+		opts.summary, err = newUpdatePRSummary(ctx, opts.workflowDir)
+		if err != nil {
+			return err
+		}
+	}
 
 	if err := runUpgradeCommand(opts); err != nil {
 		return err
+	}
+
+	if !createPR {
+		return nil
 	}
 
 	// Skip PR creation when the upgrade produced no changes (e.g. repo is already up to date).
@@ -274,6 +317,9 @@ func runUpgradeForTargetRepo(ctx context.Context, repo string, opts upgradeOptio
 		return err
 	}
 	if !changed {
+		if rollout := orgRolloutFromContext(ctx); rollout != nil && rollout.worker {
+			return emitOrgRolloutResult(orgRolloutResult{Status: "unchanged", Preview: preview}, ctx)
+		}
 		upgradeOrgLog.Printf("Skipping PR for %s: no pending changes after upgrade", repo)
 		if verbose {
 			fmt.Fprintln(os.Stderr, console.FormatVerboseMessage("Skipping PR for "+repo+": already up to date"))
@@ -281,28 +327,35 @@ func runUpgradeForTargetRepo(ctx context.Context, repo string, opts upgradeOptio
 		return nil
 	}
 
-	releaseTag, releaseURL := getGhawReleaseInfo()
-	xmlMarker := buildOrgXMLMarker(ghawUpgradeMarkerPrefix, releaseTag)
+	xmlMarker := buildOrgXMLMarker(ghawUpgradeMarkerPrefix, normalizeDisplayVersion(GetVersion()))
 
-	// Close any stale upgrade PRs in the target repo before creating the new one.
-	closeExistingOrgPRsByMarker(ctx, repo, ghawUpgradeMarkerPrefix, verbose)
-
-	var releaseLine string
-	if releaseURL != "" {
-		releaseLine = fmt.Sprintf("\n[View gh-aw release %s](%s)\n", releaseTag, releaseURL)
-	}
-	prBody := "This PR upgrades agentic workflows by applying the latest codemods, " +
-		"updating GitHub Actions versions, and recompiling all workflows." +
-		releaseLine + "\n" + xmlMarker
-
-	prURL, err := CreatePRWithChanges("upgrade-agentic-workflows", "chore: upgrade agentic workflows",
-		"Upgrade agentic workflows", prBody, verbose)
+	prBody, err := opts.summary.body(ctx, "upgrade")
 	if err != nil {
 		return err
 	}
+	prBody = appendUpdatePRReleaseHighlights(ctx, prBody, opts.prMessage, xmlMarker)
+	if err := validatePRBody(prBody); err != nil {
+		return err
+	}
 
+	// Close stale PRs only after the replacement description is validated.
+	if orgRolloutFromContext(ctx) == nil {
+		closeExistingOrgPRsByMarker(ctx, repo, ghawUpgradeMarkerPrefix, verbose)
+	}
+
+	prURL, err := createPRWithChanges(ctx, "upgrade-agentic-workflows", "chore: upgrade agentic workflows",
+		updatePRTitle("Upgrade agentic workflows"), prBody, verbose, opts.autoMerge)
 	if prURL != "" {
 		addLabelToOrgPR(ctx, prURL, agenticWorkflowsLabel, verbose)
+	}
+	if err != nil {
+		if rollout := orgRolloutFromContext(ctx); rollout != nil && rollout.worker && prURL != "" {
+			return errors.Join(err, emitOrgRolloutResult(orgRolloutResult{Status: "created", URL: prURL, Preview: preview}, ctx))
+		}
+		return err
+	}
+	if prURL != "" {
+		return finishOrgRolloutWorker(ctx, repo, existing, prURL, preview)
 	}
 	return nil
 }
@@ -312,6 +365,9 @@ func runUpgradeForTargetRepo(ctx context.Context, repo string, opts upgradeOptio
 // This is the same discovery strategy used by the update command so both
 // commands operate on the same set of repositories.
 func searchOrgLockWorkflowRepos(ctx context.Context, org string, verbose bool) ([]string, error) {
+	if !isValidOrgSlug(org) {
+		return nil, invalidOrgSlugError(org)
+	}
 	query := fmt.Sprintf(`org:%s path:.github/workflows filename:.lock.yml`, org)
 	return searchOrgReposByQuery(ctx, query, verbose)
 }
@@ -323,7 +379,7 @@ func searchOrgLockWorkflowRepos(ctx context.Context, org string, verbose bool) (
 func createIssueForUpgradeOrgRepo(ctx context.Context, repo string, verbose bool) error {
 	title := "[aw] Upgrade available"
 
-	releaseTag, releaseURL := getGhawReleaseInfo()
+	releaseTag, releaseURL := getGhawReleaseInfo(ctx)
 	xmlMarker := buildOrgXMLMarker(ghawUpgradeMarkerPrefix, releaseTag)
 
 	// Close stale upgrade issues before creating the new one.

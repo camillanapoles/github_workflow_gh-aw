@@ -20,6 +20,19 @@ make deps
 make deps-dev
 ```
 
+Run `make check-npm-1es` to verify that every exact npm registry dependency in
+the tracked lockfiles is available through the Microsoft 1ES public npm feed.
+This downloads metadata and tarballs into a temporary cache, including dev,
+transitive, and platform-specific optional dependencies, without installing
+packages, running lifecycle scripts, or changing npm configuration or lockfiles.
+Registry entries without `resolved` are checked too; npm supports omitting that
+field with [`omit-lockfile-registry-resolved`](https://docs.npmjs.com/cli/v11/using-npm/config#omit-lockfile-registry-resolved).
+Git, local, and private-registry dependencies are reported separately and still
+require their own network access. The command fails if a registry package
+cannot be downloaded; caching an upstream version may require feed permissions.
+Failures report the unavailable pinned version and its lockfile locations;
+the check does not search for replacements or suggest dependency upgrades.
+
 ### 3. Build and Verify Development Environment
 
 ```bash
@@ -283,7 +296,10 @@ The project has several test targets optimized for different scenarios:
 
 | Target | Speed | What It Tests | Use When |
 |--------|-------|---------------|----------|
-| `test-unit` | ~25s | Unit tests only (excludes integration) | **Recommended** for rapid iteration during development |
+| `test-unit` | ~30s selected runtime, plus compilation | Impacted unit tests, not full coverage | **Recommended** for rapid iteration during development |
+| `test-unit-fast` | Varies | Full fast partition; excludes measured >=10s tests | Broad fast feedback |
+| `test-unit-slow` | Varies | Measured >=10s top-level tests | Repository sweeps and slow runtime regressions |
+| `test-unit-all` | Varies | Both unit partitions | Full Go unit coverage |
 | `test` | ~30s | Unit + all integration tests | Before committing, comprehensive validation |
 | `test-integration-compile` | Varies | Workflow compilation integration tests | Testing compiler changes specifically |
 | `test-integration-mcp-playwright` | Varies | MCP Playwright integration | Testing Playwright MCP functionality |
@@ -340,6 +356,24 @@ make test
 make build
 make recompile
 ```
+
+#### Schema changes not taking effect / stale schema errors
+Files under `pkg/parser/schemas/` are embedded in the binary at compile time via
+`//go:embed`. Changing those JSON files without rebuilding means the running binary
+still holds the old schema.
+
+**Solution**: Rebuild after any schema edit:
+```bash
+make build
+```
+
+Running `go test ./pkg/parser/...` (or `make test-unit`) validates that every
+embedded schema is well-formed JSON via the `TestEmbeddedSchemasAreValid` test,
+but it does **not** rebuild the `./gh-aw` CLI.  If you need the running CLI to
+reflect your schema edits, `make build` is still required.
+
+The `make check-stale-schema-binary` target (also run as part of `make lint`) uses
+`git diff` to detect schema-file changes and verifies the binary is up to date.
 
 #### "cannot find package" errors
 **Solution**: Clean and reinstall dependencies:
@@ -499,7 +533,7 @@ The CI workflow generates JSON test result artifacts with timing information tha
 
 #### Available Artifacts
 
-- **test-result-unit.json**: Unit test results with timing data
+- **test-result-cgo-unit-***: CGO fast and slow shard artifacts, each containing `test-result-unit-SHARD.json`
 - **test-result-integration-*.json**: Integration test results for each test group
 
 #### JSON Format
@@ -524,14 +558,17 @@ To extract timing information from artifacts:
 
 ```bash
 # Download artifacts from a workflow run
-gh run download <run-id>
+gh run download <run-id> --pattern 'test-result-cgo-unit-*' --dir "$TMPDIR/cgo-results"
 
 # Extract slowest tests
-cat test-result-unit.json | jq -r 'select(.Action == "pass" and .Test != null) | "\(.Elapsed)s \(.Test)"' | sort -rn | head -20
+find "$TMPDIR/cgo-results" -name '*.json' -exec cat {} + | jq -r 'select((.Action == "pass" or .Action == "fail") and .Test != null and (.Test | contains("/") | not)) | "\(.Elapsed)s \(.Package) \(.Test)"' | sort -rn | head -20
 
 # Get package-level timing
-cat test-result-unit.json | jq -r 'select(.Action == "pass" and .Test == null) | "\(.Elapsed)s \(.Package)"' | sort -rn
+find "$TMPDIR/cgo-results" -name '*.json' -exec cat {} + | jq -r 'select((.Action == "pass" or .Action == "fail") and .Test == null) | "\(.Elapsed)s \(.Package)"' | sort -rn
 ```
+
+See [CGO unit-test timing](CONTRIBUTING.md#cgo-unit-test-timing) for the measured
+slowest tests, failure timing, and fast/slow front-door selection contract.
 
 #### Mining Test Data
 
@@ -953,6 +990,20 @@ This documentation provides:
    - Run the `pr-finisher` skill (automates final review/check/mergeability hardening) to get to green
    - For features that deeply impact the engine, add the `smoke` label and approve workflows
    - If no smoke run is queued after setting `smoke`, or additional changes require another smoke run, toggle the `smoke` label (remove and re-add), then approve workflows again
+   - For changes to model routing (`engine.model-routing`), add the `smoke-routing` label and approve workflows. It runs nine routed smokes on the PR's code:
+     - `smoke-copilot-routed`: Copilot CLI with routing and no sub-agents. It also runs the default threat-detection engine on a pinned model, and a detection-job post-step checks that detection completed on that model without routing (`D1`–`D3`)
+     - `smoke-claude-routed`: Claude Code with routing on `model-provider: github`; AWF selects `/chat/completions` and the main agent must use `/v1/messages`
+     - `smoke-pi-routed`: pi with routing and two cross-family declared sub-agents (Claude and GPT)
+     - `smoke-codex-routed`: Codex with routing on `model-provider: github` over `gpt-5.6-*` candidates; the main agent must use `/responses`, `H2` fails unless the proxy-selected effort is `max`, and `H3` fails unless every main-agent request the proxy recorded (`firewall.model_routing` `stage: request`) has `requestedEffort` equal to the selected effort
+     - `smoke-copilot-sdk-routed`: Copilot SDK with routing and a Claude sub-agent under a GPT main agent
+     - `smoke-copilot-routed-steering`: Copilot CLI with routing on one model and a 7-credit `max-ai-credits` budget; the main agent must stop on the AWF AI-credit steering notice and finish under budget
+     - `smoke-copilot-routed-claude`: Copilot CLI with routing over a Claude-only pool in `mode: auto`; the main agent must use `/chat/completions`
+     - `smoke-pi-routed-claude`: pi with routing over a Claude-only pool in `mode: robust`; the main agent must use `/v1/messages`
+     - `smoke-copilot-sdk-routed-claude`: Copilot SDK with routing over `claude-haiku-4.5` (no reasoning effort) and a GPT sub-agent on `/responses`
+   - Each routed smoke's post-step (`actions/setup/js/smoke_model_routing_assertions.cjs`) checks runner- and proxy-written evidence, not the agent's reply. Every failed check logs its ID (`R1`–`R4`, `S1`–`S4`, `M1`, `P1`, `E1`, `E2`, `U1`–`U3`, `H2` for the Codex smoke, and `T1`–`T4` for the steering smoke) with the observed model, endpoint, status, event or steering notice, so the step log is enough to diagnose a failure
+   - `U1`–`U3` check the unified session (`usage/aw_session.jsonl`) that audit, logs and footers read: `U1` no `session.collection_warning`; `U2` exactly one agent-phase `model.inventory` (with `copilotInventory`, a configured `copilot` endpoint with models); `U3` one successful `model.resolution` for each role in the smoke's explicit `resolutionRoles`. The unrouted engine smokes (`smoke-copilot`, `smoke-copilot-sdk`, `smoke-claude`, `smoke-claude-on-copilot`, `smoke-codex`, `smoke-pi`) run `E2` and `U1`–`U3` alone through `sessionContractMain`
+   - A routed smoke opts in to `U1`–`U3` by setting `expectModelInventory: true`, `copilotInventory: true` or a `resolutionRoles` array (`[]` requires no roles); `false` flags do not opt in. `U2` runs when `expectModelInventory` or `copilotInventory` is true. If neither is true, the log explicitly reports `U2 not evaluated`. With `expectModelInventory: true`, missing inventory evidence fails gracefully as `FAIL U2 ... observed 0`; it does not throw. A missing session instead fails `E2` and logs `U1–U3 not evaluated`. Unavailable evidence paths also fail `E2`. Repeated `U1` warnings are grouped by `(code, path)` with a count and an example line when available; every distinct pair remains visible
+   - `label_command` removes the `smoke-routing` label when the runs start. To run them again, re-add the label, then approve workflows again
 
 ## Release Process
 

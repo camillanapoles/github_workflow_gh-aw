@@ -3,6 +3,7 @@
 // @safe-outputs-exempt SEC-004 — body fields are read-only API context, never written back
 
 const { getErrorMessage } = require("./error_helpers.cjs");
+const { getPromptPath, renderTemplateFromFile } = require("./messages_core.cjs");
 
 /**
  * Shared helper functions for assigning coding agents (like Copilot) to issues.
@@ -34,6 +35,19 @@ function normalizeLogin(login) {
  * @type {Record<string, string>}
  */
 const AGENT_NAME_BY_LOGIN = Object.fromEntries(Object.entries(AGENT_LOGIN_NAMES).flatMap(([agentName, logins]) => logins.map(login => [normalizeLogin(login), agentName])));
+
+const REASONING_EFFORT_VALUES = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+
+function resolveReasoningEffort(reasoningEffort) {
+  if (reasoningEffort == null) return null;
+
+  const normalizedEffort = typeof reasoningEffort === "string" ? reasoningEffort.trim().toLowerCase() : null;
+  if (normalizedEffort == null || !REASONING_EFFORT_VALUES.has(normalizedEffort)) {
+    core.warning(`Ignoring reasoning-effort: expected one of ${[...REASONING_EFFORT_VALUES].join(", ")}.`);
+    return null;
+  }
+  return normalizedEffort;
+}
 
 /**
  * GitHub can surface bots either via type="Bot" or a [bot] login suffix.
@@ -208,6 +222,7 @@ async function findAgent(owner, repo, agentName, issueNumber = null, githubClien
       const statusLabel = status ? ` (${status})` : "";
       aliasFailures.push(`${loginName}${statusLabel}: ${errorMessage}`);
       if (
+        status === 401 ||
         errorMessage.includes("Bad credentials") ||
         errorMessage.includes("Not Authenticated") ||
         errorMessage.includes("Resource not accessible") ||
@@ -332,6 +347,9 @@ async function getPullRequestDetails(owner, repo, pullNumber, githubClient = git
  * @param {Object} [githubClient] - Authenticated GitHub client (defaults to global github)
  * @param {{owner: string, repo: string, type: "issue"|"pull", number: number}|null} [taskContext] - Source issue/PR context for REST path
  * @param {string|null} [pullRequestRepoSlug] - Optional pull request repository slug (owner/repo) for REST path
+ * @param {{rationale?: string, confidence?: "LOW"|"MEDIUM"|"HIGH", suggest?: boolean}} [intentMetadata] - Optional issue-intent metadata
+ * @param {boolean} [useIssueIntent] - Whether to include issue-intent metadata/headers
+ * @param {string|null} [reasoningEffort] - Optional reasoning effort
  * @returns {Promise<boolean>} True if successful
  */
 async function assignAgentToIssue(
@@ -346,7 +364,10 @@ async function assignAgentToIssue(
   baseBranch = null,
   githubClient = github,
   taskContext = null,
-  pullRequestRepoSlug = null
+  pullRequestRepoSlug = null,
+  intentMetadata = {},
+  useIssueIntent = true,
+  reasoningEffort = null
 ) {
   // SECURITY: pullRequestRepoSlug specifies a cross-repo target repository slug.
   // Callers MUST validate the corresponding repository slug against allowedRepos using
@@ -391,12 +412,23 @@ async function assignAgentToIssue(
 
   try {
     core.info(`Assigning via issues assignees REST API with login: ${agentLogin}`);
-    await githubClient.request("POST /repos/{owner}/{repo}/issues/{issue_number}/assignees", {
+    const assignee = useIssueIntent && intentMetadata && Object.keys(intentMetadata).length > 0 ? { login: agentLogin, ...intentMetadata } : agentLogin;
+    const assignParams = {
       owner: targetOwner,
       repo: targetRepo,
       issue_number: issueNumber,
-      assignees: [agentLogin],
-    });
+      assignees: [assignee],
+    };
+    const agentAssignment = {};
+    if (pullRequestRepoSlug != null) agentAssignment.target_repo = pullRequestRepoSlug;
+    if (baseBranch != null) agentAssignment.base_branch = baseBranch;
+    if (customInstructions != null) agentAssignment.custom_instructions = customInstructions;
+    if (customAgent != null) agentAssignment.custom_agent = customAgent;
+    if (model != null) agentAssignment.model = model;
+    const validReasoningEffort = resolveReasoningEffort(reasoningEffort);
+    if (validReasoningEffort != null) agentAssignment.reasoning_effort = validReasoningEffort;
+    if (Object.keys(agentAssignment).length > 0) assignParams.agent_assignment = agentAssignment;
+    await githubClient.request("POST /repos/{owner}/{repo}/issues/{issue_number}/assignees", assignParams);
     return true;
   } catch (error) {
     const errorMessage = getErrorMessage(error);
@@ -421,23 +453,17 @@ async function assignAgentToIssue(
  * @param {string} agentName - Agent name for error messages
  */
 function logPermissionError(agentName) {
-  core.error(`Failed to assign ${agentName}: Insufficient permissions`);
-  core.error("");
-  core.error("Assigning Copilot coding agent requires the following token permissions:");
-  core.error("  Fine-grained PAT:");
-  core.error("    - Read access to metadata");
-  core.error("    - Read and write access to actions, contents, issues, and pull requests");
-  core.error("  Classic PAT:");
-  core.error("    - repo scope");
-  core.error("");
-  core.error("  Repository settings:");
-  core.error("    - Ensure assignee has access to the repository");
-  core.error("");
-  core.error("  Organization/Enterprise settings and Copilot policy:");
-  core.error("    - Check if your org restricts bot assignments");
-  core.error("    - Verify Copilot is enabled for your repository");
-  core.error("");
-  core.info("For more information, see: https://docs.github.com/en/copilot/how-tos/use-copilot-agents/cloud-agent/use-cloud-agent-via-the-api#using-the-issues-api");
+  const errorTemplatePath = getPromptPath("copilot_assignment_permission_error.md");
+  const referencesTemplatePath = getPromptPath("copilot_assignment_permission_references.md");
+  const renderedError = renderTemplateFromFile(errorTemplatePath, { agent_name: agentName }).trimEnd();
+  const renderedReferences = renderTemplateFromFile(referencesTemplatePath, {}).trimEnd();
+
+  for (const line of renderedError.split("\n")) {
+    core.error(line);
+  }
+  for (const line of renderedReferences.split("\n")) {
+    core.info(line);
+  }
 }
 
 /**
@@ -445,30 +471,8 @@ function logPermissionError(agentName) {
  * @returns {string} Markdown content for permission error guidance
  */
 function generatePermissionErrorSummary() {
-  return `
-### ⚠️ Permission Requirements
-
-Assigning Copilot coding agent requires a token with the correct permissions. See the [official GitHub Copilot cloud agent API documentation](https://docs.github.com/en/copilot/how-tos/use-copilot-agents/cloud-agent/use-cloud-agent-via-the-api#using-the-issues-api) for details.
-
-**Fine-grained personal access token** — requires these repository permissions:
-- Read access to **metadata**
-- Read and write access to **actions**, **contents**, **issues**, and **pull requests**
-
-**Classic personal access token** — requires the **\`repo\`** scope.
-
-**Token capability note:**
-- Current token lacks permission for \`POST /repos/{owner}/{repo}/issues/{issue_number}/assignees\`.
-- Token must be able to assign users to issues in the target repository.
-
-**Recommended remediation paths:**
-1. Use a fine-grained PAT with the permissions listed above, or a classic PAT with the \`repo\` scope.
-2. Ensure repository settings allow assignee updates.
-3. Verify Copilot coding agent is enabled for the repository and organization policy allows bot assignments.
-
-**Why this failed:** The token could not update issue assignees via the REST API.
-
-📖 Reference: https://docs.github.com/en/copilot/how-tos/use-copilot-agents/cloud-agent/use-cloud-agent-via-the-api#using-the-issues-api
-`;
+  const templatePath = getPromptPath("copilot_assignment_permission_requirements.md");
+  return renderTemplateFromFile(templatePath, {});
 }
 
 /**
@@ -539,6 +543,7 @@ module.exports = {
   getIssueDetails,
   getPullRequestDetails,
   assignAgentToIssue,
+  resolveReasoningEffort,
   logPermissionError,
   generatePermissionErrorSummary,
   assignAgentToIssueByName,

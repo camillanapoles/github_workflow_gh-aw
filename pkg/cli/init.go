@@ -12,6 +12,7 @@ import (
 	"github.com/github/gh-aw/pkg/constants"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/ctxutil"
 	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/gitutil"
 	"github.com/github/gh-aw/pkg/logger"
@@ -24,7 +25,9 @@ var initLog = logger.New("cli:init")
 type InitOptions struct {
 	Ctx              context.Context
 	Verbose          bool
+	Quiet            bool
 	Engine           string
+	NoGitattributes  bool
 	Skill            bool
 	Agent            bool
 	MCP              bool
@@ -32,24 +35,26 @@ type InitOptions struct {
 	CodespaceEnabled bool
 	Completions      bool
 	CreatePR         bool
+	AutoMerge        bool
+	PRMessage        string
 	RootCmd          CommandProvider
 }
 
 // InitRepository initializes the repository for agentic workflows
 func InitRepository(opts InitOptions) error {
+	if err := requireAutoMergePR(opts.AutoMerge, opts.CreatePR); err != nil {
+		return err
+	}
 	initLog.Print("Starting repository initialization for agentic workflows")
 
-	ctx := opts.Ctx
-	if ctx == nil {
-		ctx = context.Background()
+	ctx := ctxutil.OrBackground(opts.Ctx)
+	copilotArtifactsEnabled := opts.Engine == "copilot"
+
+	if !opts.Quiet {
+		console.ShowWelcomeBanner("This tool will initialize your repository for GitHub Agentic Workflows.")
+		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Setting up repository..."))
+		fmt.Fprintln(os.Stderr, "")
 	}
-	copilotArtifactsEnabled := opts.Engine == "" || opts.Engine == "copilot"
-
-	// Show welcome banner for interactive mode
-	console.ShowWelcomeBanner("This tool will initialize your repository for GitHub Agentic Workflows.")
-
-	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Setting up repository..."))
-	fmt.Fprintln(os.Stderr, "")
 
 	// If --create-pull-request is enabled, run pre-flight checks before doing any work
 	if opts.CreatePR {
@@ -66,38 +71,44 @@ func InitRepository(opts InitOptions) error {
 	initLog.Print("Verified git repository")
 
 	// Auto-detect GHES deployment and configure aw.json ghes: true when needed.
+	// ensureGHESRepoConfig skips detection in CI, where gh-proxy can make the environment look like GHES.
 	if _, err := ensureGHESRepoConfig(opts.Verbose); err != nil {
 		initLog.Printf("Failed to configure GHES repo config: %v", err)
 		// Non-fatal: continue with the rest of init
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to configure GHES repo config: %v", err)))
 	}
 
-	// Configure .gitattributes
-	initLog.Print("Configuring .gitattributes")
-	if updated, err := ensureGitAttributes(); err != nil {
-		initLog.Printf("Failed to configure .gitattributes: %v", err)
-		return fmt.Errorf("failed to configure .gitattributes: %w", err)
-	} else if updated && opts.Verbose {
-		fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Configured .gitattributes"))
+	if opts.NoGitattributes {
+		initLog.Print("Skipping .gitattributes configuration")
+	} else {
+		// Configure .gitattributes
+		initLog.Print("Configuring .gitattributes")
+		if updated, err := ensureGitAttributes(); err != nil {
+			initLog.Printf("Failed to configure .gitattributes: %v", err)
+			return fmt.Errorf("failed to configure .gitattributes: %w", err)
+		} else if updated && opts.Verbose {
+			fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Configured .gitattributes"))
+		}
 	}
 
-	// Write dispatcher skill for Copilot engine only
-	if copilotArtifactsEnabled {
-		if opts.Skill {
-			initLog.Print("Writing agentic workflows dispatcher skill")
-			if err := ensureAgenticWorkflowsDispatcher(opts.Verbose, false); err != nil {
-				initLog.Printf("Failed to write dispatcher skill: %v", err)
-				return fmt.Errorf("failed to write dispatcher skill: %w", err)
-			}
-			if opts.Verbose {
-				fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Created dispatcher skill"))
-			}
-		} else {
-			initLog.Print("Skipping agentic workflows dispatcher skill")
+	// Write dispatcher skill
+	if opts.Skill {
+		initLog.Print("Writing agentic workflows dispatcher skill")
+		if err := ensureAgenticWorkflowsDispatcher(ctx, opts.Verbose, false, true); err != nil {
+			initLog.Printf("Failed to write dispatcher skill: %v", err)
+			return fmt.Errorf("failed to write dispatcher skill: %w", err)
 		}
+		if opts.Verbose {
+			fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Created dispatcher skill"))
+		}
+	} else {
+		initLog.Print("Skipping agentic workflows dispatcher skill")
+	}
+
+	if copilotArtifactsEnabled {
 		if opts.Agent {
 			initLog.Print("Writing agentic workflows custom agent")
-			if err := ensureAgenticWorkflowsAgent(opts.Verbose); err != nil {
+			if err := ensureAgenticWorkflowsAgent(opts.Verbose, true); err != nil {
 				initLog.Printf("Failed to write agentic workflows custom agent: %v", err)
 				return fmt.Errorf("failed to write agentic workflows custom agent: %w", err)
 			}
@@ -109,14 +120,12 @@ func InitRepository(opts InitOptions) error {
 		}
 		if err := deleteLegacyAgentFiles(opts.Verbose); err != nil {
 			initLog.Printf("Failed to delete legacy agent files: %v", err)
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Warning: Failed to delete legacy agent files: %v", err)))
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to delete legacy agent files: %v", err)))
 		}
 		if err := deleteAgenticWorkflowDesignerSkillDir(opts.Verbose); err != nil {
 			initLog.Printf("Failed to delete legacy agentic-workflow-designer skill directory: %v", err)
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Warning: Failed to delete legacy agentic-workflow-designer skill directory: %v", err)))
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to delete legacy agentic-workflow-designer skill directory: %v", err)))
 		}
-	} else {
-		initLog.Printf("Skipping Copilot dispatcher skill for engine: %s", opts.Engine)
 	}
 
 	// Delete existing setup agentic workflows agent if it exists
@@ -207,27 +216,32 @@ func InitRepository(opts InitOptions) error {
 		initLog.Print("Create PR enabled - preparing to create branch, commit, push, and create PR")
 		fmt.Fprintln(os.Stderr, "")
 
-		prBody := "This PR initializes the repository for agentic workflows by:\n" +
-			"- Configuring .gitattributes\n" +
-			"- Creating GitHub Copilot custom instructions\n" +
-			"- Setting up workflow prompts and skills"
-		if _, err := CreatePRWithChanges("init-agentic-workflows", "chore: initialize agentic workflows", "Initialize agentic workflows", prBody, opts.Verbose); err != nil {
+		prBody := buildInitPRBody(opts)
+		if _, err := createPRWithChanges(ctx, "init-agentic-workflows", "chore: initialize agentic workflows", "Initialize agentic workflows", prBody, opts.Verbose, opts.AutoMerge); err != nil {
 			return err
 		}
 	}
 
-	// Display success message with next steps
-	fmt.Fprintln(os.Stderr, "")
-	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Repository initialized for agentic workflows!"))
-	fmt.Fprintln(os.Stderr, "")
-	if len(opts.CodespaceRepos) > 0 {
-		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("GitHub Codespaces devcontainer configured"))
+	if !opts.Quiet {
 		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Repository initialized for agentic workflows!"))
+		fmt.Fprintln(os.Stderr, "")
+		if len(opts.CodespaceRepos) > 0 {
+			fmt.Fprintln(os.Stderr, console.FormatInfoMessage("GitHub Codespaces devcontainer configured"))
+			fmt.Fprintln(os.Stderr, "")
+		}
+		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("To create a workflow, see https://github.github.com/gh-aw/setup/creating-workflows"))
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Or add an example workflow, see https://github.com/githubnext/agentics"))
+		fmt.Fprintln(os.Stderr, "")
+		root, err := gitutil.FindGitRoot()
+		if err == nil {
+			err = writeRepositoryConnectorGuidance(os.Stderr, root)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Connector setup discovery incomplete: %v", err)))
+		}
 	}
-	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("To create a workflow, see https://github.github.com/gh-aw/setup/creating-workflows"))
-	fmt.Fprintln(os.Stderr, "")
-	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Or add an example workflow, see https://github.com/githubnext/agentics"))
-	fmt.Fprintln(os.Stderr, "")
 
 	return nil
 }
@@ -332,29 +346,22 @@ func isGHESHost(host string) bool {
 // detectGHESDeployment returns the GHES host if the current repository's git
 // remote points to a GitHub Enterprise Server instance, or "" if it does not.
 // Detection uses the following sources in priority order:
-//  1. GITHUB_SERVER_URL environment variable (set automatically inside GitHub Actions)
-//  2. GH_HOST environment variable (set by the gh CLI)
-//  3. The hostname extracted from the git origin remote URL
+//  1. GITHUB_SERVER_URL, GITHUB_ENTERPRISE_HOST, GITHUB_HOST, GH_HOST environment variables
+//  2. The hostname extracted from the git origin remote URL
 func detectGHESDeployment() string {
-	// Check GITHUB_SERVER_URL first (set inside GitHub Actions runners)
-	if serverURL := os.Getenv("GITHUB_SERVER_URL"); serverURL != "" { //nolint:osgetenvlibrary
-		// serverURL is like "https://ghes.example.com", extract just the host.
-		host := serverURL
-		for _, scheme := range []string{"https://", "http://"} {
-			host = strings.TrimPrefix(host, scheme)
+	// Check env vars in unified priority order (mirrors GetGitHubHost):
+	// GITHUB_SERVER_URL > GITHUB_ENTERPRISE_HOST > GITHUB_HOST > GH_HOST
+	for _, envVar := range []string{"GITHUB_SERVER_URL", "GITHUB_ENTERPRISE_HOST", "GITHUB_HOST", "GH_HOST"} {
+		rawValue := os.Getenv(envVar) //nolint:osgetenvlibrary
+		if rawValue == "" {
+			continue
 		}
+		host := strings.TrimPrefix(rawValue, "https://")
+		host = strings.TrimPrefix(host, "http://")
 		host = strings.TrimSuffix(host, "/")
 		if isGHESHost(host) {
-			initLog.Printf("Detected GHES deployment from GITHUB_SERVER_URL: %s", host)
+			initLog.Printf("Detected GHES deployment from %s: %s", envVar, host)
 			return host
-		}
-	}
-
-	// Check GH_HOST (set when using the gh CLI against an enterprise instance)
-	if ghHost := os.Getenv("GH_HOST"); ghHost != "" { //nolint:osgetenvlibrary
-		if isGHESHost(ghHost) {
-			initLog.Printf("Detected GHES deployment from GH_HOST: %s", ghHost)
-			return ghHost
 		}
 	}
 
@@ -373,6 +380,11 @@ func detectGHESDeployment() string {
 // if GHES is not detected or if "ghes": true is already present.
 // Returns (updated bool, err).
 func ensureGHESRepoConfig(verbose bool) (bool, error) {
+	if IsRunningInCI() {
+		initLog.Print("Running in CI, skipping GHES repo configuration")
+		return false, nil
+	}
+
 	ghesHost := detectGHESDeployment()
 	if ghesHost == "" {
 		initLog.Print("No GHES deployment detected, skipping aw.json ghes configuration")

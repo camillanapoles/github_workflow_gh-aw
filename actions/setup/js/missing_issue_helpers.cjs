@@ -1,11 +1,14 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
+const { createReportIssue } = require("./issue_report.cjs");
+
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { renderTemplateFromFile } = require("./messages_core.cjs");
-const { generateFooterWithExpiration } = require("./ephemerals.cjs");
-const { sanitizeContent } = require("./sanitize_content.cjs");
+const fs = require("node:fs");
+const { parseReportMarkdown } = require("./report_markdown.cjs");
+const { renderSizedReport } = require("./report_size.cjs");
 const { parseBoolTemplatable } = require("./templatable.cjs");
+const { appendConfiguredReportFooter } = require("./body_footer.cjs");
 
 /**
  * @typedef {import('./types/handler-factory').HandlerFactoryFunction} HandlerFactoryFunction
@@ -22,14 +25,15 @@ const { parseBoolTemplatable } = require("./templatable.cjs");
  * @param {string} options.itemsField - Field name in the message containing the items array
  * @param {string} options.templatePath - Absolute path to the issue body template file
  * @param {string} options.templateListKey - Template variable name for the rendered items list
- * @param {function(string): string[]} options.buildCommentHeader - Returns header lines for the comment body given runUrl
- * @param {function(Object, number): string[]} options.renderCommentItem - Renders a single item for an existing-issue comment
- * @param {function(Object, number): string[]} options.renderIssueItem - Renders a single item for a new-issue body
+ * @param {(runUrl: string) => string[]} options.buildCommentHeader - Returns header lines for the comment body given runUrl
+ * @param {(item: any, index: number) => string[]} options.renderCommentItem - Renders a single item for an existing-issue comment
+ * @param {(item: any, index: number) => string[]} options.renderIssueItem - Renders a single item for a new-issue body
  * @param {string[]} [options.defaultLabels] - Labels always applied to created issues (merged with config.labels)
+ * @param {(message: any) => Array<any> | null | undefined} [options.fallbackItems] - Optional fallback item builder used when the message items array is missing/empty
  * @returns {HandlerFactoryFunction}
  */
 function buildMissingIssueHandler(options) {
-  const { handlerType, defaultTitlePrefix, itemsField, templatePath, templateListKey, buildCommentHeader, renderCommentItem, renderIssueItem, defaultLabels = [] } = options;
+  const { handlerType, defaultTitlePrefix, itemsField, templatePath, templateListKey, buildCommentHeader, renderCommentItem, renderIssueItem, defaultLabels = [], fallbackItems } = options;
 
   return async function main(config = {}) {
     // Extract configuration
@@ -70,6 +74,35 @@ function buildMissingIssueHandler(options) {
 
       // Create issue title
       const issueTitle = `${titlePrefix} ${workflowName}`;
+      /** @type {import("./report_markdown.cjs").ReportContext} */
+      const reportContext = { workflow_name: workflowName, workflow_source: workflowSource, workflow_source_url: workflowSourceURL || "#", run_url: runUrl };
+      /** @param {(item: any, index: number) => string[]} renderer */
+      const itemNodes = renderer =>
+        items.flatMap((item, index) => {
+          const slots = Object.fromEntries(
+            Object.entries(item).map(([field, value]) => {
+              if (!value) return [field, value];
+              const key = `missing_item_${index}_${field}`;
+              reportContext[key] = String(value);
+              return [field, `{${key}}`];
+            })
+          );
+          return parseReportMarkdown(renderer(slots, index).join("\n"), { context: reportContext, minimumHeadingLevel: 2, agentTainted: true });
+        });
+      /** @param {string} value @param {string} url @param {boolean} agentTainted @returns {import("./report_ast.cjs").ReportInline} */
+      const linkOrText = (value, url, agentTainted) => (url ? { type: "link", url, children: [{ type: "text", value, agentTainted }], agentTainted: false } : { type: "text", value, agentTainted });
+      /** @returns {import("./report_ast.cjs").ReportBlock} */
+      const workflowQuote = () => ({
+        type: "quote",
+        agentTainted: false,
+        children: [
+          {
+            type: "paragraph",
+            agentTainted: false,
+            children: [{ type: "text", value: "Workflow: ", agentTainted: false }, linkOrText(workflowName, workflowSourceURL, true)],
+          },
+        ],
+      });
 
       core.info(`Checking for existing issue with title: "${issueTitle}"`);
 
@@ -88,15 +121,30 @@ function buildMissingIssueHandler(options) {
           core.info(`Found existing issue #${existingIssue.number}: ${existingIssue.html_url}`);
 
           // Build comment body
-          const commentLines = buildCommentHeader(runUrl);
-          items.forEach((item, index) => {
-            commentLines.push(...renderCommentItem(item, index));
-          });
-          commentLines.push(`---`);
-          commentLines.push(`> Workflow: [${workflowName}](${workflowSourceURL})`);
-          commentLines.push(`> Run: ${runUrl}`);
-
-          const commentBody = sanitizeContent(commentLines.join("\n"));
+          const report = appendConfiguredReportFooter(
+            {
+              type: "report",
+              title: issueTitle,
+              children: [
+                ...parseReportMarkdown(buildCommentHeader("{run_url}").join("\n"), { context: reportContext, minimumHeadingLevel: 2, agentTainted: false }),
+                ...itemNodes(renderCommentItem),
+                { type: "separator", agentTainted: false },
+                workflowQuote(),
+                {
+                  type: "quote",
+                  agentTainted: false,
+                  children: [
+                    {
+                      type: "paragraph",
+                      children: [{ type: "text", value: "Run: ", agentTainted: false }, ...(runUrl ? [linkOrText(runUrl, runUrl, false)] : [])],
+                    },
+                  ],
+                },
+              ],
+            },
+            config.body_footer
+          );
+          const commentBody = renderSizedReport(report).body;
 
           await github.rest.issues.createComment({
             owner,
@@ -118,37 +166,33 @@ function buildMissingIssueHandler(options) {
           core.info("No existing issue found, creating a new one");
 
           // Build items list for template
-          const issueListLines = [];
-          items.forEach((item, index) => {
-            issueListLines.push(...renderIssueItem(item, index));
-          });
-
           // Create template context
           const templateContext = {
             workflow_name: workflowName,
             workflow_source_url: workflowSourceURL || "#",
             run_url: runUrl,
             workflow_source: workflowSource,
-            [templateListKey]: issueListLines.join("\n"),
+            [templateListKey]: itemNodes(renderIssueItem),
+            ...reportContext,
           };
 
           // Load and render the issue template
-          const issueBodyContent = renderTemplateFromFile(templatePath, templateContext);
+          const issueBodyContent = parseReportMarkdown(fs.readFileSync(templatePath, "utf8"), { context: templateContext, minimumHeadingLevel: 2, agentTainted: false });
+          const report = appendConfiguredReportFooter(
+            { type: "report", title: issueTitle, children: [...issueBodyContent, workflowQuote(), { type: "expiration", expiresAt: new Date(Date.now() + 24 * 7 * 60 * 60 * 1000).toISOString(), agentTainted: false }] },
+            config.body_footer
+          );
 
-          // Add expiration marker (1 week from now) in a quoted section using helper
-          const footer = generateFooterWithExpiration({
-            footerText: `> Workflow: [${workflowName}](${workflowSourceURL})`,
-            expiresHours: 24 * 7, // 7 days
-          });
-          const issueBody = sanitizeContent(`${issueBodyContent}\n\n${footer}`);
-
-          const newIssue = await github.rest.issues.create({
-            owner,
-            repo,
-            title: issueTitle,
-            body: issueBody,
-            labels: envLabels,
-          });
+          const newIssue = await createReportIssue(
+            github,
+            {
+              owner,
+              repo,
+              title: issueTitle,
+              labels: envLabels,
+            },
+            report
+          );
 
           core.info(`✓ Created new issue #${newIssue.data.number}: ${newIssue.data.html_url}`);
 
@@ -195,8 +239,17 @@ function buildMissingIssueHandler(options) {
 
       processedCount++;
 
+      // Resolve fields from message, falling back to environment variables for fields
+      // that the agent may not know (e.g. workflow_name is not part of the agent's context).
+      const workflowName = message.workflow_name || process.env.GH_AW_WORKFLOW_NAME || "";
+      const workflowSource = message.workflow_source || "";
+      const workflowSourceURL = message.workflow_source_url || process.env.GH_AW_WORKFLOW_SOURCE_URL || "";
+      const runUrl =
+        message.run_url || (process.env.GITHUB_SERVER_URL && process.env.GITHUB_REPOSITORY && process.env.GITHUB_RUN_ID ? `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}` : "");
+      let items = message[itemsField];
+
       // Validate required fields
-      if (!message.workflow_name) {
+      if (!workflowName) {
         core.warning(`Missing required field: workflow_name`);
         return {
           success: false,
@@ -204,20 +257,17 @@ function buildMissingIssueHandler(options) {
         };
       }
 
-      if (!message[itemsField] || !Array.isArray(message[itemsField]) || message[itemsField].length === 0) {
+      if ((!items || !Array.isArray(items) || items.length === 0) && typeof fallbackItems === "function") {
+        items = fallbackItems(message);
+      }
+
+      if (!items || !Array.isArray(items) || items.length === 0) {
         core.warning(`Missing or empty ${itemsField} array`);
         return {
           success: false,
           error: `Missing or empty ${itemsField} array`,
         };
       }
-
-      // Extract fields from message
-      const workflowName = message.workflow_name;
-      const workflowSource = message.workflow_source || "";
-      const workflowSourceURL = message.workflow_source_url || "";
-      const runUrl = message.run_url || "";
-      const items = message[itemsField];
 
       // Create or update the issue
       const result = await createOrUpdateIssue(workflowName, workflowSource, workflowSourceURL, runUrl, items);

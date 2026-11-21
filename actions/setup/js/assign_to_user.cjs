@@ -8,11 +8,12 @@
 const { processItems } = require("./safe_output_processor.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
-const { resolveIssueNumber, extractAssignees, checkRequiredFilter } = require("./safe_output_helpers.cjs");
+const { resolveTarget, extractAssignees, checkRequiredFilter } = require("./safe_output_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
 const { parseBoolTemplatable } = require("./templatable.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { createCountGatedHandler } = require("./handler_scaffold.cjs");
+const { normalizeIssueIntentMetadata } = require("./issue_intents.cjs");
 
 /** @type {string} Safe output type handled by this module */
 const HANDLER_TYPE = "assign_to_user";
@@ -28,7 +29,9 @@ const main = createCountGatedHandler({
     // Extract configuration
     const allowedAssignees = config.allowed ?? [];
     const blockedAssignees = config.blocked ?? [];
+    const targetConfig = config.target || "triggering";
     const unassignFirst = parseBoolTemplatable(config.unassign_first, false);
+    const issueIntentEnabled = config.issue_intent !== false;
     const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
     const githubClient = await createAuthenticatedGitHubClient(config);
     const requiredLabels = Array.isArray(config.required_labels) ? config.required_labels : [];
@@ -36,7 +39,7 @@ const main = createCountGatedHandler({
     if (requiredLabels.length > 0) core.info(`Required labels (all): ${requiredLabels.join(", ")}`);
     if (requiredTitlePrefix) core.info(`Required title prefix: ${requiredTitlePrefix}`);
 
-    core.info(`Assign to user configuration: max=${maxCount}, unassign_first=${unassignFirst}`);
+    core.info(`Assign to user configuration: max=${maxCount}, unassign_first=${unassignFirst}, issue_intent=${issueIntentEnabled}`);
     if (allowedAssignees.length > 0) {
       core.info(`Allowed assignees: ${allowedAssignees.join(", ")}`);
     }
@@ -68,17 +71,23 @@ const main = createCountGatedHandler({
       core.info(`Target repository: ${itemRepo}`);
 
       const assignItem = message;
+      const intentMetadata = issueIntentEnabled ? normalizeIssueIntentMetadata(assignItem) : {};
 
-      // Determine issue number using shared helper
-      const issueResult = resolveIssueNumber(assignItem);
-      if (!issueResult.success) {
-        core.warning(`Skipping assign_to_user: ${issueResult.error}`);
+      const targetResult = resolveTarget({
+        targetConfig,
+        item: assignItem,
+        context,
+        itemType: HANDLER_TYPE,
+        supportsIssue: true,
+      });
+      if (!targetResult.success) {
+        core.warning(`Skipping assign_to_user: ${targetResult.error}`);
         return {
           success: false,
-          error: issueResult.error,
+          error: targetResult.error,
         };
       }
-      const issueNumber = issueResult.issueNumber;
+      const issueNumber = targetResult.number;
 
       const filterResult = await checkRequiredFilter(githubClient, repoParts, issueNumber, requiredLabels, requiredTitlePrefix, HANDLER_TYPE);
       if (filterResult) return filterResult;
@@ -147,12 +156,16 @@ const main = createCountGatedHandler({
         }
 
         // Add assignees to the issue
-        await githubClient.rest.issues.addAssignees({
+        const addAssigneesParams = {
           owner: repoParts.owner,
           repo: repoParts.repo,
           issue_number: issueNumber,
           assignees: uniqueAssignees,
-        });
+        };
+        if (issueIntentEnabled && Object.keys(intentMetadata).length > 0) {
+          Object.assign(addAssigneesParams, intentMetadata);
+        }
+        await githubClient.rest.issues.addAssignees(addAssigneesParams);
 
         core.info(`Successfully assigned ${uniqueAssignees.length} user(s) to issue #${issueNumber} in ${itemRepo}`);
 

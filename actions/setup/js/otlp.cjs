@@ -18,7 +18,8 @@
  *
  * Usage (in a `steps:` github-script step inside a shared import):
  *
- *   const otlp = require('/tmp/gh-aw/actions/otlp.cjs');
+ *   const path = require('path');
+ *   const otlp = require(path.join(process.env.RUNNER_TEMP, 'gh-aw', 'actions', 'otlp.cjs'));
  *   const start = Date.now();
  *   // ... do work ...
  *   await otlp.logSpan('my-tool', { 'my-tool.items_processed': 42, 'my-tool.result': 'ok' }, { startMs: start });
@@ -45,6 +46,7 @@ require(path.join(__dirname, "shim.cjs"));
  * @property {string}  [endpoint]     - Override the OTLP endpoint.  Defaults to `OTEL_EXPORTER_OTLP_ENDPOINT`.
  * @property {boolean} [isError]      - When `true`, the span status is set to ERROR (code 2).
  * @property {string}  [errorMessage] - Human-readable status message included when `isError` is `true`.
+ * @property {() => void} [onError] - Report export failures without exposing exporter diagnostics.
  */
 
 /**
@@ -85,6 +87,7 @@ async function logSpan(toolName, attributes = {}, options = {}) {
       SPAN_KIND_CLIENT,
       buildGitHubActionsResourceAttributes,
       readJSONIfExists,
+      isGenAiV1,
     } = require(path.join(__dirname, "send_otlp_span.cjs"));
 
     const now = Date.now();
@@ -130,6 +133,7 @@ async function logSpan(toolName, attributes = {}, options = {}) {
       awfVersion,
       awmgVersion,
       staged,
+      workflowName: process.env.GITHUB_WORKFLOW || "",
     });
 
     const payload = buildOTLPPayload({
@@ -144,7 +148,7 @@ async function logSpan(toolName, attributes = {}, options = {}) {
       kind: SPAN_KIND_CLIENT,
       attributes: spanAttrs,
       resourceAttributes,
-      statusCode: options.isError ? 2 : 1,
+      statusCode: options.isError ? 2 : isGenAiV1() ? 0 : 1,
       ...(options.isError && options.errorMessage ? { statusMessage: options.errorMessage } : {}),
     });
 
@@ -165,8 +169,30 @@ async function logSpan(toolName, attributes = {}, options = {}) {
     }
   } catch (err) {
     // Export failures must never break the workflow.
-    console.warn(`[otlp] ${toolName}: failed to emit span: ${getErrorMessage(err)}`);
+    if (options.onError) options.onError();
+    else console.warn(`[otlp] ${toolName}: failed to emit span: ${getErrorMessage(err)}`);
   }
 }
 
-module.exports = { logSpan };
+/**
+ * Record a custom OTLP metric. Loaded lazily (like send_otlp_span.cjs) so
+ * isolated bundles that ship otlp.cjs do not statically depend on telemetry export.
+ *
+ * @param {string} name
+ * @param {number} value
+ * @param {{type?: "counter" | "gauge" | "histogram", unit?: string, description?: string, attributes?: Record<string, string | number | boolean>, buckets?: number[]}} [options]
+ * @returns {Promise<void>}
+ */
+async function logMetric(name, value, options = {}) {
+  if (process.env.GH_AW_OTEL_METRICS !== "true") return;
+  let emitMetric;
+  try {
+    ({ logMetric: emitMetric } = require(path.join(__dirname, "otlp_metrics.cjs")));
+  } catch (err) {
+    console.warn(`[otlp] ${name}: failed to load metrics exporter: ${getErrorMessage(err)}`);
+    return;
+  }
+  return emitMetric(name, value, options);
+}
+
+module.exports = { logSpan, logMetric };

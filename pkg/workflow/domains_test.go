@@ -3,12 +3,14 @@
 package workflow
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestGetDomainEcosystem(t *testing.T) {
@@ -100,11 +102,16 @@ func TestGetDomainEcosystem(t *testing.T) {
 			domain:   "dl.google.com",
 			expected: "java",
 		},
-		// Defaults ecosystem takes priority over chrome for packages.cloud.google.com
+		// Linux package repositories take priority over chrome for packages.cloud.google.com
 		{
-			name:     "defaults ecosystem - packages.cloud.google.com (not chrome)",
+			name:     "linux-distros ecosystem - packages.cloud.google.com (not chrome)",
 			domain:   "packages.cloud.google.com",
-			expected: "defaults",
+			expected: "linux-distros",
+		},
+		{
+			name:     "chrome ecosystem - www.googleapis.com (not defaults)",
+			domain:   "www.googleapis.com",
+			expected: "chrome",
 		},
 
 		// Deno ecosystem
@@ -344,16 +351,10 @@ func TestMatchesDomain(t *testing.T) {
 func TestCopilotDefaultDomains(t *testing.T) {
 	// Verify that expected Copilot domains are present
 	expectedDomains := []string{
-		"api.business.githubcopilot.com",
-		"api.enterprise.githubcopilot.com",
 		"api.github.com",
-		"api.githubcopilot.com",
-		"api.individual.githubcopilot.com",
 		"github.com",
 		"host.docker.internal",
 		"raw.githubusercontent.com",
-		"registry.npmjs.org",
-		"telemetry.enterprise.githubcopilot.com",
 	}
 
 	// Create a map for O(1) lookups
@@ -368,14 +369,53 @@ func TestCopilotDefaultDomains(t *testing.T) {
 		}
 	}
 
+	// Package registries must never be part of the engine defaults: they would be
+	// reachable even when the workflow declares network: {} (see security hardening
+	// for engine default domains).
+	assert.NotContains(t, CopilotDefaultDomains, "registry.npmjs.org",
+		"CopilotDefaultDomains must not include the npm registry; it requires explicit node opt-in")
+
 	// Verify the count matches (no extra domains)
 	if len(CopilotDefaultDomains) != len(expectedDomains) {
 		t.Errorf("CopilotDefaultDomains has %d domains, expected %d", len(CopilotDefaultDomains), len(expectedDomains))
 	}
 }
 
+// TestCopilotVendorDomainsRequireOptIn verifies that plan-specific Copilot API hosts and
+// Copilot telemetry are not unconditional engine defaults: agents route inference through
+// the AWF api-proxy, so these vendor hosts must be requested explicitly via the
+// "copilot-vendor" ecosystem.
+func TestCopilotVendorDomainsRequireOptIn(t *testing.T) {
+	vendorDomains := []string{
+		"api.business.githubcopilot.com",
+		"api.enterprise.githubcopilot.com",
+		"api.githubcopilot.com",
+		"api.individual.githubcopilot.com",
+		"telemetry.enterprise.githubcopilot.com",
+	}
+
+	optIn := getEcosystemDomains("copilot-vendor")
+	require.NotEmpty(t, optIn, "copilot-vendor ecosystem must be defined")
+
+	for _, domain := range vendorDomains {
+		assert.NotContains(t, CopilotDefaultDomains, domain,
+			"CopilotDefaultDomains must not include vendor domain %q; it requires explicit copilot-vendor opt-in", domain)
+		assert.NotContains(t, PiDefaultDomains, domain,
+			"PiDefaultDomains must not include vendor domain %q; it requires explicit copilot-vendor opt-in", domain)
+		assert.Contains(t, optIn, domain,
+			"copilot-vendor ecosystem must include %q", domain)
+	}
+
+	// The opt-in set must resolve through the regular network allow-list expansion.
+	expanded := GetAllowedDomains(&NetworkPermissions{Allowed: []string{"copilot-vendor"}})
+	for _, domain := range vendorDomains {
+		assert.Contains(t, expanded, domain,
+			"network: { allowed: [copilot-vendor] } must expand to %q", domain)
+	}
+}
+
 func TestThreatDetectionDomains(t *testing.T) {
-	detectionDomains := getEcosystemDomains("threat-detection")
+	detectionDomains := engineDefaultDomainSets["threat-detection"]
 
 	// Detection domains must include every required Copilot API domain
 	requiredDomains := []string{
@@ -386,28 +426,68 @@ func TestThreatDetectionDomains(t *testing.T) {
 		"api.individual.githubcopilot.com",
 		"github.com",
 		"host.docker.internal",
-		"registry.npmjs.org",
-		"telemetry.enterprise.githubcopilot.com",
 	}
+
 	detectionMap := make(map[string]bool)
 	for _, d := range detectionDomains {
 		detectionMap[d] = true
 	}
 	for _, required := range requiredDomains {
-		assert.True(t, detectionMap[required], "Required domain %q not found in threat-detection ecosystem", required)
+		assert.True(t, detectionMap[required], "Required domain %q not found in threat-detection domain set", required)
 	}
 
-	// Detection domains must NOT include the domains excluded for supply-chain reduction
+	// Detection domains must NOT include unnecessary downloads or vendor telemetry
 	excludedDomains := []string{
 		"raw.githubusercontent.com",
+		"registry.npmjs.org",
+		"telemetry.enterprise.githubcopilot.com",
 	}
 	for _, excluded := range excludedDomains {
-		assert.False(t, detectionMap[excluded], "Domain %q should not be in threat-detection ecosystem (excluded to reduce supply chain surface)", excluded)
+		assert.False(t, detectionMap[excluded], "Domain %q should not be in threat-detection domain set", excluded)
 	}
 
 	// Verify exact count — no silent additions
 	assert.Len(t, detectionDomains, len(requiredDomains),
-		"threat-detection ecosystem should have exactly %d entries", len(requiredDomains))
+		"threat-detection domain set should have exactly %d entries", len(requiredDomains))
+}
+
+func TestThreatDetectionNetworkAllowedCompatibilityAlias(t *testing.T) {
+	engineDefaults := engineDefaultDomainSets["threat-detection"]
+	expanded := GetAllowedDomains(&NetworkPermissions{Allowed: []string{"threat-detection"}})
+
+	assert.Equal(t, engineDefaults, expanded,
+		"legacy network.allowed threat-detection alias must expand to the Copilot detection domain set")
+	assert.NotContains(t, expanded, "telemetry.enterprise.githubcopilot.com",
+		"legacy threat-detection alias must not allow vendor telemetry")
+}
+
+func TestEngineDomainSetsRequireExplicitNetworkAllowedOptIn(t *testing.T) {
+	result := GetAllowedDomainsForEngine(constants.CopilotEngine, &NetworkPermissions{Allowed: []string{"github"}}, nil, nil)
+
+	assert.NotContains(t, result, "api.githubcopilot.com",
+		"selecting the Copilot engine must not automatically add the copilot domain set")
+
+	result = GetAllowedDomainsForEngine(constants.CopilotEngine, &NetworkPermissions{Allowed: []string{"copilot", "github"}}, nil, nil)
+	assert.NotContains(t, result, "api.githubcopilot.com",
+		"the copilot transport set must not grant direct model API egress")
+	result = GetAllowedDomainsForEngine(constants.CopilotEngine, &NetworkPermissions{Allowed: []string{"copilot-vendor"}}, nil, nil)
+	assert.Contains(t, result, "api.githubcopilot.com",
+		"the copilot-vendor set should grant direct model API egress when explicitly referenced")
+	assert.True(t, isKnownEcosystemIdentifier("copilot"),
+		"engine domain sets should validate like other domain set identifiers")
+}
+
+func TestEmbeddedDomainSets(t *testing.T) {
+	sets := getLoadedDomainSets()
+
+	assert.Contains(t, sets.Ecosystems, "defaults")
+	assert.Contains(t, sets.Ecosystems, "threat-detection")
+	assert.Contains(t, sets.Ecosystems, "gemini-vendor")
+	assert.Contains(t, sets.EngineDefaults, "copilot")
+	assert.NotContains(t, sets.EngineDefaults["pi"], "api.githubcopilot.com")
+	assert.Equal(t, []string{"github.com", "localhost"}, sets.SanitizationDefaults)
+	assert.Equal(t, sets.EngineDefaults["threat-detection"], sets.Ecosystems["threat-detection"],
+		"legacy network.allowed threat-detection alias must stay in sync with Copilot detection defaults")
 }
 
 func TestGetThreatDetectionAllowedDomains(t *testing.T) {
@@ -418,11 +498,11 @@ func TestGetThreatDetectionAllowedDomains(t *testing.T) {
 	// Must include essential Copilot API domain
 	assert.Contains(t, result, "api.githubcopilot.com", "Detection domains must include Copilot API domain")
 
-	// Must include npm registry for read-only package validation
-	assert.Contains(t, result, "registry.npmjs.org", "Detection domains must include npm registry for read-only package validation")
+	assert.NotContains(t, result, "registry.npmjs.org", "Detection domains must not include npm registry without opt-in")
 
 	// Must NOT include raw GitHub downloads
 	assert.NotContains(t, result, "raw.githubusercontent.com", "Detection domains must not include raw.githubusercontent.com")
+	assert.NotContains(t, result, "telemetry.enterprise.githubcopilot.com", "Detection domains must not include vendor telemetry by default")
 
 	// Must NOT include ecosystem-expansion domains (no tools/runtimes passed for detection)
 	assert.NotContains(t, result, "pypi.org", "Detection domains must not include Python ecosystem domains")
@@ -434,11 +514,8 @@ func TestCodexDefaultDomains(t *testing.T) {
 	expectedDomains := []string{
 		"172.30.0.1", // AWF gateway IP - Codex resolves host.docker.internal to this IP
 		"api.github.com",
-		"api.openai.com",
-		"chatgpt.com", // Codex CLI connects to chatgpt.com (and subdomains e.g. ab.chatgpt.com) for auth/telemetry
 		"github.com",
 		"host.docker.internal",
-		"openai.com",
 	}
 
 	// Create a map for O(1) lookups
@@ -459,33 +536,111 @@ func TestCodexDefaultDomains(t *testing.T) {
 	}
 }
 
+func TestCodexVendorDomainsRequireOptIn(t *testing.T) {
+	for _, optIn := range []bool{false, true} {
+		t.Run(fmt.Sprintf("opt-in=%t", optIn), func(t *testing.T) {
+			allowed := []string{"codex"}
+			if optIn {
+				allowed = append(allowed, "codex-vendor")
+			}
+			domains := domainSet(t, GetAllowedDomainsForEngine(constants.CodexEngine,
+				&NetworkPermissions{Allowed: allowed}, nil, nil))
+			for _, host := range []string{"api.openai.com", "auth.openai.com", "ab.chatgpt.com"} {
+				reachable := false
+				for rule := range domains {
+					reachable = reachable || awfDomainAllowsHost(rule, host)
+				}
+				assert.Equal(t, optIn, reachable, "optional vendor host %q", host)
+			}
+			assert.NotContains(t, domains, "openai.com")
+			assert.NotContains(t, domains, "chatgpt.com")
+		})
+	}
+}
+
+func TestGeminiDomainSetRequiresPackageOptIn(t *testing.T) {
+	for _, ecosystem := range []string{"node", "go", "dart", "java"} {
+		t.Run(ecosystem, func(t *testing.T) {
+			for _, optIn := range []bool{false, true} {
+				allowed := []string{"gemini"}
+				if optIn {
+					allowed = append(allowed, ecosystem)
+				}
+				domains := domainSet(t, GetAllowedDomainsForEngine(constants.GeminiEngine,
+					&NetworkPermissions{Allowed: allowed}, nil, nil))
+				assert.NotContains(t, domains, "generativelanguage.googleapis.com")
+				host := "storage.googleapis.com"
+				if ecosystem == "java" {
+					host = "maven-central.storage-download.googleapis.com"
+				}
+				reachable := false
+				for rule := range domains {
+					reachable = reachable || awfDomainAllowsHost(rule, host)
+				}
+				assert.Equal(t, optIn, reachable, "ecosystem %q host %q", ecosystem, host)
+			}
+		})
+	}
+}
+
+func TestGeminiVendorDomainRequiresOptIn(t *testing.T) {
+	baseline := GetAllowedDomainsForEngine(constants.GeminiEngine,
+		&NetworkPermissions{Allowed: []string{"gemini"}}, nil, nil)
+	assert.NotContains(t, baseline, "generativelanguage.googleapis.com")
+
+	direct := GetAllowedDomainsForEngine(constants.GeminiEngine,
+		&NetworkPermissions{Allowed: []string{"gemini-vendor"}}, nil, nil)
+	assert.Contains(t, direct, "generativelanguage.googleapis.com")
+}
+
 func TestClaudeDefaultDomains(t *testing.T) {
-	// Verify that critical Claude domains are present
-	criticalDomains := []string{
-		"anthropic.com",
-		"api.anthropic.com",
-		"statsig.anthropic.com",
+	expectedDomains := []string{
 		"api.github.com",
 		"github.com",
 		"host.docker.internal",
-		"registry.npmjs.org",
+		"raw.githubusercontent.com",
 	}
 
-	// Create a map for O(1) lookups
-	domainMap := make(map[string]bool)
-	for _, domain := range ClaudeDefaultDomains {
-		domainMap[domain] = true
+	assert.ElementsMatch(t, expectedDomains, ClaudeDefaultDomains)
+	defaults, err := GetDefaultDomainsForEngine(constants.ClaudeEngine, "")
+	require.NoError(t, err)
+	assert.ElementsMatch(t, expectedDomains, defaults)
+	assert.ElementsMatch(t, expectedDomains, getEcosystemDomains("claude"))
+}
+
+func TestClaudeDomainSetGatesOptionalEcosystems(t *testing.T) {
+	baseline := domainSet(t, GetAllowedDomainsForEngine(constants.ClaudeEngine,
+		&NetworkPermissions{Allowed: []string{"claude"}}, nil, nil))
+
+	for _, ecosystem := range []string{"defaults", "github", "containers", "playwright"} {
+		t.Run(ecosystem, func(t *testing.T) {
+			optionalDomains := getEcosystemDomains(ecosystem)
+			require.NotEmpty(t, optionalDomains)
+			optedIn := domainSet(t, GetAllowedDomainsForEngine(constants.ClaudeEngine,
+				&NetworkPermissions{Allowed: []string{"claude", ecosystem}}, nil, nil))
+			for _, domain := range optionalDomains {
+				if slices.Contains(ClaudeDefaultDomains, domain) {
+					continue
+				}
+				assert.NotContains(t, baseline, domain)
+				assert.Contains(t, optedIn, domain)
+			}
+		})
 	}
 
-	for _, expected := range criticalDomains {
-		if !domainMap[expected] {
-			t.Errorf("Expected domain %q not found in ClaudeDefaultDomains", expected)
-		}
+	for _, domain := range []string{"sentry.io", "statsig.anthropic.com", "anthropic.com", "*.anthropic.com"} {
+		t.Run(domain, func(t *testing.T) {
+			assert.NotContains(t, baseline, domain)
+			optedIn := domainSet(t, GetAllowedDomainsForEngine(constants.ClaudeEngine,
+				&NetworkPermissions{Allowed: []string{"claude", domain}}, nil, nil))
+			assert.Contains(t, optedIn, domain)
+		})
 	}
 
-	// Verify minimum count (Claude has many more domains than the critical ones)
-	if len(ClaudeDefaultDomains) < len(criticalDomains) {
-		t.Errorf("ClaudeDefaultDomains has %d domains, expected at least %d", len(ClaudeDefaultDomains), len(criticalDomains))
+	playwright := domainSet(t, GetAllowedDomainsForEngine(constants.ClaudeEngine,
+		&NetworkPermissions{Allowed: []string{"claude"}}, map[string]any{"playwright": map[string]any{}}, nil))
+	for _, domain := range getEcosystemDomains("playwright") {
+		assert.Contains(t, playwright, domain)
 	}
 }
 
@@ -822,7 +977,7 @@ func TestGetDomainsFromRuntimes(t *testing.T) {
 		{
 			name: "node runtime adds node ecosystem domains",
 			runtimes: map[string]any{
-				"node": map[string]any{"version": "20"},
+				"node": map[string]any{"version": "24"},
 			},
 			expectContains: []string{"registry.npmjs.org", "nodejs.org", "yarnpkg.com"},
 		},
@@ -837,7 +992,7 @@ func TestGetDomainsFromRuntimes(t *testing.T) {
 			name: "multiple runtimes add all ecosystem domains",
 			runtimes: map[string]any{
 				"go":   map[string]any{"version": "1.22"},
-				"node": map[string]any{"version": "20"},
+				"node": map[string]any{"version": "24"},
 			},
 			expectContains: []string{"proxy.golang.org", "registry.npmjs.org"},
 		},
@@ -929,11 +1084,11 @@ func TestGetDomainsFromRuntimes(t *testing.T) {
 	}
 }
 
-// TestGetCopilotAllowedDomainsWithToolsAndRuntimes tests the full integration of runtimes with Copilot domains
+// TestGetCopilotAllowedDomainsWithToolsAndRuntimes tests explicit Copilot domain-set opt-in with runtimes
 func TestGetCopilotAllowedDomainsWithToolsAndRuntimes(t *testing.T) {
 	t.Run("includes runtime ecosystem domains", func(t *testing.T) {
 		network := &NetworkPermissions{
-			Allowed: []string{"defaults"},
+			Allowed: []string{"defaults", "copilot"},
 		}
 		runtimes := map[string]any{
 			"go": map[string]any{"version": "1.22"},
@@ -941,9 +1096,9 @@ func TestGetCopilotAllowedDomainsWithToolsAndRuntimes(t *testing.T) {
 
 		result := GetAllowedDomainsForEngine(constants.CopilotEngine, network, nil, runtimes)
 
-		// Should contain Copilot defaults
-		if !strings.Contains(result, "api.githubcopilot.com") {
-			t.Error("Expected api.githubcopilot.com in result")
+		// The transport set must not grant direct Copilot API egress.
+		if strings.Contains(result, "api.githubcopilot.com") {
+			t.Error("Did not expect api.githubcopilot.com from the copilot transport set")
 		}
 		// Should contain Go ecosystem domains
 		if !strings.Contains(result, "proxy.golang.org") {
@@ -953,7 +1108,7 @@ func TestGetCopilotAllowedDomainsWithToolsAndRuntimes(t *testing.T) {
 
 	t.Run("combines network permissions, tools, and runtimes", func(t *testing.T) {
 		network := &NetworkPermissions{
-			Allowed: []string{"custom.example.com"},
+			Allowed: []string{"copilot", "custom.example.com"},
 		}
 		tools := map[string]any{
 			"tavily": map[string]any{
@@ -962,14 +1117,14 @@ func TestGetCopilotAllowedDomainsWithToolsAndRuntimes(t *testing.T) {
 			},
 		}
 		runtimes := map[string]any{
-			"node": map[string]any{"version": "20"},
+			"node": map[string]any{"version": "24"},
 		}
 
 		result := GetAllowedDomainsForEngine(constants.CopilotEngine, network, tools, runtimes)
 
-		// Should contain Copilot defaults
-		if !strings.Contains(result, "api.githubcopilot.com") {
-			t.Error("Expected api.githubcopilot.com in result")
+		// The transport set must not grant direct Copilot API egress.
+		if strings.Contains(result, "api.githubcopilot.com") {
+			t.Error("Did not expect api.githubcopilot.com from the copilot transport set")
 		}
 		// Should contain network allowed domain
 		if !strings.Contains(result, "custom.example.com") {
@@ -985,29 +1140,31 @@ func TestGetCopilotAllowedDomainsWithToolsAndRuntimes(t *testing.T) {
 		}
 	})
 
-	t.Run("nil runtimes works correctly", func(t *testing.T) {
+	t.Run("nil network does not include engine domain set", func(t *testing.T) {
 		result := GetAllowedDomainsForEngine(constants.CopilotEngine, nil, nil, nil)
 
-		// Should still contain Copilot defaults
-		if !strings.Contains(result, "api.githubcopilot.com") {
-			t.Error("Expected api.githubcopilot.com in result")
+		if strings.Contains(result, "api.githubcopilot.com") {
+			t.Error("Did not expect api.githubcopilot.com without explicit copilot domain-set opt-in")
 		}
 	})
 }
 
-// TestGetClaudeAllowedDomainsWithToolsAndRuntimes tests the full integration of runtimes with Claude domains
+// TestGetClaudeAllowedDomainsWithToolsAndRuntimes tests explicit Claude domain-set opt-in with runtimes
 func TestGetClaudeAllowedDomainsWithToolsAndRuntimes(t *testing.T) {
 	t.Run("includes runtime ecosystem domains", func(t *testing.T) {
+		network := &NetworkPermissions{
+			Allowed: []string{"claude"},
+		}
 		runtimes := map[string]any{
 			"python": map[string]any{"version": "3.11"},
 		}
 
-		result := GetAllowedDomainsForEngine(constants.ClaudeEngine, nil, nil, runtimes)
+		result := GetAllowedDomainsForEngine(constants.ClaudeEngine, network, nil, runtimes)
 
-		// Should contain Claude defaults
-		if !strings.Contains(result, "api.anthropic.com") {
-			t.Error("Expected api.anthropic.com in result")
-		}
+		// Should contain explicitly requested Claude domain set
+		domains := strings.Split(result, ",")
+		assert.Subset(t, domains, ClaudeDefaultDomains)
+		assert.NotContains(t, domains, "api.anthropic.com")
 		// Should contain Python ecosystem domains
 		if !strings.Contains(result, "pypi.org") {
 			t.Error("Expected pypi.org from python runtime in result")
@@ -1015,18 +1172,21 @@ func TestGetClaudeAllowedDomainsWithToolsAndRuntimes(t *testing.T) {
 	})
 }
 
-// TestGetCodexAllowedDomainsWithToolsAndRuntimes tests the full integration of runtimes with Codex domains
+// TestGetCodexAllowedDomainsWithToolsAndRuntimes tests explicit Codex domain-set opt-in with runtimes
 func TestGetCodexAllowedDomainsWithToolsAndRuntimes(t *testing.T) {
 	t.Run("includes runtime ecosystem domains", func(t *testing.T) {
+		network := &NetworkPermissions{
+			Allowed: []string{"codex"},
+		}
 		runtimes := map[string]any{
 			"java": map[string]any{"version": "21"},
 		}
 
-		result := GetAllowedDomainsForEngine(constants.CodexEngine, nil, nil, runtimes)
+		result := GetAllowedDomainsForEngine(constants.CodexEngine, network, nil, runtimes)
 
-		// Should contain Codex defaults
-		if !strings.Contains(result, "api.openai.com") {
-			t.Error("Expected api.openai.com in result")
+		// The transport set must not grant direct OpenAI API egress.
+		if strings.Contains(result, "api.openai.com") {
+			t.Error("Did not expect api.openai.com from the codex transport set")
 		}
 		// Should contain Java ecosystem domains
 		if !strings.Contains(result, "repo.maven.apache.org") {
@@ -1090,11 +1250,11 @@ func TestExpandAllowedDomains(t *testing.T) {
 func TestComputeExpandedAllowedDomainsForSanitization(t *testing.T) {
 	compiler := NewCompiler()
 
-	t.Run("unions with engine base set", func(t *testing.T) {
+	t.Run("unions with explicit engine domain set", func(t *testing.T) {
 		data := &WorkflowData{
 			EngineConfig: &EngineConfig{ID: "copilot"},
 			NetworkPermissions: &NetworkPermissions{
-				Allowed: []string{"example.com"},
+				Allowed: []string{"copilot", "example.com"},
 			},
 			SafeOutputs: &SafeOutputsConfig{
 				AllowedDomains: []string{"extra-domain.com"},
@@ -1111,7 +1271,7 @@ func TestComputeExpandedAllowedDomainsForSanitization(t *testing.T) {
 			t.Errorf("Expected network domain example.com in result, got: %s", result)
 		}
 		if !strings.Contains(result, "api.github.com") {
-			t.Error("Expected Copilot default api.github.com in result")
+			t.Error("Expected explicitly requested Copilot domain set api.github.com in result")
 		}
 	})
 
@@ -1313,4 +1473,44 @@ func TestMergeAPITargetDomains(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestExtractProviderFromModel(t *testing.T) {
+	t.Run("standard provider/model format", func(t *testing.T) {
+		provider, err := extractProviderFromModel("anthropic/claude-sonnet-4-20250514")
+		require.NoError(t, err)
+		assert.Equal(t, "anthropic", provider)
+
+		provider, err = extractProviderFromModel("openai/gpt-4.1")
+		require.NoError(t, err)
+		assert.Equal(t, "openai", provider)
+
+		provider, err = extractProviderFromModel("google/gemini-2.5-pro")
+		require.NoError(t, err)
+		assert.Equal(t, "google", provider)
+	})
+
+	t.Run("empty model returns empty provider", func(t *testing.T) {
+		provider, err := extractProviderFromModel("")
+		require.NoError(t, err)
+		assert.Empty(t, provider)
+	})
+
+	t.Run("no slash returns empty provider", func(t *testing.T) {
+		provider, err := extractProviderFromModel("claude-sonnet-4-20250514")
+		require.NoError(t, err)
+		assert.Empty(t, provider)
+	})
+
+	t.Run("case insensitive provider", func(t *testing.T) {
+		provider, err := extractProviderFromModel("OpenAI/gpt-4.1")
+		require.NoError(t, err)
+		assert.Equal(t, "openai", provider)
+	})
+
+	t.Run("leading slash returns error", func(t *testing.T) {
+		_, err := extractProviderFromModel("/gpt-4.1")
+		require.Error(t, err, "Leading slash (empty provider prefix) must return an error")
+		require.ErrorContains(t, err, "provider prefix is empty")
+	})
 }

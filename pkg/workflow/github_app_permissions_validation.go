@@ -8,9 +8,10 @@ import (
 	"strings"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/logger"
 )
 
-var githubAppPermissionsLog = newValidationLogger("github_app_permissions")
+var githubAppPermissionsLog = logger.New("workflow:github_app_permissions_validation")
 
 // validateGitHubAppOnlyPermissions validates that when GitHub App-only permissions
 // are specified in the workflow, a GitHub App is configured somewhere in the workflow,
@@ -174,6 +175,31 @@ func validateGitHubMCPAppPermissionsNoWrite(workflowData *WorkflowData) error {
 	return errors.New(strings.Join(lines, "\n"))
 }
 
+func validateMentionGitHubAppPermissionsReadOnly(workflowData *WorkflowData) error {
+	if workflowData == nil || workflowData.SafeOutputs == nil ||
+		workflowData.SafeOutputs.Mentions == nil || workflowData.SafeOutputs.Mentions.GitHubApp == nil {
+		return nil
+	}
+
+	var invalidScopes []string
+	for scope, level := range workflowData.SafeOutputs.Mentions.GitHubApp.Permissions {
+		normalized := strings.ToLower(strings.TrimSpace(level))
+		if normalized != string(PermissionRead) && normalized != string(PermissionNone) {
+			invalidScopes = append(invalidScopes, scope+" (level: "+level+")")
+		}
+	}
+	if len(invalidScopes) == 0 {
+		return nil
+	}
+	sort.Strings(invalidScopes)
+	return NewValidationError(
+		"safe-outputs.mentions.github-app.permissions",
+		strings.Join(invalidScopes, ", "),
+		"mention-resolution GitHub App permissions must be read-only; each level must be \"read\" or \"none\"",
+		"Change each permission level to \"read\" or \"none\". Write permissions are not allowed for mention resolution.",
+	)
+}
+
 // warnGitHubAppPermissionsUnsupportedContexts emits a warning when
 // github-app.permissions is set in contexts that do not support it.
 // The permissions field takes effect for tools.github.github-app and
@@ -201,6 +227,9 @@ func warnGitHubAppPermissionsUnsupportedContexts(workflowData *WorkflowData) {
 }
 
 func hasGitHubAppConfigured(workflowData *WorkflowData) bool {
+	if usesTokenBrokerGitHubTool(workflowData) || usesTokenBrokerSafeOutputs(workflowData) {
+		return true
+	}
 	// Check tools.github.github-app
 	if workflowData.ParsedTools != nil &&
 		workflowData.ParsedTools.GitHub != nil &&

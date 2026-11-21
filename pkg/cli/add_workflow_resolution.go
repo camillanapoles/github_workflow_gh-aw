@@ -4,18 +4,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
-	"github.com/github/gh-aw/pkg/parser"
 	"github.com/github/gh-aw/pkg/sliceutil"
+	"github.com/github/gh-aw/pkg/workflow"
 )
 
 var resolutionLog = logger.New("cli:add_workflow_resolution")
-var fetchWorkflowFromSourceWithContextFn = FetchWorkflowFromSourceWithContext
+
+// errNotHandled is a sentinel used by package-spec parse helpers to signal
+// that a workflow string was not recognized as their type; callers should
+// fall through to the next parser.
+var errNotHandled = errors.New("not handled")
 
 // ResolvedWorkflow contains metadata about a workflow that has been resolved and is ready to add
 type ResolvedWorkflow struct {
@@ -43,6 +45,12 @@ type ResolvedWorkflow struct {
 	// IsPackageAgentFile is true when the file is an agent .md from an aw.yml package
 	// manifest. The file is installed as-is to the agentic engine agents folder.
 	IsPackageAgentFile bool
+	// IsPackageResourceFile is true when the file is a declarative repository resource
+	// from an aw.yml package manifest. The file is installed as-is to DestinationPath.
+	IsPackageResourceFile bool
+	// IsPackageProjectFile is true when the file is an aw.json project file from a package.
+	// It is merged into the target repository's aw.json instead of copied as-is.
+	IsPackageProjectFile bool
 	// SkillName is the skill directory name for package skill files (e.g. "my-skill").
 	// Only meaningful when IsPackageSkillFile is true.
 	SkillName string
@@ -58,6 +66,10 @@ type ResolvedWorkflows struct {
 	HasWorkflowDispatch bool
 	// Warnings contains non-fatal package-resolution warnings to show during add
 	Warnings []string
+	// BootstrapProfile holds the bootstrap profile from an aw.yml package manifest,
+	// when exactly one source package declares a config section.
+	// Used by add (non-interactive TODO list) and add-wizard (interactive setup).
+	BootstrapProfile *resolvedBootstrapProfile
 }
 
 // ResolveWorkflows resolves workflow specifications by parsing specs and fetching workflow content.
@@ -66,192 +78,35 @@ type ResolvedWorkflows struct {
 func ResolveWorkflows(ctx context.Context, workflows []string, verbose bool) (*ResolvedWorkflows, error) {
 	resolutionLog.Printf("Resolving workflows: count=%d", len(workflows))
 
-	if len(workflows) == 0 {
-		return nil, errors.New("at least one workflow name is required")
+	if err := validateResolveWorkflowsInput(workflows); err != nil {
+		return nil, err
 	}
 
-	for i, workflow := range workflows {
-		if workflow == "" {
-			return nil, fmt.Errorf("workflow name cannot be empty (workflow %d)", i+1)
-		}
+	specResolution, err := parseWorkflowSpecsForResolution(ctx, workflows)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateCurrentRepositorySpecs(specResolution.ParsedSpecs); err != nil {
+		return nil, err
 	}
 
-	// Parse workflow specifications
-	parsedSpecs := make([]*WorkflowSpec, 0, len(workflows))
-	var resolutionWarnings []string
-
-	for _, workflow := range workflows {
-		if repoSpec, ok, repoErr := parseRepositoryPackageSpec(workflow); ok {
-			if repoErr != nil {
-				return nil, repoErr
-			}
-
-			pkg, pkgErr := resolveRepositoryPackage(ctx, repoSpec, explicitHostForRepo(repoSpec.RepoSlug))
-			if pkgErr == nil {
-				resolutionWarnings = append(resolutionWarnings, pkg.Warnings...)
-				parsedSpecs = appendRepositoryPackageWorkflowSpecs(parsedSpecs, repoSpec, pkg)
-				continue
-			}
-			if repoSpec.PackagePath == "" || !isRepositoryPackageManifestNotFound(pkgErr) {
-				return nil, pkgErr
-			}
-		}
-
-		spec, err := parseWorkflowSpec(workflow)
-		if err != nil {
-			repoSpec, repoErr := parseRepoSpec(workflow)
-			if repoErr != nil {
-				return nil, fmt.Errorf("invalid specification '%s': not a valid workflow path or repository package: %w", workflow, repoErr)
-			}
-
-			pkg, pkgErr := resolveRepositoryPackage(ctx, repoSpec, explicitHostForRepo(repoSpec.RepoSlug))
-			if pkgErr != nil {
-				return nil, pkgErr
-			}
-			resolutionWarnings = append(resolutionWarnings, pkg.Warnings...)
-			parsedSpecs = appendRepositoryPackageWorkflowSpecs(parsedSpecs, repoSpec, pkg)
-			continue
-		}
-
-		// Wildcards are only supported for local workflows
-		if spec.IsWildcard && !isLocalWorkflowPath(spec.WorkflowPath) {
-			return nil, fmt.Errorf("wildcards are only supported for local workflows, not remote repositories: %s", workflow)
-		}
-
-		parsedSpecs = append(parsedSpecs, spec)
+	parsedSpecs, hasWildcard, err := expandWorkflowSpecsIfNeeded(specResolution.ParsedSpecs, verbose)
+	if err != nil {
+		return nil, err
 	}
 
-	// Check if any workflow is from the current repository
-	// Skip this check if we can't determine the current repository (e.g., not in a git repo)
-	currentRepoSlug, repoErr := GetCurrentRepoSlug()
-	if repoErr == nil {
-		resolutionLog.Printf("Current repository: %s", currentRepoSlug)
-		// We successfully determined the current repository, check all workflow specs
-		for _, spec := range parsedSpecs {
-			// Skip local workflow specs
-			if isLocalWorkflowPath(spec.WorkflowPath) {
-				continue
-			}
-
-			if spec.RepoSlug == currentRepoSlug {
-				return nil, fmt.Errorf("cannot add workflows from the current repository (%s). The 'add' command is for installing workflows from other repositories", currentRepoSlug)
-			}
-		}
-	} else {
-		resolutionLog.Printf("Could not determine current repository: %v", repoErr)
-	}
-	// If we can't determine the current repository, proceed without the check
-
-	// Check if any workflow specs contain wildcards (local only)
-	hasWildcard := sliceutil.Any(parsedSpecs, func(spec *WorkflowSpec) bool {
-		return spec.IsWildcard
-	})
-
-	// Expand wildcards for local workflows only
-	if hasWildcard {
-		var err error
-		parsedSpecs, err = expandLocalWildcardWorkflows(parsedSpecs, verbose)
-		if err != nil {
-			return nil, err
-		}
+	resolvedWorkflows, hasWorkflowDispatch, resolutionWarnings, err := resolveWorkflowSpecs(
+		ctx,
+		parsedSpecs,
+		specResolution.Warnings,
+		verbose,
+	)
+	if err != nil {
+		return nil, err
 	}
 
-	// Fetch workflow content and metadata for each workflow
-	resolvedWorkflows := make([]*ResolvedWorkflow, 0, len(parsedSpecs))
-	hasWorkflowDispatch := false
-
-	for _, spec := range parsedSpecs {
-		// Fetch workflow content (including redirect resolution for remote workflows)
-		resolvedSpec, fetched, err := resolveAddWorkflowSpecAndContent(ctx, spec, verbose)
-		if err != nil {
-			return nil, fmt.Errorf("workflow '%s' not found: %w", spec.String(), err)
-		}
-
-		// Package skill files are installed as-is to the engine's skill directory.
-		if spec.IsPackageSkillFile {
-			resolutionLog.Printf("Resolved package skill file: spec=%s, skill=%s, content_size=%d bytes",
-				spec.String(), spec.SkillName, len(fetched.Content))
-			resolvedWorkflows = append(resolvedWorkflows, &ResolvedWorkflow{
-				Spec:               resolvedSpec,
-				Content:            fetched.Content,
-				SourceInfo:         fetched,
-				IsPackageSkillFile: true,
-				SkillName:          spec.SkillName,
-			})
-			continue
-		}
-
-		// Package agent files are installed as-is to the engine's agents directory.
-		if spec.IsPackageAgentFile {
-			resolutionLog.Printf("Resolved package agent file: spec=%s, content_size=%d bytes",
-				spec.String(), len(fetched.Content))
-			resolvedWorkflows = append(resolvedWorkflows, &ResolvedWorkflow{
-				Spec:               resolvedSpec,
-				Content:            fetched.Content,
-				SourceInfo:         fetched,
-				IsPackageAgentFile: true,
-			})
-			continue
-		}
-
-		// Action workflow files (.yml) are raw GitHub Actions YAML — skip all markdown
-		// frontmatter processing and install them as-is.
-		if isActionWorkflowPath(resolvedSpec.WorkflowPath) {
-			resolutionLog.Printf("Resolved action workflow: spec=%s, content_size=%d bytes",
-				spec.String(), len(fetched.Content))
-			resolvedWorkflows = append(resolvedWorkflows, &ResolvedWorkflow{
-				Spec:             resolvedSpec,
-				Content:          fetched.Content,
-				SourceInfo:       fetched,
-				IsActionWorkflow: true,
-			})
-			continue
-		}
-
-		// Extract description from content
-		description := ExtractWorkflowDescription(string(fetched.Content))
-
-		// Extract engine from content (if specified in frontmatter)
-		engine := ExtractWorkflowEngine(string(fetched.Content))
-
-		if spec.FromRepositoryManifest {
-			privateValue, hasPrivate := ExtractWorkflowPrivateSetting(string(fetched.Content))
-			if hasPrivate && privateValue {
-				manifestPath := joinRepositoryPackagePath(spec.PackagePath, repositoryPackageManifestFileName)
-				return nil, fmt.Errorf("invalid Agentic Workflow manifest %q: workflow %q sets private: true and cannot be included because private workflows cannot be added", manifestPath, resolvedSpec.WorkflowPath)
-			}
-		}
-
-		// Check if workflow is private - private workflows cannot be added to other repositories
-		isPrivate := ExtractWorkflowPrivate(string(fetched.Content))
-		if isPrivate {
-			return nil, fmt.Errorf("workflow '%s' is private and cannot be added to other repositories", spec.String())
-		}
-
-		// Check for workflow_dispatch trigger in content
-		workflowHasDispatch := checkWorkflowHasDispatchFromContent(string(fetched.Content))
-		if workflowHasDispatch {
-			hasWorkflowDispatch = true
-		}
-
-		if fetched.ConvertedFromJSON {
-			resolutionWarnings = append(resolutionWarnings,
-				fmt.Sprintf("JSON workflow import for %q was best-effort; run an agentic prompt to refine .github/workflows/%s.md", resolvedSpec.WorkflowName, resolvedSpec.WorkflowName))
-		}
-
-		resolutionLog.Printf("Resolved workflow: spec=%s, engine=%s, has_dispatch=%t, content_size=%d bytes",
-			spec.String(), engine, workflowHasDispatch, len(fetched.Content))
-
-		resolvedWorkflows = append(resolvedWorkflows, &ResolvedWorkflow{
-			Spec:                resolvedSpec,
-			Content:             fetched.Content,
-			SourceInfo:          fetched,
-			Description:         description,
-			Engine:              engine,
-			HasWorkflowDispatch: workflowHasDispatch,
-			IsPrivate:           isPrivate,
-		})
-	}
+	bootstrapProfile, updatedWarnings := selectBootstrapProfile(specResolution.BootstrapProfiles, resolutionWarnings)
+	resolutionWarnings = updatedWarnings
 
 	resolutionLog.Printf("Resolution complete: resolved=%d workflows, has_wildcard=%t, has_dispatch=%t",
 		len(resolvedWorkflows), hasWildcard, hasWorkflowDispatch)
@@ -261,239 +116,333 @@ func ResolveWorkflows(ctx context.Context, workflows []string, verbose bool) (*R
 		HasWildcard:         hasWildcard,
 		HasWorkflowDispatch: hasWorkflowDispatch,
 		Warnings:            resolutionWarnings,
+		BootstrapProfile:    bootstrapProfile,
 	}, nil
 }
 
-func appendRepositoryPackageWorkflowSpecs(parsedSpecs []*WorkflowSpec, repoSpec *RepoSpec, pkg *resolvedRepositoryPackage) []*WorkflowSpec {
-	if pkg == nil {
-		return parsedSpecs
-	}
-	host := explicitHostForRepo(repoSpec.RepoSlug)
-	effectiveVersion := repositoryPackageEffectiveRef(repoSpec, pkg)
-	for _, installationSource := range pkg.InstallationSource {
-		// installationSource is guaranteed by isSupportedPackageInstallablePath to be
-		// either a .md agentic workflow or a .yml action workflow file; no other
-		// extensions can reach this point.
-		base := filepath.Base(installationSource)
-		// Use filepath.Ext for case-insensitive extension removal (e.g. ".YML" or ".MD").
-		workflowName := strings.TrimSuffix(base, filepath.Ext(base))
-		parsedSpecs = append(parsedSpecs, &WorkflowSpec{
-			RepoSpec: RepoSpec{
-				RepoSlug:    repoSpec.RepoSlug,
-				Version:     effectiveVersion,
-				PackagePath: repoSpec.PackagePath,
-			},
-			WorkflowPath:           installationSource,
-			WorkflowName:           workflowName,
-			Host:                   host,
-			FromRepositoryManifest: true,
-		})
-	}
-
-	// Append skill file specs. Each spec carries IsPackageSkillFile=true and the SkillName
-	// so that the installation step can route the file to the correct skill directory.
-	for _, skillFile := range pkg.SkillFiles {
-		base := filepath.Base(skillFile.SourcePath)
-		// WorkflowName is unused for skill files but set to a stable value for logging.
-		workflowName := skillFile.SkillName + "/" + strings.TrimSuffix(base, filepath.Ext(base))
-		parsedSpecs = append(parsedSpecs, &WorkflowSpec{
-			RepoSpec: RepoSpec{
-				RepoSlug:    repoSpec.RepoSlug,
-				Version:     effectiveVersion,
-				PackagePath: repoSpec.PackagePath,
-			},
-			WorkflowPath:       skillFile.SourcePath,
-			WorkflowName:       workflowName,
-			Host:               host,
-			IsPackageSkillFile: true,
-			SkillName:          skillFile.SkillName,
-		})
-	}
-
-	// Append agent file specs. Each spec carries IsPackageAgentFile=true so the installation
-	// step routes the file to the correct agents directory.
-	for _, agentFile := range pkg.AgentFiles {
-		base := filepath.Base(agentFile)
-		workflowName := strings.TrimSuffix(base, filepath.Ext(base))
-		parsedSpecs = append(parsedSpecs, &WorkflowSpec{
-			RepoSpec: RepoSpec{
-				RepoSlug:    repoSpec.RepoSlug,
-				Version:     effectiveVersion,
-				PackagePath: repoSpec.PackagePath,
-			},
-			WorkflowPath:       agentFile,
-			WorkflowName:       workflowName,
-			Host:               host,
-			IsPackageAgentFile: true,
-		})
-	}
-
-	return parsedSpecs
+type specResolutionResult struct {
+	ParsedSpecs       []*WorkflowSpec
+	Warnings          []string
+	BootstrapProfiles []*resolvedBootstrapProfile
 }
 
-func resolveAddWorkflowSpecAndContent(ctx context.Context, initialSpec *WorkflowSpec, verbose bool) (*WorkflowSpec, *FetchedWorkflow, error) {
-	currentSpec := *initialSpec
-	visited := make(map[string]struct{})
-	followedRedirect := false
+func validateResolveWorkflowsInput(workflows []string) error {
+	if len(workflows) == 0 {
+		return errors.New("at least one workflow name is required")
+	}
+	for i, workflow := range workflows {
+		if workflow == "" {
+			return fmt.Errorf("workflow name cannot be empty (workflow %d)", i+1)
+		}
+	}
+	return nil
+}
 
-	for range maxRedirectDepth {
-		// Fetch workflow content - handles both local and remote.
-		fetched, err := fetchWorkflowFromSourceWithContextFn(ctx, &currentSpec, verbose)
+func parseWorkflowSpecsForResolution(ctx context.Context, workflows []string) (*specResolutionResult, error) {
+	result := &specResolutionResult{
+		ParsedSpecs: make([]*WorkflowSpec, 0, len(workflows)),
+	}
+	for _, workflow := range workflows {
+		specs, warnings, bootstrapProfile, err := parseSingleWorkflowSpecForResolution(ctx, workflow)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
-
-		// Redirects only apply to remote workflows.
-		if fetched.IsLocal {
-			return &currentSpec, fetched, nil
-		}
-
-		currentRef := currentSpec.Version
-		if currentRef == "" {
-			currentRef = "main"
-		}
-		locationKey := fmt.Sprintf("%s/%s@%s", currentSpec.RepoSlug, currentSpec.WorkflowPath, currentRef)
-		if _, exists := visited[locationKey]; exists {
-			return nil, nil, fmt.Errorf("redirect loop detected at %s", locationKey)
-		}
-		visited[locationKey] = struct{}{}
-
-		redirect, err := extractRedirectFromContent(string(fetched.Content))
-		if err != nil {
-			return nil, nil, err
-		}
-		if redirect == "" {
-			// Preserve the original WorkflowName from the user's request only when
-			// one or more redirects were followed, so the final local file keeps
-			// the requested name.
-			// Without redirects, keep any name derived during fetch, such as JSON
-			// imports where conversion picks a better filename from `name`.
-			if followedRedirect {
-				currentSpec.WorkflowName = initialSpec.WorkflowName
-			}
-			return &currentSpec, fetched, nil
-		}
-
-		redirectedSource, err := normalizeRedirectToSourceSpec(redirect)
-		if err != nil {
-			return nil, nil, fmt.Errorf("invalid redirect %q in %s: %w", redirect, locationKey, err)
-		}
-
-		nextSpec := &WorkflowSpec{
-			RepoSpec: RepoSpec{
-				RepoSlug: redirectedSource.Repo,
-				Version:  redirectedSource.Ref,
-			},
-			WorkflowPath: redirectedSource.Path,
-			WorkflowName: normalizeWorkflowID(redirectedSource.Path),
-			Host:         currentSpec.Host,
-		}
-		resolutionLog.Printf("Following redirect for add: from=%s to=%s", locationKey, nextSpec.String())
-		if verbose {
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Workflow redirect: %s -> %s", locationKey, nextSpec.String())))
-		}
-		followedRedirect = true
-		currentSpec = *nextSpec
-	}
-
-	return nil, nil, fmt.Errorf("redirect chain exceeded maximum depth (%d) for workflow '%s'", maxRedirectDepth, initialSpec.String())
-}
-
-// expandLocalWildcardWorkflows expands wildcard workflow specifications for local workflows only.
-func expandLocalWildcardWorkflows(specs []*WorkflowSpec, verbose bool) ([]*WorkflowSpec, error) {
-	expandedWorkflows := []*WorkflowSpec{}
-
-	for _, spec := range specs {
-		if spec.IsWildcard && isLocalWorkflowPath(spec.WorkflowPath) {
-			resolutionLog.Printf("Expanding local wildcard: %s", spec.WorkflowPath)
-			if verbose {
-				fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Discovering local workflows matching %s...", spec.WorkflowPath)))
-			}
-
-			// Expand local wildcard (e.g., ./*.md or ./workflows/*.md)
-			discovered, err := expandLocalWildcard(spec)
-			if err != nil {
-				return nil, fmt.Errorf("failed to expand wildcard %s: %w", spec.WorkflowPath, err)
-			}
-
-			if len(discovered) == 0 {
-				fmt.Fprintln(os.Stderr, console.FormatWarningMessage("No workflows found matching "+spec.WorkflowPath))
-			} else {
-				if verbose {
-					fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("Found %d workflow(s)", len(discovered))))
-				}
-				expandedWorkflows = append(expandedWorkflows, discovered...)
-			}
-		} else {
-			expandedWorkflows = append(expandedWorkflows, spec)
+		result.ParsedSpecs = append(result.ParsedSpecs, specs...)
+		result.Warnings = append(result.Warnings, warnings...)
+		if bootstrapProfile != nil {
+			result.BootstrapProfiles = append(result.BootstrapProfiles, bootstrapProfile)
 		}
 	}
-
-	if len(expandedWorkflows) == 0 {
-		return nil, errors.New("no workflows to add after expansion")
-	}
-
-	return expandedWorkflows, nil
-}
-
-// checkWorkflowHasDispatchFromContent checks if workflow content has a workflow_dispatch trigger
-func checkWorkflowHasDispatchFromContent(content string) bool {
-	result, err := parser.ExtractFrontmatterFromContent(content)
-	if err != nil {
-		return false
-	}
-
-	onSection, exists := result.Frontmatter["on"]
-	if !exists {
-		return false
-	}
-
-	switch on := onSection.(type) {
-	case map[string]any:
-		_, hasDispatch := on["workflow_dispatch"]
-		return hasDispatch
-	case string:
-		return strings.Contains(strings.ToLower(on), "workflow_dispatch")
-	case []any:
-		for _, item := range on {
-			if str, ok := item.(string); ok && strings.EqualFold(str, "workflow_dispatch") {
-				return true
-			}
-		}
-		return false
-	default:
-		return false
-	}
-}
-
-// expandLocalWildcard expands a local wildcard path (e.g., ./*.md) into individual workflow specs
-func expandLocalWildcard(spec *WorkflowSpec) ([]*WorkflowSpec, error) {
-	pattern := spec.WorkflowPath
-
-	// Use filepath.Glob to expand the pattern
-	matches, err := filepath.Glob(pattern)
-	if err != nil {
-		return nil, fmt.Errorf("invalid wildcard pattern %s: %w", pattern, err)
-	}
-
-	if len(matches) == 0 {
-		return nil, nil
-	}
-
-	mdMatches := sliceutil.Filter(matches, func(m string) bool {
-		return strings.HasSuffix(m, ".md")
-	})
-	result := sliceutil.Map(mdMatches, func(match string) *WorkflowSpec {
-		return &WorkflowSpec{
-			RepoSpec: RepoSpec{
-				RepoSlug: spec.RepoSlug,
-				Version:  spec.Version,
-			},
-			WorkflowPath: match,
-			WorkflowName: normalizeWorkflowID(match),
-			IsWildcard:   false,
-		}
-	})
-
 	return result, nil
+}
+
+func parseSingleWorkflowSpecForResolution(ctx context.Context, workflow string) ([]*WorkflowSpec, []string, *resolvedBootstrapProfile, error) {
+	specs, warnings, bootstrapProfile, err := resolveLocalPackageWorkflowSpec(workflow)
+	if err == nil {
+		return specs, warnings, bootstrapProfile, nil
+	}
+	if !errors.Is(err, errNotHandled) {
+		return nil, nil, nil, err
+	}
+
+	specs, warnings, bootstrapProfile, err = resolveRepositoryPackageWorkflowSpec(ctx, workflow)
+	if err == nil {
+		return specs, warnings, bootstrapProfile, nil
+	}
+	if !errors.Is(err, errNotHandled) {
+		return nil, nil, nil, err
+	}
+
+	spec, err := parseWorkflowSpec(workflow)
+	if err == nil {
+		if spec.IsWildcard && !isLocalWorkflowPath(spec.WorkflowPath) {
+			return nil, nil, nil, fmt.Errorf("wildcards are only supported for local workflows, not remote repositories: %s", workflow)
+		}
+		return []*WorkflowSpec{spec}, nil, nil, nil
+	}
+
+	specs, warnings, bootstrapProfile, err = resolveRepositoryPackageFallback(ctx, workflow)
+	return specs, warnings, bootstrapProfile, err
+}
+
+func resolveLocalPackageWorkflowSpec(workflow string) ([]*WorkflowSpec, []string, *resolvedBootstrapProfile, error) {
+	pkg, err := resolveLocalRepositoryPackage(workflow)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if pkg == nil {
+		return nil, nil, nil, errNotHandled
+	}
+
+	var bootstrapProfile *resolvedBootstrapProfile
+	if pkg.Bootstrap != nil {
+		bootstrapProfile = &resolvedBootstrapProfile{
+			PackageID: pkg.ManifestPath,
+			Source:    workflow,
+			Profile:   pkg.Bootstrap,
+		}
+	}
+	specs := appendLocalRepositoryPackageWorkflowSpecs(nil, pkg)
+	return specs, pkg.Warnings, bootstrapProfile, nil
+}
+
+func resolveRepositoryPackageWorkflowSpec(ctx context.Context, workflow string) ([]*WorkflowSpec, []string, *resolvedBootstrapProfile, error) {
+	repoSpec, ok, err := parseRepositoryPackageSpec(workflow)
+	if !ok {
+		return nil, nil, nil, errNotHandled
+	}
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	specs, warnings, bootstrapProfile, err := resolveRepositoryPackageSpecs(ctx, workflow, repoSpec)
+	if err == nil {
+		return specs, warnings, bootstrapProfile, nil
+	}
+	if repoSpec.PackagePath != "" && isRepositoryPackageManifestNotFound(err) {
+		return nil, nil, nil, errNotHandled
+	}
+	return nil, nil, nil, err
+}
+
+func resolveRepositoryPackageFallback(ctx context.Context, workflow string) ([]*WorkflowSpec, []string, *resolvedBootstrapProfile, error) {
+	repoSpec, repoErr := parseRepoSpec(workflow)
+	if repoErr != nil {
+		return nil, nil, nil, fmt.Errorf("invalid specification '%s': not a valid workflow path or repository package: %w", workflow, repoErr)
+	}
+	return resolveRepositoryPackageSpecs(ctx, workflow, repoSpec)
+}
+
+func resolveRepositoryPackageSpecs(ctx context.Context, workflow string, repoSpec *RepoSpec) ([]*WorkflowSpec, []string, *resolvedBootstrapProfile, error) {
+	pkg, err := resolveRepositoryPackage(ctx, repoSpec, explicitHostForRepo(repoSpec.RepoSlug))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	specs := appendRepositoryPackageWorkflowSpecs(nil, repoSpec, pkg)
+
+	var bootstrapProfile *resolvedBootstrapProfile
+	if pkg.Bootstrap != nil {
+		bootstrapProfile = &resolvedBootstrapProfile{
+			PackageID: repositoryPackageIdentifier(repoSpec.RepoSlug, repoSpec.PackagePath),
+			Source:    workflow,
+			Profile:   pkg.Bootstrap,
+		}
+	}
+	return specs, pkg.Warnings, bootstrapProfile, nil
+}
+
+func validateCurrentRepositorySpecs(parsedSpecs []*WorkflowSpec) error {
+	currentRepoSlug, err := GetCurrentRepoSlug()
+	if err != nil {
+		resolutionLog.Printf("Could not determine current repository: %v", err)
+		return nil
+	}
+	resolutionLog.Printf("Current repository: %s", currentRepoSlug)
+	for _, spec := range parsedSpecs {
+		if isLocalWorkflowPath(spec.WorkflowPath) {
+			continue
+		}
+		if spec.RepoSlug == currentRepoSlug {
+			return fmt.Errorf("cannot add workflows from the current repository (%s). The 'add' command is for installing workflows from other repositories", currentRepoSlug)
+		}
+	}
+	return nil
+}
+
+func expandWorkflowSpecsIfNeeded(parsedSpecs []*WorkflowSpec, verbose bool) ([]*WorkflowSpec, bool, error) {
+	hasWildcard := sliceutil.Any(parsedSpecs, func(spec *WorkflowSpec) bool {
+		return spec.IsWildcard
+	})
+	if !hasWildcard {
+		return parsedSpecs, false, nil
+	}
+	expandedSpecs, err := expandLocalWildcardWorkflows(parsedSpecs, verbose)
+	if err != nil {
+		return nil, false, err
+	}
+	return expandedSpecs, true, nil
+}
+
+func resolveWorkflowSpecs(ctx context.Context, parsedSpecs []*WorkflowSpec, warnings []string, verbose bool) ([]*ResolvedWorkflow, bool, []string, error) {
+	resolvedWorkflows := make([]*ResolvedWorkflow, 0, len(parsedSpecs))
+	resolutionWarnings := warnings
+	hasWorkflowDispatch := false
+
+	for _, spec := range parsedSpecs {
+		result, err := resolveSingleWorkflowSpec(ctx, spec, verbose)
+		if err != nil {
+			return nil, false, nil, err
+		}
+		if result.Workflow.HasWorkflowDispatch {
+			hasWorkflowDispatch = true
+		}
+		if result.Warning != "" {
+			resolutionWarnings = append(resolutionWarnings, result.Warning)
+		}
+		resolvedWorkflows = append(resolvedWorkflows, result.Workflow)
+	}
+
+	return resolvedWorkflows, hasWorkflowDispatch, resolutionWarnings, nil
+}
+
+// resolvedWorkflowResult holds the outcome of resolving a single workflow spec.
+type resolvedWorkflowResult struct {
+	Workflow *ResolvedWorkflow
+	Warning  string
+}
+
+func resolveSingleWorkflowSpec(ctx context.Context, spec *WorkflowSpec, verbose bool) (*resolvedWorkflowResult, error) {
+	resolvedSpec, fetched, err := resolveAddWorkflowSpecAndContent(ctx, spec, verbose)
+	if err != nil {
+		return nil, fmt.Errorf("workflow '%s' not found: %w", spec.String(), err)
+	}
+
+	if resolvedWorkflow, handled := resolvePackageOrActionWorkflow(spec, resolvedSpec, fetched); handled {
+		return &resolvedWorkflowResult{Workflow: resolvedWorkflow}, nil
+	}
+
+	return resolveStandardWorkflow(spec, resolvedSpec, fetched)
+}
+
+func resolvePackageOrActionWorkflow(spec, resolvedSpec *WorkflowSpec, fetched *FetchedWorkflow) (*ResolvedWorkflow, bool) {
+	if spec.IsPackageSkillFile {
+		resolutionLog.Printf("Resolved package skill file: spec=%s, skill=%s, content_size=%d bytes",
+			spec.String(), spec.SkillName, len(fetched.Content))
+		return &ResolvedWorkflow{
+			Spec:               resolvedSpec,
+			Content:            fetched.Content,
+			SourceInfo:         fetched,
+			IsPackageSkillFile: true,
+			SkillName:          spec.SkillName,
+		}, true
+	}
+
+	if spec.IsPackageAgentFile {
+		resolutionLog.Printf("Resolved package agent file: spec=%s, content_size=%d bytes",
+			spec.String(), len(fetched.Content))
+		return &ResolvedWorkflow{
+			Spec:               resolvedSpec,
+			Content:            fetched.Content,
+			SourceInfo:         fetched,
+			IsPackageAgentFile: true,
+		}, true
+	}
+
+	if spec.IsPackageResourceFile {
+		isProjectFile := filepath.ToSlash(filepath.Clean(spec.DestinationPath)) == workflow.RepoConfigFileName
+		resolutionLog.Printf("Resolved package resource file: spec=%s, destination=%s, content_size=%d bytes",
+			spec.String(), spec.DestinationPath, len(fetched.Content))
+		return &ResolvedWorkflow{
+			Spec:                  resolvedSpec,
+			Content:               fetched.Content,
+			SourceInfo:            fetched,
+			IsPackageResourceFile: true,
+			IsPackageProjectFile:  isProjectFile,
+		}, true
+	}
+
+	if isActionWorkflowPath(resolvedSpec.WorkflowPath) {
+		resolutionLog.Printf("Resolved action workflow: spec=%s, content_size=%d bytes",
+			spec.String(), len(fetched.Content))
+		return &ResolvedWorkflow{
+			Spec:             resolvedSpec,
+			Content:          fetched.Content,
+			SourceInfo:       fetched,
+			IsActionWorkflow: true,
+		}, true
+	}
+
+	return nil, false
+}
+
+func resolveStandardWorkflow(spec, resolvedSpec *WorkflowSpec, fetched *FetchedWorkflow) (*resolvedWorkflowResult, error) {
+	content := string(fetched.Content)
+	description := ExtractWorkflowDescription(content)
+	engine := ExtractWorkflowEngine(content)
+
+	if err := validateManifestWorkflowPrivateSetting(spec, resolvedSpec, content); err != nil {
+		return nil, err
+	}
+
+	if ExtractWorkflowPrivate(content) {
+		return nil, fmt.Errorf("workflow '%s' is private and cannot be added to other repositories", spec.String())
+	}
+
+	workflowHasDispatch := checkWorkflowHasDispatchFromContent(content)
+	resolutionLog.Printf("Resolved workflow: spec=%s, engine=%s, has_dispatch=%t, content_size=%d bytes",
+		spec.String(), engine, workflowHasDispatch, len(fetched.Content))
+
+	var warning string
+	if fetched.ConvertedFromJSON {
+		warning = fmt.Sprintf(
+			"JSON workflow import for %q was best-effort; run an agentic prompt to refine .github/workflows/%s.md",
+			resolvedSpec.WorkflowName,
+			resolvedSpec.WorkflowName,
+		)
+	}
+
+	return &resolvedWorkflowResult{
+		Workflow: &ResolvedWorkflow{
+			Spec:                resolvedSpec,
+			Content:             fetched.Content,
+			SourceInfo:          fetched,
+			Description:         description,
+			Engine:              engine,
+			HasWorkflowDispatch: workflowHasDispatch,
+		},
+		Warning: warning,
+	}, nil
+}
+
+func validateManifestWorkflowPrivateSetting(spec, resolvedSpec *WorkflowSpec, content string) error {
+	if !spec.FromRepositoryManifest {
+		return nil
+	}
+	privateValue, hasPrivate := ExtractWorkflowPrivateSetting(content)
+	if !hasPrivate || !privateValue {
+		return nil
+	}
+	manifestPath := joinRepositoryPackagePath(spec.PackagePath, repositoryPackageManifestFileName)
+	return fmt.Errorf(
+		"invalid Agentic Workflow manifest %q: workflow %q sets private: true and cannot be included because private workflows cannot be added",
+		manifestPath,
+		resolvedSpec.WorkflowPath,
+	)
+}
+
+func selectBootstrapProfile(bootstrapProfiles []*resolvedBootstrapProfile, resolutionWarnings []string) (*resolvedBootstrapProfile, []string) {
+	if len(bootstrapProfiles) > 1 {
+		ids := make([]string, 0, len(bootstrapProfiles))
+		for _, p := range bootstrapProfiles {
+			ids = append(ids, p.PackageID)
+		}
+		resolutionLog.Printf("Multiple bootstrap profiles found (%v); skipping all", ids)
+		return nil, append(resolutionWarnings,
+			fmt.Sprintf("multiple bootstrap profiles found (%s); bootstrap config will be skipped — run each package separately to apply its config", strings.Join(ids, ", ")))
+	}
+	if len(bootstrapProfiles) > 0 {
+		bootstrapProfile := bootstrapProfiles[0]
+		resolutionLog.Printf("Bootstrap profile found: packageID=%s", bootstrapProfile.PackageID)
+		return bootstrapProfile, resolutionWarnings
+	}
+	return nil, resolutionWarnings
 }

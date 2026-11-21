@@ -16,14 +16,42 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestProtectedSessionCaptureRejectsEvals(t *testing.T) {
+	definition := &EngineDefinition{
+		ID: "protected",
+		Behaviors: &EngineBehaviorDefinition{
+			Execution: &EngineExecutionDefinition{ProtectedSessionCapture: true},
+			LogParser: `function parseLog() { return { markdown: "", logEntries: [] }; }`,
+		},
+	}
+	engine, err := NewBehaviorDefinedEngine(definition)
+	require.NoError(t, err)
+
+	evals := &EvalsConfig{Questions: []EvalDefinition{{ID: "review", Question: "Does the answer match?"}}}
+	ctx := &workflowBuildContext{
+		cleanPath:    "protected.md",
+		engineSetup:  &engineSetupResult{agenticEngine: engine},
+		workflowData: &WorkflowData{Evals: evals},
+	}
+	err = NewCompiler().validateWorkflowBuildContext(ctx)
+	require.ErrorContains(t, err, "secondary engine invocation that reads evals.log")
+	assert.Contains(t, err.Error(), "protected-session-capture: false")
+
+	require.NoError(t, validateProtectedSessionCaptureEvals(engine, nil))
+	definition.Behaviors.Execution.ProtectedSessionCapture = false
+	unprotectedEngine, err := NewBehaviorDefinedEngine(definition)
+	require.NoError(t, err)
+	require.NoError(t, validateProtectedSessionCaptureEvals(unprotectedEngine, evals))
+}
+
 // TestBuildInitialWorkflowData_BasicFields tests that buildInitialWorkflowData correctly populates basic fields
 func TestBuildInitialWorkflowData_BasicFields(t *testing.T) {
 	compiler := NewCompiler()
 
 	// Mock frontmatter result
 	frontmatterResult := &parser.FrontmatterResult{
-		Frontmatter:      map[string]any{"description": "Test workflow", "source": "test-source"},
-		FrontmatterLines: []string{"description: Test workflow", "source: test-source"},
+		Frontmatter:      map[string]any{"description": "Test workflow", "metadata": map[string]any{"docs": "https://docs.example.com/test-workflow"}, "source": "test-source"},
+		FrontmatterLines: []string{"description: Test workflow", "metadata:", "  docs: https://docs.example.com/test-workflow", "source: test-source"},
 		Markdown:         "# Test\n\nContent",
 	}
 
@@ -62,12 +90,14 @@ func TestBuildInitialWorkflowData_BasicFields(t *testing.T) {
 	}
 
 	// Call buildInitialWorkflowData
-	workflowData := compiler.buildInitialWorkflowData(frontmatterResult, toolsResult, engineSetup, engineSetup.importsResult)
+	workflowData, err := compiler.buildInitialWorkflowData(frontmatterResult, toolsResult, engineSetup, engineSetup.importsResult)
+	require.NoError(t, err)
 
 	// Verify all fields are populated correctly
 	assert.Equal(t, "Test Workflow", workflowData.Name)
 	assert.Equal(t, "Test Frontmatter Name", workflowData.FrontmatterName)
 	assert.Equal(t, "Test workflow", workflowData.Description)
+	assert.Equal(t, "https://docs.example.com/test-workflow", workflowData.Docs)
 	assert.Equal(t, "test-source", workflowData.Source)
 	assert.Equal(t, "TRACKER-123", workflowData.TrackerID)
 	assert.Equal(t, []string{"/imported/file"}, workflowData.ImportedFiles)
@@ -109,7 +139,8 @@ func TestBuildInitialWorkflowData_EmptyFields(t *testing.T) {
 		importsResult:      &parser.ImportsResult{},
 	}
 
-	workflowData := compiler.buildInitialWorkflowData(frontmatterResult, toolsResult, engineSetup, engineSetup.importsResult)
+	workflowData, err := compiler.buildInitialWorkflowData(frontmatterResult, toolsResult, engineSetup, engineSetup.importsResult)
+	require.NoError(t, err)
 
 	// Should not panic and should create valid structure
 	assert.NotNil(t, workflowData)
@@ -317,7 +348,7 @@ func TestValidateWorkflowEngineSettings_PreservesLegacyErrorOrder(t *testing.T) 
 
 	err := compiler.validateWorkflowEngineSettings("workflow.md", workflowData)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "workflow.md: strict mode: run-install-scripts: true is set")
+	require.ErrorContains(t, err, "workflow.md: strict mode: run-install-scripts: true is set")
 	assert.NotContains(t, err.Error(), "engine.harness")
 }
 
@@ -338,7 +369,7 @@ func TestValidateWorkflowEngineSettings_LSPRequiresCopilot(t *testing.T) {
 
 	err := compiler.validateWorkflowEngineSettings("workflow.md", workflowData)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "workflow.md: lsp is currently only supported for engine: copilot")
+	require.ErrorContains(t, err, "workflow.md: lsp is currently only supported for engine: copilot")
 }
 
 func TestMergeRawOTLPEndpoints_DedupesAndCountsSources(t *testing.T) {
@@ -406,6 +437,49 @@ func TestMergeImportedObservability_MergesResourceAttributesWithMainPrecedence(t
 	}, otlp["resource-attributes"])
 }
 
+func TestMergeImportedObservabilityResolvesRootMetadataReferences(t *testing.T) {
+	importedObsJSON, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{"version": "import-version"},
+		"otlp": map[string]any{
+			"attributes": map[string]any{
+				"catalogue.version": "${{ github.aw.metadata.version }}",
+			},
+			"resource-attributes": map[string]any{
+				"catalogue.category": "${{ github.aw.metadata.category }}",
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	workflowData := &WorkflowData{
+		RawFrontmatter: map[string]any{
+			"metadata": map[string]any{
+				"version":  "root-version",
+				"category": "automation",
+			},
+		},
+	}
+
+	ctx := &workflowBuildContext{
+		cleanPath:   "workflow.md",
+		frontmatter: &parser.FrontmatterResult{Frontmatter: workflowData.RawFrontmatter},
+		engineSetup: &engineSetupResult{
+			importsResult: &parser.ImportsResult{MergedObservability: string(importedObsJSON)},
+		},
+		workflowData: workflowData,
+	}
+	require.NoError(t, NewCompiler().mergeImportedWorkflowConfiguration(ctx))
+
+	obs := workflowData.RawFrontmatter["observability"].(map[string]any)
+	otlp := obs["otlp"].(map[string]any)
+	assert.Equal(t, map[string]any{"catalogue.version": "root-version"}, otlp["attributes"])
+	assert.Equal(t, map[string]any{"catalogue.category": "automation"}, otlp["resource-attributes"])
+	assert.Equal(t, map[string]string{"catalogue.version": "root-version"}, collectOTLPCustomAttributes(workflowData.RawFrontmatter))
+	assert.Equal(t, map[string]string{"catalogue.category": "automation"}, collectOTLPResourceAttributes(workflowData.RawFrontmatter))
+	assert.Contains(t, workflowData.Env, `"catalogue.version":"root-version"`)
+	assert.Contains(t, workflowData.Env, "catalogue.category=automation")
+}
+
 func TestBuildMergedEnvSources_MainWorkflowWins(t *testing.T) {
 	mergedEnv := map[string]any{
 		"MAIN_ONLY":   "1",
@@ -442,6 +516,24 @@ func TestSetMainWorkflowEnvSources_OnlyTracksPresentKeys(t *testing.T) {
 		"FOO": "(main workflow)",
 		"BAR": "(main workflow)",
 	}, workflowData.EnvSources)
+}
+
+func TestMergeWorkflowEnv_InlinesImportedEnvReferences(t *testing.T) {
+	compiler := NewCompiler()
+	workflowData := &WorkflowData{}
+	importsResult := &parser.ImportsResult{
+		MergedEnv: `{"REVIEW_OUTPUT_REPO":"${{ github.event.inputs.safe_output_repo || vars.CENTRAL_AGENTIC_OPS_REVIEW_REPO || '' }}","SAFE_OUTPUT_REPO":"${{ (github.event.inputs.safe_output_mode || vars.CENTRAL_AGENTIC_OPS_MODE || 'preview') == 'review' && env.REVIEW_OUTPUT_REPO || '' }}"}`,
+		MergedEnvSources: map[string]string{
+			"REVIEW_OUTPUT_REPO": "shared/control.md",
+			"SAFE_OUTPUT_REPO":   "shared/control.md",
+		},
+	}
+
+	err := compiler.mergeWorkflowEnv(map[string]any{}, workflowData, importsResult)
+	require.NoError(t, err)
+	assert.Contains(t, workflowData.Env, "SAFE_OUTPUT_REPO: ${{ (github.event.inputs.safe_output_mode || vars.CENTRAL_AGENTIC_OPS_MODE || 'preview') == 'review' && (github.event.inputs.safe_output_repo || vars.CENTRAL_AGENTIC_OPS_REVIEW_REPO || '') || '' }}")
+	assert.NotContains(t, workflowData.Env, "env.REVIEW_OUTPUT_REPO")
+	assert.Equal(t, "shared/control.md", workflowData.EnvSources["SAFE_OUTPUT_REPO"])
 }
 
 // TestProcessAndMergeSteps_NoSteps tests processAndMergeSteps with no steps
@@ -931,7 +1023,8 @@ func TestMergeJobsFromYAMLImports_NoImportedJobs(t *testing.T) {
 		},
 	}
 
-	result := compiler.mergeJobsFromYAMLImports(mainJobs, "")
+	result, err := compiler.mergeJobsFromYAMLImports(mainJobs, "")
+	require.NoError(t, err)
 
 	assert.Equal(t, mainJobs, result)
 	assert.Len(t, result, 1)
@@ -945,7 +1038,8 @@ func TestMergeJobsFromYAMLImports_EmptyJSON(t *testing.T) {
 		"test": map[string]any{"runs-on": "ubuntu-latest"},
 	}
 
-	result := compiler.mergeJobsFromYAMLImports(mainJobs, "{}")
+	result, err := compiler.mergeJobsFromYAMLImports(mainJobs, "{}")
+	require.NoError(t, err)
 
 	assert.Equal(t, mainJobs, result)
 	assert.Len(t, result, 1)
@@ -958,7 +1052,8 @@ func TestMergeJobsFromYAMLImports_ImportedJobsOnly(t *testing.T) {
 	mainJobs := map[string]any{}
 	importedJobsJSON := `{"imported-job": {"runs-on": "ubuntu-latest", "steps": [{"run": "echo imported"}]}}`
 
-	result := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+	result, err := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+	require.NoError(t, err)
 
 	assert.Len(t, result, 1)
 	assert.Contains(t, result, "imported-job")
@@ -980,7 +1075,8 @@ func TestMergeJobsFromYAMLImports_MainJobTakesPrecedence(t *testing.T) {
 	// Imported job with same name "test"
 	importedJobsJSON := `{"test": {"runs-on": "macos-latest", "steps": [{"run": "echo imported"}]}}`
 
-	result := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+	result, err := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+	require.NoError(t, err)
 
 	assert.Len(t, result, 1)
 	assert.Contains(t, result, "test")
@@ -1008,7 +1104,8 @@ func TestMergeJobsFromYAMLImports_MergesPreStepsOnConflict(t *testing.T) {
 	}
 
 	importedJobsJSON := `{"test": {"runs-on": "macos-latest", "pre-steps": [{"name": "import pre", "run": "echo import"}], "steps": [{"run": "echo imported job"}]}}`
-	result := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+	result, err := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+	require.NoError(t, err)
 
 	assert.Len(t, result, 1)
 	testJob := result["test"].(map[string]any)
@@ -1044,7 +1141,8 @@ func TestMergeJobsFromYAMLImports_MergesSetupStepsOnConflict(t *testing.T) {
 	}
 
 	importedJobsJSON := `{"test": {"runs-on": "macos-latest", "setup-steps": [{"name": "import setup", "run": "echo import"}], "steps": [{"run": "echo imported job"}]}}`
-	result := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+	result, err := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+	require.NoError(t, err)
 
 	assert.Len(t, result, 1)
 	testJob := result["test"].(map[string]any)
@@ -1081,7 +1179,8 @@ func TestMergeJobsFromYAMLImports_MergesSetupAndPreStepsIndependentlyOnConflict(
 	}
 
 	importedJobsJSON := `{"test": {"runs-on": "macos-latest", "setup-steps": [{"name": "import setup", "run": "echo import setup"}], "pre-steps": [{"name": "import pre", "run": "echo import pre"}], "steps": [{"run": "echo imported job"}]}}`
-	result := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+	result, err := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+	require.NoError(t, err)
 
 	assert.Len(t, result, 1)
 	testJob := result["test"].(map[string]any)
@@ -1105,6 +1204,57 @@ func TestMergeJobsFromYAMLImports_MergesSetupAndPreStepsIndependentlyOnConflict(
 	assert.Equal(t, "main pre", secondPre["name"], "Main workflow pre-steps should run after imported pre-steps")
 }
 
+func TestMergeJobsFromYAMLImports_MergesActivationStepsOnConflict(t *testing.T) {
+	compiler := NewCompiler()
+
+	mainJobs := map[string]any{
+		"activation": map[string]any{
+			"steps": []any{
+				map[string]any{"name": "main activation", "run": "echo main"},
+			},
+		},
+	}
+
+	importedJobsJSON := `{"activation": {"steps": [{"name": "import activation", "run": "echo import"}]}}`
+	result, err := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+	require.NoError(t, err)
+
+	assert.Len(t, result, 1)
+	activationJob := result["activation"].(map[string]any)
+
+	steps, ok := activationJob["steps"].([]any)
+	require.True(t, ok, "Expected merged activation steps array")
+	require.Len(t, steps, 2, "Expected imported+main activation steps to be merged")
+
+	first := steps[0].(map[string]any)
+	second := steps[1].(map[string]any)
+	assert.Equal(t, "import activation", first["name"], "Imported activation steps should run first")
+	assert.Equal(t, "main activation", second["name"], "Main workflow activation steps should run after imported activation steps")
+}
+
+func TestMergeJobsFromYAMLImports_DoesNotMergeRegularStepsForCustomJobConflict(t *testing.T) {
+	compiler := NewCompiler()
+
+	mainJobs := map[string]any{
+		"test": map[string]any{
+			"runs-on": "ubuntu-latest",
+			"steps": []any{
+				map[string]any{"name": "main", "run": "echo main"},
+			},
+		},
+	}
+
+	importedJobsJSON := `{"test": {"runs-on": "macos-latest", "steps": [{"name": "import", "run": "echo import"}]}}`
+	result, err := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+	require.NoError(t, err)
+
+	testJob := result["test"].(map[string]any)
+	steps, ok := testJob["steps"].([]any)
+	require.True(t, ok, "Expected main custom job steps array")
+	require.Len(t, steps, 1, "Custom job conflicts should preserve main regular steps")
+	assert.Equal(t, "main", steps[0].(map[string]any)["name"])
+}
+
 // TestMergeJobsFromYAMLImports_MultipleImportedJobs tests merging multiple imported jobs
 func TestMergeJobsFromYAMLImports_MultipleImportedJobs(t *testing.T) {
 	compiler := NewCompiler()
@@ -1117,7 +1267,8 @@ func TestMergeJobsFromYAMLImports_MultipleImportedJobs(t *testing.T) {
 	importedJobsJSON := `{"imported-1": {"runs-on": "ubuntu-latest"}}
 {"imported-2": {"runs-on": "macos-latest"}}`
 
-	result := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+	result, err := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+	require.NoError(t, err)
 
 	assert.Len(t, result, 3)
 	assert.Contains(t, result, "main-job")
@@ -1136,7 +1287,8 @@ func TestMergeJobsFromYAMLImports_MalformedJSON(t *testing.T) {
 	// Malformed JSON should be skipped
 	importedJobsJSON := `{"malformed": "unclosed`
 
-	result := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+	result, err := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+	require.NoError(t, err)
 
 	// Should return only main jobs, skipping malformed
 	assert.Len(t, result, 1)
@@ -1159,7 +1311,8 @@ func TestMergeJobsFromYAMLImports_EmptyLines(t *testing.T) {
 {"job-2": {"runs-on": "macos-latest"}}
 `
 
-	result := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+	result, err := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+	require.NoError(t, err)
 
 	assert.Len(t, result, 2)
 	assert.Contains(t, result, "job-1")
@@ -1442,7 +1595,7 @@ engine: copilot
 			require.Error(t, err, "Should error for %s", tt.name)
 			assert.Nil(t, workflowData)
 			if tt.expectError != "" {
-				assert.Contains(t, err.Error(), tt.expectError)
+				require.ErrorContains(t, err, tt.expectError)
 			}
 		})
 	}
@@ -1568,6 +1721,7 @@ on: push
 engine: copilot
 tools:
   bash: []
+  cli-proxy: false
 ---
 
 # Test Workflow
@@ -1706,7 +1860,7 @@ engine: invalid-engine-that-does-not-exist
 
 	require.Error(t, err, "Should error with invalid engine")
 	assert.Nil(t, workflowData)
-	assert.Contains(t, err.Error(), "invalid-engine-that-does-not-exist")
+	require.ErrorContains(t, err, "invalid-engine-that-does-not-exist")
 }
 
 // TestParseWorkflowFile_ErrorPropagationFromToolsProcessing tests error propagation from tools phase
@@ -1733,7 +1887,7 @@ tools:
 
 	require.Error(t, err, "Should error with invalid tools timeout")
 	assert.Nil(t, workflowData)
-	assert.Contains(t, err.Error(), "timeout")
+	require.ErrorContains(t, err, "timeout")
 }
 
 // TestParseWorkflowFile_ActionCacheAndResolverSetup tests action cache and resolver are properly set
@@ -1817,7 +1971,8 @@ func TestMergeJobsFromYAMLImports_PreservesJobOrder(t *testing.T) {
 	importedJobsJSON := `{"job-c": {"runs-on": "ubuntu-latest"}}
 {"job-d": {"runs-on": "macos-latest"}}`
 
-	result := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+	result, err := compiler.mergeJobsFromYAMLImports(mainJobs, importedJobsJSON)
+	require.NoError(t, err)
 
 	assert.Len(t, result, 4)
 	// Verify all jobs present
@@ -1852,7 +2007,7 @@ func TestProcessAndMergeSteps_InvalidYAML_MergedSteps(t *testing.T) {
 	// Malformed MergedSteps YAML must propagate as an error
 	err := compiler.processAndMergeSteps(frontmatter, workflowData, importsResult)
 	require.Error(t, err, "malformed MergedSteps YAML should return an error")
-	assert.Contains(t, err.Error(), "failed to parse imported steps")
+	require.ErrorContains(t, err, "imported steps YAML is not recognized")
 }
 
 // TestProcessAndMergePreSteps_InvalidYAML tests that malformed imported pre-steps YAML returns an error
@@ -1873,7 +2028,7 @@ func TestProcessAndMergePreSteps_InvalidYAML(t *testing.T) {
 
 	err := compiler.processAndMergePreSteps(frontmatter, workflowData, importsResult)
 	require.Error(t, err, "malformed imported pre-steps YAML should return an error")
-	assert.Contains(t, err.Error(), "failed to parse imported pre-steps")
+	require.ErrorContains(t, err, "imported pre-steps YAML is not recognized")
 }
 
 // TestProcessAndMergePreAgentSteps_InvalidYAML tests that malformed imported pre-agent-steps YAML returns an error
@@ -1894,7 +2049,7 @@ func TestProcessAndMergePreAgentSteps_InvalidYAML(t *testing.T) {
 
 	err := compiler.processAndMergePreAgentSteps(frontmatter, workflowData, importsResult)
 	require.Error(t, err, "malformed imported pre-agent-steps YAML should return an error")
-	assert.Contains(t, err.Error(), "failed to parse imported pre-agent-steps")
+	require.ErrorContains(t, err, "imported pre-agent-steps YAML is not recognized")
 }
 
 // TestProcessAndMergePostSteps_InvalidYAML tests that malformed imported post-steps YAML returns an error
@@ -1915,7 +2070,7 @@ func TestProcessAndMergePostSteps_InvalidYAML(t *testing.T) {
 
 	err := compiler.processAndMergePostSteps(frontmatter, workflowData, importsResult)
 	require.Error(t, err, "malformed imported post-steps YAML should return an error")
-	assert.Contains(t, err.Error(), "failed to parse imported post-steps")
+	require.ErrorContains(t, err, "imported post-steps YAML is not recognized")
 }
 
 // TestProcessAndMergeServices_EmptyImportedServices tests handling of empty imported services
@@ -1981,7 +2136,8 @@ func TestBuildInitialWorkflowData_FieldMapping(t *testing.T) {
 		},
 	}
 
-	workflowData := compiler.buildInitialWorkflowData(frontmatterResult, toolsResult, engineSetup, engineSetup.importsResult)
+	workflowData, err := compiler.buildInitialWorkflowData(frontmatterResult, toolsResult, engineSetup, engineSetup.importsResult)
+	require.NoError(t, err)
 
 	// Verify all mappings
 	assert.Equal(t, "Test Name", workflowData.Name)

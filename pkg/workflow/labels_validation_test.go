@@ -3,6 +3,10 @@
 package workflow
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -76,7 +80,7 @@ func TestValidateLabels(t *testing.T) {
 			if tt.shouldErr {
 				require.Error(t, err, "Expected validation to fail")
 				if tt.errorMsg != "" {
-					assert.Contains(t, err.Error(), tt.errorMsg, "Error message should contain expected text")
+					require.ErrorContains(t, err, tt.errorMsg, "Error message should contain expected text")
 				}
 			} else {
 				assert.NoError(t, err, "Expected validation to pass")
@@ -99,4 +103,24 @@ func TestValidateLabels_NilWorkflowData(t *testing.T) {
 	// Test with nil workflowData
 	err := validateLabels(nil)
 	assert.NoError(t, err, "Should handle nil workflowData gracefully")
+}
+
+func TestCompileRejectsLongLabelNames(t *testing.T) {
+	for _, field := range []string{
+		"labels: [%q]",
+		"safe-outputs:\n  create-issue:\n    labels: [%q]",
+	} {
+		t.Run(field, func(t *testing.T) {
+			workflowPath := filepath.Join(t.TempDir(), "long-label.md")
+			content := "---\non: workflow_dispatch\n" +
+				fmt.Sprintf(field, strings.Repeat("a", 54)) +
+				"\n---\nTest label validation.\n"
+			require.NoError(t, os.WriteFile(workflowPath, []byte(content), 0600))
+
+			err := NewCompiler().CompileWorkflow(workflowPath)
+			require.ErrorContains(t, err, "maxLength: got 54, want 50")
+			_, err = os.Stat(strings.TrimSuffix(workflowPath, ".md") + ".lock.yml")
+			require.ErrorIs(t, err, os.ErrNotExist)
+		})
+	}
 }

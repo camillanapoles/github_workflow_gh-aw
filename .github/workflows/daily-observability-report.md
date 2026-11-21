@@ -2,24 +2,29 @@
 private: true
 emoji: "📊"
 description: Daily observability report analyzing logging and telemetry coverage for AWF firewall and MCP Gateway across workflow runs
-on: daily
+on:
+  workflow_dispatch:
 permissions:
   contents: read
   actions: read
   discussions: read
   issues: read
   pull-requests: read
+model: gpt-5.3-codex
 engine:
   id: codex
-  model: gpt-5.4
 strict: true
 tracker-id: daily-observability-report
 tools:
+  work-queue:
+    worker: true
+    require-assignment: true
   agentic-workflows: true
 timeout-minutes: 45
 # Default AI credit budget for this workflow.
 max-ai-credits: 1500
 imports:
+  - shared/daily-report-worker.md
   - uses: shared/meta-analysis-base.md
     with:
       toolsets: [default, discussions, actions]
@@ -27,6 +32,7 @@ imports:
     with:
       title-prefix: "[observability] "
       expires: 1d
+  - shared/reporting.md
 
 
   - shared/otlp.md
@@ -34,8 +40,14 @@ features:
   gh-aw-detection: true
 sandbox:
   agent:
-    sudo: false
+    id: awf
+evals:
+  - id: observability_data_analyzed
+    question: Did the agent analyze logging and telemetry coverage for AWF firewall and MCP Gateway?
+  - id: report_created
+    question: Was an observability report created identifying gaps and trends?
 ---
+
 {{#runtime-import? .github/shared-instructions.md}}
 
 # Daily Observability Report for AWF Firewall and MCP Gateway
@@ -134,14 +146,17 @@ The AWF Firewall uses Squid proxy for egress control. The key log file is `acces
 
 For each firewall-enabled workflow run, check:
 
-1. **access.log existence**: Look for `access.log/` directory in the run logs
-   - Path pattern: `/tmp/gh-aw/aw-mcp/logs/run-<id>/access.log/`
-   - Contains files like `access-*.log`
+1. **access.log existence**: Search recursively inside each run folder for firewall access logs
+   - Canonical path (current AWF layout): `run-<id>/sandbox/firewall/logs/squid-logs/access.log`
+   - Also accept the legacy path: `run-<id>/sandbox/firewall/logs/access.log` (older AWF layout)
+   - Also accept equivalent paths nested under artifact-prefixed directories (workflow_call)
+   - Do not assume a fixed top-level location; use recursive discovery
 
 2. **access.log content quality**:
    - Are there log entries present?
-   - Do entries follow squid format: `timestamp duration client status size method url user hierarchy type`
-   - Are both allowed and blocked requests logged?
+   - Do entries follow AWF custom format: `timestamp client_ip:port domain dest_ip:port proto method status decision url user_agent`
+   - Example entry: `1761332530.474 172.30.0.20:35288 api.github.com:443 140.82.112.22:443 1.1 CONNECT 200 TCP_TUNNEL:HIER_DIRECT api.github.com:443 "-"`
+   - Are both allowed (TCP_TUNNEL) and blocked (TCP_DENIED) requests logged?
 
 3. **Firewall configuration**:
    - Check `aw_info.json` for firewall settings:
@@ -168,13 +183,20 @@ The MCP Gateway logs tool execution. Two log formats may be present depending on
 
 For each run that uses MCP servers, check in this order:
 
-1. **gateway.jsonl existence** (preferred): Look for the file in run logs
-   - Path pattern: `/tmp/gh-aw/aw-mcp/logs/run-<id>/mcp-logs/gateway.jsonl`
+1. **gateway.jsonl existence** (preferred): Search recursively inside the run folder
+   - Canonical path: `/tmp/gh-aw/aw-mcp/logs/run-<id>/mcp-logs/gateway.jsonl`
+   - Also accept equivalent paths nested under artifact-prefixed directories (workflow_call)
 
 2. **rpc-messages.jsonl existence** (canonical fallback): Check when gateway.jsonl is missing
-   - Path pattern: `/tmp/gh-aw/aw-mcp/logs/run-<id>/mcp-logs/rpc-messages.jsonl`
+   - Canonical path: `/tmp/gh-aw/aw-mcp/logs/run-<id>/mcp-logs/rpc-messages.jsonl`
+   - Also accept equivalent paths nested under artifact-prefixed directories (workflow_call)
    - This file is written by the Copilot CLI and contains raw JSON-RPC protocol messages
    - A run with this file present has MCP telemetry and should NOT be reported as Critical
+
+**Path normalization rule (required):**
+- For each run, determine telemetry presence by recursively finding files named `gateway.jsonl` or `rpc-messages.jsonl` anywhere under `run-<id>/`.
+- Record the exact discovered path(s) in your analysis notes before assigning status.
+- Never classify a run as "missing MCP telemetry" based only on one hardcoded path check.
 
 3. **gateway.jsonl content quality** (when present):
    - Are log entries valid JSONL format?
@@ -193,7 +215,12 @@ For each run that uses MCP servers, check in this order:
    - Do entries contain required fields:
      - `timestamp`: When the message was sent/received
      - `direction`: "IN" (from server) or "OUT" (to server)
-     - `type`: "REQUEST" or "RESPONSE"
+     - `event` or `type`: Message kind. Real-world telemetry (schema `rpc-message/v2`) uses a
+       top-level `event` field with values `rpc_request` / `rpc_response` (and `difc_filtered`
+       for blocked events); a top-level `_schema` field (e.g. `"rpc-message/v2"`) marks this
+       format. Older/synthetic files may instead use a top-level `type` field directly with
+       values `REQUEST` / `RESPONSE` / `DIFC_FILTERED`. **Do not flag a run as unhealthy solely
+       because entries lack a top-level `type` field** — check for `event` first.
      - `server_id`: MCP server identifier
      - `payload`: JSON-RPC payload with `method`, `params`, `result`, or `error`
    - Tool call count derived from outgoing `tools/call` requests
@@ -402,7 +429,6 @@ This workflow uses Codex, so prompt discipline is the main budget control.
 
 ### Report Quality
 
-- **Report Formatting**: Use h3 (###) or lower for all headers in your report to maintain proper document hierarchy. Wrap long sections in `<details><summary>Section Name</summary>` tags to improve readability and reduce scrolling.
 - Be specific with numbers and percentages
 - Link to actual workflow runs for context
 - Provide actionable recommendations

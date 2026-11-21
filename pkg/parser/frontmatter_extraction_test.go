@@ -3,6 +3,7 @@
 package parser
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -164,6 +165,12 @@ Nested content`,
 			sectionName: "NonExistent",
 			wantErr:     true,
 		},
+		{
+			name:        "section name with regexp metacharacters",
+			content:     "## Setup (v2.0+)\n\nContent",
+			sectionName: "Setup (v2.0+)",
+			expected:    "## Setup (v2.0+)\n\nContent",
+		},
 	}
 
 	for _, tt := range tests {
@@ -179,6 +186,12 @@ Nested content`,
 			assert.Equal(t, tt.expected, result, "ExtractMarkdownSection() should return the expected section content")
 		})
 	}
+}
+
+func TestExtractMarkdownSectionReturnsScannerErrors(t *testing.T) {
+	content := "# Setup\n" + strings.Repeat("x", 64*1024+1)
+	_, err := ExtractMarkdownSection(content, "Setup")
+	require.ErrorContains(t, err, "failed to scan markdown while extracting section")
 }
 
 func TestGenerateDefaultWorkflowName(t *testing.T) {

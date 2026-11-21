@@ -7,8 +7,12 @@
  * for workflow execution notifications.
  */
 
-const { getMessages, renderTemplate, toSnakeCase } = require("./messages_core.cjs");
-const { getDetectionReasonText, getThreatDetectedMarkerTemplate, normalizeThreatKinds } = require("./threat_detection_warning.cjs");
+const { getMessages, renderTemplate, renderTemplateFromFile, toSnakeCase, getPromptPath } = require("./messages_core.cjs");
+const { getDetectionReasonText, getThreatDetectedMarkerTemplate, getThreatEngineErrorMarkerTemplate, normalizeThreatKinds, isToolingFailureReason } = require("./threat_detection_warning.cjs");
+const { parseReportMarkdown } = require("./report_markdown.cjs");
+const PULL_REQUEST_CREATED = "Pull request created: [#{item_number}]({item_url})";
+const ISSUE_CREATED = "Issue created: [#{item_number}]({item_url})";
+const COMMIT_PUSHED = "Commit pushed: [`{short_sha}`]({commit_url})";
 
 /**
  * Renders a message using a custom template from config or a default template.
@@ -28,6 +32,7 @@ function renderConfiguredMessage(messageKey, defaultTemplate, ctx) {
  * @property {string} workflowName - Name of the workflow
  * @property {string} runUrl - URL of the workflow run
  * @property {string} eventType - Event type description (e.g., "issue", "pull request", "discussion")
+ * @property {string} [emoji] - Optional workflow emoji override
  */
 
 /**
@@ -36,7 +41,8 @@ function renderConfiguredMessage(messageKey, defaultTemplate, ctx) {
  * @returns {string} Run-started message
  */
 function getRunStartedMessage(ctx) {
-  return renderConfiguredMessage("runStarted", "🚀 [{workflow_name}]({run_url}) has started processing this {event_type}", ctx);
+  const normalizedEmoji = typeof ctx?.emoji === "string" && ctx.emoji.trim() ? ctx.emoji.trim() : "🚀";
+  return renderConfiguredMessage("runStarted", "{emoji} [{workflow_name}]({run_url}) has started processing this {event_type}", { ...ctx, emoji: normalizedEmoji });
 }
 
 /**
@@ -74,15 +80,30 @@ function getRunFailureMessage(ctx) {
  * @typedef {Object} DetectionFailureContext
  * @property {string} workflowName - Name of the workflow
  * @property {string} runUrl - URL of the workflow run
+ * @property {string} [reason] - Categorized detection outcome
+ * @property {string} [threatKinds] - Schema-defined threat categories
  */
 
+const DETECTION_FAILURE_TEMPLATE = "⚠️ Security scanning failed for [{workflow_name}]({run_url}). {reason_text} Review the logs for details.";
+
 /**
- * Get the detection-failure message, using custom template if configured.
- * @param {DetectionFailureContext} ctx - Context for detection-failure message generation
- * @returns {string} Detection-failure message
+ * @param {DetectionFailureContext | DetectionWarningContext} ctx
  */
-function getDetectionFailureMessage(ctx) {
-  return renderConfiguredMessage("detectionFailure", "⚠️ Security scanning failed for [{workflow_name}]({run_url}). Review the logs for details.", ctx);
+function detectionMessageContext(ctx) {
+  const reason = ctx.reason ?? process.env.GH_AW_DETECTION_REASON;
+  const threatKinds = ctx.threatKinds ?? process.env.GH_AW_DETECTION_THREAT_KINDS;
+  return { ...ctx, reasonText: getDetectionReasonText(reason, threatKinds), threatKinds: reason === "threat_detected" ? normalizeThreatKinds(threatKinds) : "unknown" };
+}
+
+/**
+ * @param {DetectionFailureContext} ctx
+ * @returns {import("./report_ast.cjs").ReportBlock[]}
+ */
+function getDetectionFailureBlocks(ctx) {
+  return parseReportMarkdown(getMessages()?.detectionFailure ?? DETECTION_FAILURE_TEMPLATE, {
+    context: toSnakeCase(detectionMessageContext(ctx)),
+    agentTainted: false,
+  });
 }
 
 /**
@@ -97,7 +118,7 @@ function getDetectionFailureMessage(ctx) {
  * @returns {string} Pull-request-created message
  */
 function getPullRequestCreatedMessage(ctx) {
-  return renderConfiguredMessage("pullRequestCreated", "Pull request created: [#{item_number}]({item_url})", ctx);
+  return renderConfiguredMessage("pullRequestCreated", PULL_REQUEST_CREATED, ctx);
 }
 
 /**
@@ -112,7 +133,7 @@ function getPullRequestCreatedMessage(ctx) {
  * @returns {string} Issue-created message
  */
 function getIssueCreatedMessage(ctx) {
-  return renderConfiguredMessage("issueCreated", "Issue created: [#{item_number}]({item_url})", ctx);
+  return renderConfiguredMessage("issueCreated", ISSUE_CREATED, ctx);
 }
 
 /**
@@ -128,7 +149,18 @@ function getIssueCreatedMessage(ctx) {
  * @returns {string} Commit-pushed message
  */
 function getCommitPushedMessage(ctx) {
-  return renderConfiguredMessage("commitPushed", "Commit pushed: [`{short_sha}`]({commit_url})", ctx);
+  return renderConfiguredMessage("commitPushed", COMMIT_PUSHED, ctx);
+}
+
+/**
+ * @param {"issue" | "pull_request" | "commit"} kind
+ * @param {PullRequestCreatedContext | CommitPushedContext} ctx
+ * @returns {import("./report_ast.cjs").ReportBlock[]}
+ */
+function buildCreatedMessageBlocks(kind, ctx) {
+  const key = kind === "issue" ? "issueCreated" : kind === "commit" ? "commitPushed" : "pullRequestCreated";
+  const fallback = kind === "issue" ? ISSUE_CREATED : kind === "commit" ? COMMIT_PUSHED : PULL_REQUEST_CREATED;
+  return parseReportMarkdown(getMessages()?.[key] ?? fallback, { context: toSnakeCase(ctx), agentTainted: false });
 }
 
 /**
@@ -136,27 +168,61 @@ function getCommitPushedMessage(ctx) {
  * @property {string} workflowName - Name of the workflow
  * @property {string} runUrl - URL of the workflow run
  * @property {string} reason - Categorized reason for the warning (e.g. "threat_detected", "agent_failure", "parse_error")
+ * @property {string} [threatKinds] - Schema-defined threat categories
  */
 
 /**
  * Get the detection-warning message with progressive disclosure via details/summary.
  * Used when continue-on-error is true (default) instead of false.
+ *
+ * When the reason indicates a tooling failure (agent_failure or parse_error) the
+ * message uses a [!WARNING] admonition so reviewers can distinguish "detection
+ * engine crashed" from "detection engine found something". Actual threat findings
+ * (threat_detected) keep the [!CAUTION] admonition.
+ *
  * @param {DetectionWarningContext} ctx - Context for detection-warning message generation
- * @returns {string} Detection-warning message with caution admonition
+ * @returns {string} Detection-warning message with admonition
  */
 function getDetectionWarningMessage(ctx) {
-  const reasonText = getDetectionReasonText(ctx.reason);
-  const defaultTemplate = `> [!CAUTION]\n> agentic threat detected\n> Threat detection flagged this output in warn mode. Manual review is REQUIRED before any follow-up automation.\n> ${getThreatDetectedMarkerTemplate()}\n>\n> <details>\n> <summary>Details</summary>\n>\n> {reason_text}\n>\n> Review the [workflow run logs]({run_url}) for details.\n> </details>`;
-  return renderConfiguredMessage("detectionWarning", defaultTemplate, { ...ctx, reasonText, threatKinds: normalizeThreatKinds(ctx.reason) });
+  const isEngineError = isToolingFailureReason(ctx.reason);
+  const templateFile = isEngineError ? "threat_detection_engine_error.md" : "threat_detection_caution.md";
+  const messageKey = isEngineError ? "detectionEngineError" : "detectionWarning";
+  const markerTemplate = isEngineError ? getThreatEngineErrorMarkerTemplate() : getThreatDetectedMarkerTemplate();
+  const messages = getMessages();
+  const configTemplate = messages?.[messageKey];
+  if (configTemplate) {
+    return renderTemplate(configTemplate, toSnakeCase({ ...detectionMessageContext(ctx), threat_detected_marker: markerTemplate }));
+  }
+  return renderTemplateFromFile(getPromptPath(templateFile), toSnakeCase({ ...detectionMessageContext(ctx), threat_detected_marker: markerTemplate })).trimEnd();
+}
+
+/**
+ * @param {DetectionWarningContext} ctx
+ * @returns {import("./report_ast.cjs").ReportBlock[]}
+ */
+function getDetectionWarningBlocks(ctx) {
+  const isEngineError = isToolingFailureReason(ctx.reason);
+  const key = isEngineError ? "detectionEngineError" : "detectionWarning";
+  const template = getMessages()?.[key] || renderTemplateFromFile(getPromptPath(isEngineError ? "threat_detection_engine_error.md" : "threat_detection_caution.md"), {});
+  return parseReportMarkdown(template, {
+    agentTainted: false,
+    allowFlagMarkers: true,
+    context: toSnakeCase({
+      ...detectionMessageContext(ctx),
+      threat_detected_marker: [{ type: "marker", name: isEngineError ? "gh-aw-threat-engine-error" : "gh-aw-threat-detected", agentTainted: false }],
+    }),
+  });
 }
 
 module.exports = {
   getRunStartedMessage,
   getRunSuccessMessage,
   getRunFailureMessage,
-  getDetectionFailureMessage,
+  getDetectionFailureBlocks,
   getDetectionWarningMessage,
+  getDetectionWarningBlocks,
   getPullRequestCreatedMessage,
   getIssueCreatedMessage,
   getCommitPushedMessage,
+  buildCreatedMessageBlocks,
 };

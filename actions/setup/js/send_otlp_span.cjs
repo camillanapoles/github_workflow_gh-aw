@@ -1,23 +1,60 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
+const { iterateJsonl, iterateLines, readJsonlFile } = require("./jsonl_helpers.cjs");
 const childProcess = require("child_process");
 const { randomBytes } = require("crypto");
 const fs = require("fs");
-const { buildWorkflowCallId } = require("./aw_context.cjs");
+const { buildWorkflowCallId, resolveParentHopId } = require("./aw_context.cjs");
 const path = require("path");
 const { nowMs } = require("./performance_now.cjs");
 const { buildWorkflowRunUrl } = require("./workflow_metadata_helpers.cjs");
 const { readExperimentAssignments, EXPERIMENT_ASSIGNMENTS_PATH } = require("./experiment_helpers.cjs");
-const { parseJsonlContent } = require("./jsonl_helpers.cjs");
 const { countSteeringEventsInApiProxyJsonl } = require("./steering_helpers.cjs");
 const { resolveAICreditsFailureState } = require("./ai_credits_context.cjs");
+const { collectCodexMixedRecords } = require("./parse_codex_log.cjs");
+const { normalizeCodexSession } = require("./codex_session.cjs");
+const { projectSessionResult, observedSessionModel } = require("./agent_session.cjs");
+const { resolveEffectiveModel, resolveModelRoutingSummary } = require("./model_attribution.cjs");
+const { normalizeHarnessRetryRecord } = require("./harness_retry_record.cjs");
+const { isDurableSessionRecord } = require("./durable_session_record.cjs");
+const { readEvalsNotEvaluatedStatus } = require("./evals_status.cjs");
+const { MAX_OTLP_RESPONSE_BYTES, readOTLPResponse, inspectOTLPResponse, unavailableOTLPResponse } = require("./otlp_response.cjs");
+const { buildTraceparent, buildServiceRequestHeaders, isValidTraceId, isValidSpanId } = require("./service_correlation.cjs");
+const {
+  OTEL_ATTR_CICD_PIPELINE_NAME,
+  OTEL_ATTR_CICD_PIPELINE_RUN_ID,
+  OTEL_ATTR_CICD_PIPELINE_RUN_URL_FULL,
+  OTEL_ATTR_CICD_PIPELINE_TASK_NAME,
+  OTEL_ATTR_DEPLOYMENT_ENVIRONMENT,
+  OTEL_ATTR_DEPLOYMENT_ENVIRONMENT_NAME,
+  OTEL_ATTR_ENGINE_ID,
+  OTEL_ATTR_ERROR_TYPE,
+  OTEL_ATTR_GITHUB_RUN_ID,
+  OTEL_ATTR_GEN_AI_AGENT_NAME,
+  OTEL_ATTR_GEN_AI_PROVIDER_NAME,
+  OTEL_ATTR_GEN_AI_TOKEN_MODALITY,
+  OTEL_ATTR_GEN_AI_USAGE_CACHE_WRITE_INPUT_TOKENS,
+  OTEL_ATTR_REPOSITORY,
+  OTEL_ATTR_RUN_ID,
+  OTEL_ATTR_VCS_PROVIDER_NAME,
+  OTEL_ATTR_VCS_REF_HEAD_NAME,
+  OTEL_ATTR_VCS_REF_HEAD_REVISION,
+  OTEL_ATTR_VCS_REPOSITORY_URL_FULL,
+  OTEL_ATTR_WORKFLOW_NAME,
+  canonicalAttributeName,
+} = require("./otel_attributes_generated.cjs");
+
+function getGhAwPath(relativePath) {
+  const root = (process.env.GH_AW_TMP_DIR || "").trim() || "/tmp/gh-aw";
+  return path.join(root, relativePath);
+}
 
 /**
  * send_otlp_span.cjs
  *
  * Sends a single OTLP (OpenTelemetry Protocol) trace span to the configured
- * HTTP/JSON endpoint.  Used by actions/setup to instrument each job execution
+ * OTLP/HTTP JSON or protobuf endpoint. Used by actions/setup to instrument each job execution
  * with basic telemetry.
  *
  * Design constraints:
@@ -45,6 +82,29 @@ const ENGINE_TO_SYSTEM_MAP = Object.assign(Object.create(null), {
   codex: "openai",
   gemini: "google_vertex_ai",
 });
+
+/** @type {Record<string, string>} gen_ai.provider.name per engine. */
+const ENGINE_TO_PROVIDER_MAP = Object.assign(Object.create(null), {
+  copilot: "github",
+  claude: "anthropic",
+  codex: "openai",
+  gemini: "gcp.gen_ai",
+});
+
+/** @param {string} engineId */
+function resolveGenAiProvider(engineId) {
+  return ENGINE_TO_PROVIDER_MAP[engineId] || engineId;
+}
+
+/** True when OTEL_SEMCONV_STABILITY_OPT_IN contains gen_ai_v1 (spec §6.7). */
+function isGenAiV1() {
+  return (process.env.OTEL_SEMCONV_STABILITY_OPT_IN || "")
+    .split(",")
+    .map(s => s.trim())
+    .includes("gen_ai_v1");
+}
+
+const GEN_AI_SCHEMA_URL = "https://opentelemetry.io/schemas/1.45.0";
 
 // ---------------------------------------------------------------------------
 // Low-level helpers
@@ -88,12 +148,13 @@ function toNanoString(ms) {
  * @returns {{ key: string, value: object }}
  */
 function buildAttr(key, value) {
+  key = canonicalAttributeName(key);
   if (typeof value === "boolean") {
     return { key, value: { boolValue: value } };
   }
   if (typeof value === "number") {
     if (Number.isFinite(value)) {
-      if (Number.isInteger(value)) {
+      if (Number.isInteger(value) && Number.isSafeInteger(value)) {
         return { key, value: { intValue: value } };
       }
       return { key, value: { doubleValue: value } };
@@ -116,7 +177,7 @@ function buildAttr(key, value) {
  * @returns {{ key: string, value: { doubleValue: number } }}
  */
 function buildDoubleAttr(key, value) {
-  return { key, value: { doubleValue: typeof value === "number" && Number.isFinite(value) ? value : 0 } };
+  return { key: canonicalAttributeName(key), value: { doubleValue: typeof value === "number" && Number.isFinite(value) ? value : 0 } };
 }
 
 /**
@@ -129,7 +190,7 @@ function buildDoubleAttr(key, value) {
  * @returns {{ key: string, value: { arrayValue: { values: Array<{ stringValue: string }> } } }}
  */
 function buildArrayAttr(key, values) {
-  return { key, value: { arrayValue: { values: values.map(v => ({ stringValue: String(v) })) } } };
+  return { key: canonicalAttributeName(key), value: { arrayValue: { values: values.map(v => ({ stringValue: String(v) })) } } };
 }
 
 /**
@@ -209,7 +270,7 @@ function readContextString(value) {
  * 2. `awInfo.context.engine_id` – propagated via aw_context for auxiliary / dispatched jobs
  * 3. `process.env.GH_AW_INFO_ENGINE_ID` – workflow-injected env var fallback
  *
- * @param {object} awInfo
+ * @param {any} awInfo
  * @returns {string}
  */
 function resolveEngineId(awInfo) {
@@ -226,7 +287,7 @@ function resolveEngineId(awInfo) {
  * standalone runs we fall back to the current run's run_id-run_attempt pair so
  * every live span is still queryable as a bounded execution unit.
  *
- * @param {object} awInfo
+ * @param {any} awInfo
  * @param {string} runId
  * @param {string} runAttempt
  * @returns {Array<{key: string, value: object}>}
@@ -235,7 +296,7 @@ function buildEpisodeAttributesFromContext(awInfo, runId, runAttempt) {
   const currentHopId = buildCurrentWorkflowCallId(runId, runAttempt);
   const inheritedHopId = readContextString(awInfo.context?.hop_id) || readContextString(awInfo.context?.workflow_call_id);
   const episodeId = readContextString(awInfo.context?.episode_id) || inheritedHopId || currentHopId;
-  const parentHopId = readContextString(awInfo.context?.parent_hop_id) || (inheritedHopId && inheritedHopId !== currentHopId ? inheritedHopId : "");
+  const parentHopId = resolveParentHopId(awInfo.context, currentHopId);
   const originEvent = readContextString(awInfo.context?.origin_event) || readContextString(awInfo.context?.event_type);
   const rootRepo = readContextString(awInfo.context?.root_repo) || readContextString(awInfo.context?.repo);
   const rootWorkflowId = readContextString(awInfo.context?.root_workflow_id) || readContextString(awInfo.context?.workflow_id);
@@ -298,7 +359,7 @@ const SPAN_KIND_CONSUMER = 5;
  * @property {string} [scopeVersion]    - gh-aw version string (e.g. from GH_AW_INFO_VERSION)
  * @property {Array<{key: string, value: object}>} attributes - Span attributes
  * @property {Array<{key: string, value: object}>} [resourceAttributes] - Extra resource attributes (e.g. github.repository, github.run_id)
- * @property {number} [statusCode]      - OTLP status code: 0=UNSET, 1=OK, 2=ERROR (defaults to 1)
+ * @property {number} [statusCode]      - OTLP status code: 0=UNSET, 1=OK, 2=ERROR
  * @property {string} [statusMessage]   - Human-readable status message (included when statusCode is 2)
  * @property {number} [kind]            - OTLP SpanKind: use SPAN_KIND_* constants. Defaults to SPAN_KIND_INTERNAL (1).
  * @property {Array<{timeUnixNano: string, name: string, attributes: Array<{key: string, value: object}>}>} [events] - Span events following the OTel events spec (e.g. exception events).
@@ -323,10 +384,10 @@ const SPAN_KIND_CONSUMER = 5;
  * Build the OTLP span object nested under `scopeSpans[].spans[]`.
  *
  * @param {OTLPSpanRecordOptions} opts
- * @returns {object}
+ * @returns {any}
  */
 function buildOTLPSpan({ traceId, spanId, parentSpanId, spanName, startMs, endMs, attributes, statusCode, statusMessage, kind = SPAN_KIND_INTERNAL, events }) {
-  const code = typeof statusCode === "number" ? statusCode : 1; // STATUS_CODE_OK
+  const code = typeof statusCode === "number" ? statusCode : isGenAiV1() ? 0 : 1;
   /** @type {{ code: number, message?: string }} */
   const status = { code };
   if (statusMessage) {
@@ -377,6 +438,7 @@ function buildOTLPResourceAttributes(serviceName, scopeVersion, resourceAttribut
  *   sha?: string,
  *   job?: string,
  *   workflowRef?: string,
+ *   workflowName?: string,
  *   actorId?: string,
  *   runnerOs?: string,
  *   runnerArch?: string,
@@ -399,6 +461,7 @@ function buildGitHubActionsResourceAttributes({
   sha = "",
   job = "",
   workflowRef = "",
+  workflowName = "",
   actorId = "",
   runnerOs = "",
   runnerArch = "",
@@ -418,11 +481,16 @@ function buildGitHubActionsResourceAttributes({
       resourceAttributes.push(attr);
     }
   };
+  const addResourceAttrIfAbsent = attr => {
+    if (!resourceAttributes.some(existing => existing.key === attr.key)) resourceAttributes.push(attr);
+  };
 
   upsertResourceAttr(buildAttr("github.repository", repository));
-  upsertResourceAttr(buildAttr("github.run_id", runId));
+  upsertResourceAttr(buildAttr(OTEL_ATTR_GITHUB_RUN_ID, runId));
   upsertResourceAttr(buildAttr("github.run_attempt", runAttempt));
-  const runUrlAttr = buildGitHubActionsRunUrlAttribute(repository, runId);
+  const [repositoryOwner = "", repositoryName = ""] = repository.split("/");
+  const runUrl = repositoryOwner && repositoryName && runId ? buildWorkflowRunUrl({ runId }, { owner: repositoryOwner, repo: repositoryName }) : "";
+  const runUrlAttr = runUrl ? buildAttr("github.actions.run_url", runUrl) : null;
   if (runUrlAttr) {
     upsertResourceAttr(runUrlAttr);
   }
@@ -468,7 +536,29 @@ function buildGitHubActionsResourceAttributes({
   if (awmgVersion) {
     upsertResourceAttr(buildAttr("gh-aw.awmg.version", awmgVersion));
   }
-  upsertResourceAttr(buildAttr("deployment.environment", staged ? "staging" : "production"));
+  const deploymentEnvironment = staged ? "staging" : "production";
+  if (!isGenAiV1()) {
+    upsertResourceAttr(buildAttr(OTEL_ATTR_DEPLOYMENT_ENVIRONMENT, deploymentEnvironment));
+  } else {
+    for (let index = resourceAttributes.length - 1; index >= 0; index--) {
+      if (resourceAttributes[index].key === OTEL_ATTR_DEPLOYMENT_ENVIRONMENT) resourceAttributes.splice(index, 1);
+    }
+  }
+  const serverUrl = (process.env.GITHUB_SERVER_URL || "https://github.com").replace(/\/+$/, "");
+  const repositoryUrl = repository ? `${serverUrl}/${repository}` : "";
+  const pipelineName = process.env.GITHUB_WORKFLOW || workflowName;
+  const standardResourceAttributes = [
+    ...(pipelineName ? [buildAttr(OTEL_ATTR_CICD_PIPELINE_NAME, pipelineName)] : []),
+    ...(runId ? [buildAttr(OTEL_ATTR_CICD_PIPELINE_RUN_ID, runId)] : []),
+    ...(runUrl ? [buildAttr(OTEL_ATTR_CICD_PIPELINE_RUN_URL_FULL, runUrl)] : []),
+    ...(job ? [buildAttr(OTEL_ATTR_CICD_PIPELINE_TASK_NAME, job)] : []),
+    buildAttr(OTEL_ATTR_VCS_PROVIDER_NAME, "github"),
+    ...(repositoryUrl ? [buildAttr(OTEL_ATTR_VCS_REPOSITORY_URL_FULL, repositoryUrl)] : []),
+    ...(refName ? [buildAttr(OTEL_ATTR_VCS_REF_HEAD_NAME, refName)] : []),
+    ...(sha ? [buildAttr(OTEL_ATTR_VCS_REF_HEAD_REVISION, sha)] : []),
+    buildAttr(OTEL_ATTR_DEPLOYMENT_ENVIRONMENT_NAME, deploymentEnvironment),
+  ];
+  standardResourceAttributes.forEach(addResourceAttrIfAbsent);
   return resourceAttributes;
 }
 
@@ -572,21 +662,21 @@ function buildGitHubActionsRunUrlAttribute(repository, runId) {
  *   resourceAttributes?: Array<{key: string, value: object}>,
  *   spans: object[]
  * }} opts
- * @returns {object}
+ * @returns {any}
  */
 function buildOTLPBatchPayload({ serviceName, scopeVersion, resourceAttributes, spans }) {
+  const scopeSpans = {
+    scope: { name: "gh-aw", version: scopeVersion || "unknown" },
+    ...(isGenAiV1() ? { schemaUrl: GEN_AI_SCHEMA_URL } : {}),
+    spans,
+  };
   return {
     resourceSpans: [
       {
         resource: {
           attributes: buildOTLPResourceAttributes(serviceName, scopeVersion, resourceAttributes),
         },
-        scopeSpans: [
-          {
-            scope: { name: "gh-aw", version: scopeVersion || "unknown" },
-            spans,
-          },
-        ],
+        scopeSpans: [scopeSpans],
       },
     ],
   };
@@ -603,7 +693,7 @@ function buildOTLPBatchPayload({ serviceName, scopeVersion, resourceAttributes, 
  *   spans: object[],
  *   maxSpansPerPayload?: number
  * }} opts
- * @returns {object[]}
+ * @returns {any[]}
  */
 function buildOTLPBatchPayloads({ serviceName, scopeVersion, resourceAttributes, spans, maxSpansPerPayload = 100 }) {
   const normalizedMax = Number.isInteger(maxSpansPerPayload) && maxSpansPerPayload > 0 ? maxSpansPerPayload : 100;
@@ -625,7 +715,7 @@ function buildOTLPBatchPayloads({ serviceName, scopeVersion, resourceAttributes,
  * Build an OTLP/HTTP JSON traces payload wrapping a single span.
  *
  * @param {OTLPSpanOptions} opts
- * @returns {object} - Ready to be serialised as JSON and POSTed to `/v1/traces`
+ * @returns {any} - Ready to be serialised as JSON and POSTed to `/v1/traces`
  */
 function buildOTLPPayload({ traceId, spanId, parentSpanId, spanName, startMs, endMs, serviceName, scopeVersion, attributes, resourceAttributes, statusCode, statusMessage, kind = SPAN_KIND_INTERNAL, events }) {
   return buildOTLPBatchPayload({
@@ -653,7 +743,7 @@ const OTEL_JSONL_PATH = "/tmp/gh-aw/otel.jsonl";
  * file.  Creates the `/tmp/gh-aw` directory if it does not already exist.
  * Errors are silently swallowed — mirror failures must never break the workflow.
  *
- * @param {object} payload - OTLP traces payload
+ * @param {any} payload - OTLP traces payload
  * @returns {void}
  */
 function appendToOTLPJSONL(payload) {
@@ -706,6 +796,105 @@ function buildExperimentAttributes(assignments) {
     attrs.push(buildAttr("gh-aw.experiments", JSON.stringify(validAssignments)));
   }
   return attrs;
+}
+
+/**
+ * Build summary attributes and per-result events from valid deterministic grader output.
+ * Free-form grader messages, details, and errors are intentionally excluded because
+ * they may contain trace content with sensitive values.
+ *
+ * @param {any} graderOutput
+ * @param {number} eventTimeMs
+ * @returns {{attributes: Array<{key: string, value: object}>, events: Array<{timeUnixNano: string, name: string, attributes: Array<{key: string, value: object}>}>}}
+ */
+function buildGraderTelemetry(graderOutput, eventTimeMs) {
+  if (!graderOutput || typeof graderOutput !== "object" || !Array.isArray(graderOutput.results) || graderOutput.results.length === 0) {
+    return { attributes: [], events: [] };
+  }
+
+  const results = graderOutput.results.filter(result => result && typeof result === "object" && typeof result.id === "string" && result.id);
+  if (results.length === 0) {
+    return { attributes: [], events: [] };
+  }
+
+  const countByStatus = status => results.filter(result => result.status === status).length;
+  const attributes = [
+    buildAttr("gh-aw.graders.count", results.length),
+    buildAttr("gh-aw.graders.passed", countByStatus("pass")),
+    buildAttr("gh-aw.graders.failed", countByStatus("fail")),
+    buildAttr("gh-aw.graders.errors", countByStatus("error")),
+    buildAttr("gh-aw.graders.unavailable", countByStatus("unavailable")),
+    buildAttr("gh-aw.graders.other", results.length - countByStatus("pass") - countByStatus("fail") - countByStatus("error") - countByStatus("unavailable")),
+  ];
+  const timeUnixNano = toNanoString(eventTimeMs);
+  const events = results.map(result => {
+    const resultAttributes = [buildAttr("gh-aw.grader.id", result.id)];
+    if (typeof result.name === "string" && result.name) resultAttributes.push(buildAttr("gh-aw.grader.name", result.name));
+    if (typeof result.status === "string" && result.status) resultAttributes.push(buildAttr("gh-aw.grader.status", result.status));
+    if (typeof result.source === "string" && result.source) resultAttributes.push(buildAttr("gh-aw.grader.source", result.source));
+    if (typeof result.unit === "string" && result.unit) resultAttributes.push(buildAttr("gh-aw.grader.unit", result.unit));
+    if (typeof result.value === "number" && Number.isFinite(result.value)) resultAttributes.push(buildDoubleAttr("gh-aw.grader.value", result.value));
+    if (typeof result.passed === "boolean") resultAttributes.push(buildAttr("gh-aw.grader.passed", result.passed));
+    if (typeof result.severity === "string" && result.severity) resultAttributes.push(buildAttr("gh-aw.grader.severity", result.severity));
+    return { timeUnixNano, name: "grader.result", attributes: resultAttributes };
+  });
+
+  return { attributes, events };
+}
+
+/**
+ * @param {string} jobName
+ * @param {(path: string) => any} [readJSON]
+ */
+function selectGraderOutputForJob(jobName, readJSON = readJSONIfExists) {
+  if (jobName === "conclusion") return readJSON("/tmp/gh-aw/usage/graders/grader_results.json");
+  if (jobName !== "graders") return undefined;
+  const combinedOutput = readJSON("/tmp/gh-aw/custom-graders/grader_results.json");
+  if (!combinedOutput || !Array.isArray(combinedOutput.results)) return undefined;
+  return { ...combinedOutput, results: combinedOutput.results.filter(result => result?.source === "inline" || result?.source === "operational-value") };
+}
+
+/**
+ * Build summary attributes and per-result events from BinEval JSONL records.
+ * Only bounded, structured fields are included; free-form questions are excluded.
+ *
+ * @param {any[]} evalResults
+ * @param {number} eventTimeMs
+ * @param {import("./evals_status.cjs").EvalsNotEvaluatedStatus | null} [notEvaluated]
+ * @returns {{attributes: Array<{key: string, value: object}>, events: Array<{timeUnixNano: string, name: string, attributes: Array<{key: string, value: object}>}>}}
+ */
+function buildEvalTelemetry(evalResults, eventTimeMs, notEvaluated = null) {
+  if (notEvaluated) {
+    const attributes = [buildAttr("gh-aw.evals.status", notEvaluated.status), buildAttr("gh-aw.evals.reason_code", notEvaluated.reason_code)];
+    if (typeof notEvaluated.model === "string" && notEvaluated.model) {
+      attributes.push(buildAttr("gh-aw.eval.model", notEvaluated.model));
+    }
+    return { attributes, events: [{ timeUnixNano: toNanoString(eventTimeMs), name: "eval.status", attributes }] };
+  }
+  if (!Array.isArray(evalResults)) {
+    return { attributes: [], events: [] };
+  }
+  const results = evalResults.filter(result => result && typeof result === "object" && typeof result.id === "string" && result.id);
+  if (results.length === 0) {
+    return { attributes: [], events: [] };
+  }
+
+  const normalizedAnswers = results.map(result => {
+    const answer = typeof result.answer === "string" ? result.answer.trim().toUpperCase() : "UNKNOWN";
+    return answer === "YES" || answer === "NO" ? answer : "UNKNOWN";
+  });
+  const countAnswer = answer => normalizedAnswers.filter(value => value === answer).length;
+  const attributes = [buildAttr("gh-aw.evals.count", results.length), buildAttr("gh-aw.evals.yes", countAnswer("YES")), buildAttr("gh-aw.evals.no", countAnswer("NO")), buildAttr("gh-aw.evals.unknown", countAnswer("UNKNOWN"))];
+  const timeUnixNano = toNanoString(eventTimeMs);
+  const events = results.map((result, index) => {
+    const resultAttributes = [buildAttr("gh-aw.eval.id", result.id), buildAttr("gh-aw.eval.answer", normalizedAnswers[index])];
+    if (typeof result.model === "string" && result.model) {
+      resultAttributes.push(buildAttr("gh-aw.eval.model", result.model));
+    }
+    return { timeUnixNano, name: "eval.result", attributes: resultAttributes };
+  });
+
+  return { attributes, events };
 }
 
 // ---------------------------------------------------------------------------
@@ -773,19 +962,39 @@ function buildCustomOTLPAttributes() {
  * @param {string} raw - Raw header string (e.g. "Authorization=Bearer tok,X-Tenant=acme")
  * @returns {Record<string, string>} Parsed headers object
  */
-function parseOTLPHeaders(raw) {
-  if (!raw || !raw.trim()) return {};
-  /** @type {Record<string, string>} */
-  const result = {};
-  for (const pair of raw.split(",")) {
-    const eqIdx = pair.indexOf("=");
-    if (eqIdx <= 0) continue; // skip malformed pairs (no =) or empty keys (= at start)
-    // Decode before trimming so percent-encoded whitespace (%20) at edges is preserved correctly.
-    const key = decodeURIComponent(pair.slice(0, eqIdx)).trim();
-    const value = decodeURIComponent(pair.slice(eqIdx + 1)).trim();
-    if (key) result[key] = value;
-  }
-  return result;
+const { parseOTLPHeaders } = require("./otlp_header_helpers.cjs");
+
+const EMPTY_OTLP_AUTHORIZATION_SCHEMES = new Set([
+  "api-key",
+  "apikey",
+  "basic",
+  "bearer",
+  "concealed",
+  "digest",
+  "dpop",
+  "dsn",
+  "gnap",
+  "hoba",
+  "mutual",
+  "negotiate",
+  "oauth",
+  "privatetoken",
+  "scram-sha-1",
+  "scram-sha-256",
+  "sentry",
+  "vapid",
+]);
+
+/**
+ * @param {string} raw
+ * @returns {boolean}
+ */
+function hasEmptyOTLPAuthorizationHeader(raw) {
+  const headers = parseOTLPHeaders(raw);
+  return Object.entries(headers).some(([key, value]) => {
+    const normalizedKey = key.toLowerCase();
+    return (normalizedKey === "authorization" || normalizedKey === "x-sentry-auth") && (value === "" || EMPTY_OTLP_AUTHORIZATION_SCHEMES.has(value.toLowerCase()));
+  });
 }
 
 /**
@@ -808,12 +1017,30 @@ function hasProxyConfigured(endpoint) {
  *
  * @param {string} url
  * @param {Record<string, string>} headers
- * @param {string} body
- * @returns {{ ok: boolean, status: number, statusText: string }}
+ * @param {string | Buffer} body
+ * @returns {{ ok: boolean, status: number, statusText: string, responseBody: Buffer, contentType: string, diagnosticsUnavailable: boolean }}
  */
 function sendOTLPViaCurl(url, headers, body) {
   /** @type {string[]} */
-  const args = ["--silent", "--show-error", "--location", "--output", "/dev/null", "--write-out", "%{http_code}", "--request", "POST", "--data-binary", "@-"];
+  const args = [
+    "--silent",
+    "--show-error",
+    "--location",
+    "--suppress-connect-headers",
+    "--dump-header",
+    "-",
+    // Let curl finish and emit its status before the subprocess deadline.
+    "--max-time",
+    "10",
+    "--max-filesize",
+    String(MAX_OTLP_RESPONSE_BYTES),
+    "--write-out",
+    "\n%{http_code}\n%{content_type}",
+    "--request",
+    "POST",
+    "--data-binary",
+    "@-",
+  ];
 
   for (const [key, value] of Object.entries(headers)) {
     args.push("--header", `${key}: ${value}`);
@@ -821,29 +1048,60 @@ function sendOTLPViaCurl(url, headers, body) {
   args.push(url);
 
   const result = childProcess.spawnSync("curl", args, {
-    encoding: "utf8",
     input: body,
-    maxBuffer: 1024 * 1024,
+    stdio: ["pipe", "pipe", "pipe"],
+    maxBuffer: MAX_OTLP_RESPONSE_BYTES + 4096,
     timeout: 15_000,
   });
 
-  if (result.error) {
+  const interrupted = result.error && "code" in result.error && (result.error.code === "ENOBUFS" || result.error.code === "ETIMEDOUT");
+  if (result.error && !interrupted) {
     throw result.error;
   }
 
-  const status = Number.parseInt((result.stdout || "").trim(), 10);
-  if (Number.isInteger(status)) {
+  const output = Buffer.from(result.stdout || "");
+  // curl writes headers to stdout before each body. Unlike /dev/fd paths, "-"
+  // works with Node's socket-backed stdio on Linux as well as macOS.
+  // Stop at the final response's body: body bytes must never supply a status.
+  let bodyOffset = 0;
+  let headerStatus = 0;
+  while (output.subarray(bodyOffset, bodyOffset + 5).toString() === "HTTP/") {
+    const remaining = output.subarray(bodyOffset).toString("latin1");
+    const header = /^HTTP\/(?:1\.[01]|2|3) ([1-5]\d{2})(?:[ \t][^\r\n]*)?\r?\n(?:[^\r\n]+\r?\n)*\r?\n/.exec(remaining);
+    headerStatus = 0;
+    if (!header) break;
+    bodyOffset += header[0].length;
+    headerStatus = Number(header[1]);
+    if (headerStatus >= 200 && (headerStatus < 300 || headerStatus >= 400)) break;
+    if (headerStatus >= 300 && !/\r?\nlocation:/i.test(header[0])) break;
+    // Informational responses require a final response. curl suppresses
+    // redirect bodies when following Location, leaving the next header here.
+    if (headerStatus < 200) headerStatus = 0;
+  }
+  const responseOutput = output.subarray(bodyOffset);
+  const typeIndex = responseOutput.lastIndexOf("\n");
+  const statusIndex = responseOutput.lastIndexOf("\n", typeIndex - 1);
+  const trailerStatus = responseOutput.subarray(statusIndex + 1, typeIndex < 0 ? undefined : typeIndex).toString();
+  const status = headerStatus || (!interrupted && /^[1-5]\d{2}$/.test(trailerStatus) ? Number(trailerStatus) : 0);
+  const diagnostics = {
+    responseBody: statusIndex < 0 ? Buffer.alloc(0) : responseOutput.subarray(0, statusIndex),
+    contentType: typeIndex < 0 ? "" : responseOutput.subarray(typeIndex + 1).toString(),
+    diagnosticsUnavailable: Boolean(interrupted) || result.status !== 0,
+  };
+  if (status > 0) {
     return {
       ok: status >= 200 && status < 300,
       status,
-      statusText: result.status === 0 ? "OK" : (result.stderr || "curl failed").trim() || "curl failed",
+      statusText: result.status === 0 ? "OK" : (result.stderr || "curl failed").toString().trim() || "curl failed",
+      ...diagnostics,
     };
   }
 
   return {
     ok: false,
     status: 0,
-    statusText: (result.stderr || "curl failed").trim() || "curl failed",
+    statusText: (result.stderr || "curl failed").toString().trim() || "curl failed",
+    ...diagnostics,
   };
 }
 
@@ -858,6 +1116,7 @@ function sendOTLPViaCurl(url, headers, body) {
  * @type {RegExp}
  */
 const SENSITIVE_ATTR_KEY_RE = /token|secret|password|passwd|\bkey\b|auth|credential|api[_-]?key|access[_-]?key/i;
+const SAFE_TOKEN_TYPE_VALUES = new Set(["input", "output", "input_cache_read", "input_cache_write"]);
 
 /**
  * Maximum length (in characters) allowed for a string attribute value.
@@ -872,6 +1131,8 @@ const MAX_ATTR_VALUE_LENGTH = 1024;
  * @type {string}
  */
 const REDACTED = "[REDACTED]";
+
+const FETCH_TIMEOUT_MS = 120_000;
 
 /**
  * Sanitize an array of OTLP key-value attributes in-place (shallowly cloned).
@@ -891,6 +1152,8 @@ function sanitizeAttrs(attrs) {
     const isSensitive = SENSITIVE_ATTR_KEY_RE.test(attr.key);
     const val = attr.value;
     if (typeof val !== "object" || val === null) return attr;
+    if (attr.key === "gen_ai.token.type" && "stringValue" in val && typeof val.stringValue === "string" && SAFE_TOKEN_TYPE_VALUES.has(val.stringValue)) return attr;
+    if (attr.key === OTEL_ATTR_GEN_AI_TOKEN_MODALITY && "stringValue" in val && typeof val.stringValue === "string" && ["text", "image", "audio", "video", "unknown"].includes(val.stringValue)) return attr;
     if (isSensitive && "stringValue" in val) {
       return { key: attr.key, value: { stringValue: REDACTED } };
     }
@@ -912,8 +1175,8 @@ function sanitizeAttrs(attrs) {
  *
  * The original payload object is not mutated; a shallow-clone is returned.
  *
- * @param {object} payload - OTLP traces payload produced by {@link buildOTLPPayload}
- * @returns {object} Sanitized payload suitable for serialisation
+ * @param {any} payload - OTLP traces payload produced by {@link buildOTLPPayload}
+ * @returns {any} Sanitized payload suitable for serialisation
  */
 function sanitizeOTLPPayload(payload) {
   if (!payload || !Array.isArray(payload.resourceSpans)) return payload;
@@ -996,12 +1259,38 @@ function formatOTLPExportFailureMessage(response, reason) {
  */
 
 /**
+ * Normalizes GH_AW_OTLP_IF_MISSING to a supported mode. Mirrors the compiler's
+ * getOTLPIfMissingMode (pkg/workflow/observability_otlp.go) and the equivalent
+ * helper in start_mcp_gateway.cjs so every OTLP consumer applies the same
+ * missing-configuration policy.
+ * @param {string | undefined} value
+ * @returns {"error" | "warn" | "ignore"}
+ */
+function getOTLPIfMissingMode(value) {
+  const normalized = (value || "").trim().toLowerCase();
+  if (normalized === "warn" || normalized === "ignore") {
+    return normalized;
+  }
+  return "error";
+}
+
+/**
  * Resolve the list of configured OTLP endpoints for the current run.
  *
  * Reads `GH_AW_OTLP_ENDPOINTS` (JSON-encoded array produced by the gh-aw
  * compiler for all endpoint configurations, including single-endpoint setups).
  * Returns an empty array when no endpoint is configured, so callers can skip
  * the export step without additional checks.
+ *
+ * When `GH_AW_OTLP_IF_MISSING=ignore` (set only for the enterprise-default
+ * endpoint/headers fallback — see resolveOTLPEndpointEntries in
+ * pkg/workflow/observability_otlp.go), an endpoint with a URL but no headers is
+ * dropped rather than exported unauthenticated. This is the single choke point
+ * used by every span emitter (job-setup, conclusion, outcome, MCP gateway), so
+ * the guard applies uniformly regardless of job ordering — a half-configured
+ * default (endpoint set, headers secret unset) can never leak telemetry before
+ * the agent job's check_otlp_default_credentials.sh step runs, because that
+ * step only runs in one job while this function runs in all of them.
  *
  * @returns {OTLPEndpointEntry[]}
  */
@@ -1011,9 +1300,22 @@ function parseOTLPEndpoints() {
   try {
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed) && parsed.length > 0) {
+      const ignoreMissingCredentials = getOTLPIfMissingMode(process.env.GH_AW_OTLP_IF_MISSING) === "ignore";
       /** @type {OTLPEndpointEntry[]} */
       const valid = parsed
         .filter(e => e && typeof e.url === "string" && e.url.trim() !== "")
+        .filter(e => {
+          const hasHeaders = typeof e.headers === "string" && e.headers !== "";
+          if (hasHeaders && hasEmptyOTLPAuthorizationHeader(e.headers)) {
+            return false;
+          }
+          if (ignoreMissingCredentials && !hasHeaders) {
+            // Enterprise-default endpoint configured without matching credentials:
+            // treat as unconfigured instead of exporting unauthenticated telemetry.
+            return false;
+          }
+          return true;
+        })
         .map(e => ({
           url: e.url,
           ...(typeof e.headers === "string" && e.headers ? { headers: e.headers } : {}),
@@ -1021,7 +1323,7 @@ function parseOTLPEndpoints() {
       return valid;
     }
   } catch {
-    // Invalid JSON — no endpoints available.
+    // Invalid JSON — ignored, no endpoints available.
   }
   return [];
 }
@@ -1034,13 +1336,12 @@ function parseOTLPEndpoints() {
  * caller before invoking this function (pass `skipJSONL: true`).
  *
  * @param {OTLPEndpointEntry[]} endpoints  - Resolved endpoint list from {@link parseOTLPEndpoints}
- * @param {object} payload                 - Serialisable OTLP JSON object
- * @param {{ maxRetries?: number, baseDelayMs?: number, skipJSONL?: boolean }} [opts]
- * @returns {Promise<void>}
+ * @param {any} payload                 - Serialisable OTLP JSON object
+ * @param {{ maxRetries?: number, baseDelayMs?: number, skipJSONL?: boolean, signal?: "traces" | "logs" | "metrics", sanitize?: (payload: any) => any }} [opts]
+ * @returns {Promise<boolean[]>} Per-endpoint export success, in `endpoints` order.
  */
 async function sendOTLPToAllEndpoints(endpoints, payload, opts = {}) {
-  if (endpoints.length === 0) return;
-  await Promise.allSettled(
+  const results = await Promise.allSettled(
     endpoints.map(ep =>
       sendOTLPSpan(ep.url, payload, {
         ...opts,
@@ -1050,10 +1351,12 @@ async function sendOTLPToAllEndpoints(endpoints, payload, opts = {}) {
       })
     )
   );
+  return results.map(result => result.status === "fulfilled" && result.value === true);
 }
 
 /**
- * POST an OTLP traces payload to `{endpoint}/v1/traces` with automatic retries.
+ * POST an OTLP payload with automatic retries. Base endpoints gain the signal path;
+ * Azure Monitor logs use their own stream, not the traces stream.
  *
  * Failures are surfaced as `console.warn` messages and never thrown; OTLP
  * export failures must not break the workflow.  Uses exponential back-off
@@ -1063,29 +1366,65 @@ async function sendOTLPToAllEndpoints(endpoints, payload, opts = {}) {
  * Reads `OTEL_EXPORTER_OTLP_HEADERS` from the environment and merges any
  * configured headers into every request, unless `headersOverride` is provided
  * (used for per-endpoint headers in the multi-endpoint case).
+ * `OTEL_EXPORTER_OTLP_{TRACES,LOGS,METRICS}_PROTOCOL` overrides `OTEL_EXPORTER_OTLP_PROTOCOL`
+ * for the matching signal;
+ * both accept `http/json` (the compatibility default) or `http/protobuf`.
  *
  * @param {string} endpoint  - OTLP base URL (e.g. https://traces.example.com:4317)
- * @param {object} payload   - Serialisable OTLP JSON object
- * @param {{ maxRetries?: number, baseDelayMs?: number, skipJSONL?: boolean, headersOverride?: string }} [opts]
- * @returns {Promise<void>}
+ * @param {any} payload   - Serialisable OTLP JSON object
+ * @param {{ maxRetries?: number, baseDelayMs?: number, skipJSONL?: boolean, headersOverride?: string, signal?: "traces" | "logs" | "metrics", sanitize?: (payload: any) => any }} [opts]
+ * @returns {Promise<boolean>}
  */
-async function sendOTLPSpan(endpoint, payload, { maxRetries = 2, baseDelayMs = 100, skipJSONL = false, headersOverride = undefined } = {}) {
+async function sendOTLPSpan(endpoint, payload, { maxRetries = 2, baseDelayMs = 100, skipJSONL = false, headersOverride = undefined, signal = "traces", sanitize = sanitizeOTLPPayload } = {}) {
+  if (signal === "metrics" && process.env.GH_AW_OTEL_METRICS !== "true") {
+    return false;
+  }
+  const sanitizedPayload = sanitize(payload);
   // Mirror payload locally so it survives even when the collector is unreachable.
   // Callers that already wrote the JSONL mirror pass skipJSONL: true to avoid a
   // duplicate line.
   if (!skipJSONL) {
-    appendToOTLPJSONL(payload);
+    appendToOTLPJSONL(sanitizedPayload);
   }
 
-  const url = endpoint.replace(/\/$/, "") + "/v1/traces";
+  const suffixIndex = endpoint.search(/[?#]/);
+  const base = (suffixIndex < 0 ? endpoint : endpoint.slice(0, suffixIndex)).replace(/\/+$/, "");
+  const suffix = suffixIndex < 0 ? "" : endpoint.slice(suffixIndex);
+  const signalBase = base.replace(/\/v1\/(?:traces|logs|metrics)$/, "");
+  const azureSignal = signal === "metrics" ? "Metrics" : signal === "logs" ? "Logs" : "Traces";
+  const signalBaseForExport = signalBase.replace(/\/streams\/Microsoft-OTLP-(?:Traces|Logs|Metrics)\/otlp$/, () => `/streams/Microsoft-OTLP-${azureSignal}/otlp`);
+  const url = (signal === "traces" ? base + (base.endsWith("/v1/traces") ? "" : "/v1/traces") : signalBaseForExport + `/v1/${signal}`) + suffix;
   // Use headersOverride when explicitly provided (including empty string, which means
   // "this endpoint has no configured headers" in the multi-endpoint fan-out path).
   // Fall back to OTEL_EXPORTER_OTLP_HEADERS only when headersOverride is absent
   // (undefined), which is the legacy single-endpoint case.
   const rawHeaders = headersOverride !== undefined ? headersOverride : process.env.OTEL_EXPORTER_OTLP_HEADERS || "";
   const extraHeaders = parseOTLPHeaders(rawHeaders);
-  const headers = { "Content-Type": "application/json", ...extraHeaders };
-  const sanitizedBody = JSON.stringify(sanitizeOTLPPayload(payload));
+  const signalProtocol = process.env[`OTEL_EXPORTER_OTLP_${signal.toUpperCase()}_PROTOCOL`];
+  const protocol = signalProtocol || process.env.OTEL_EXPORTER_OTLP_PROTOCOL || "http/json";
+  /** @type {string | Buffer} */
+  let sanitizedBody;
+  try {
+    if (protocol === "http/protobuf") {
+      const { encodeOTLPTraceRequest, encodeOTLPLogsRequest, encodeOTLPMetricsRequest } = require("./otlp_protobuf.cjs");
+      const encode = signal === "metrics" ? encodeOTLPMetricsRequest : signal === "logs" ? encodeOTLPLogsRequest : encodeOTLPTraceRequest;
+      sanitizedBody = encode(sanitizedPayload);
+    } else if (protocol === "http/json") {
+      sanitizedBody = JSON.stringify(sanitizedPayload);
+    } else {
+      throw new Error(`Unsupported OTLP ${signal} protocol; use http/json or http/protobuf`);
+    }
+  } catch (err) {
+    const reason = getErrorMessage(err);
+    console.warn(`OTLP export encoding failed: ${reason}`);
+    recordOTLPExportError({ endpoint, reason });
+    return false;
+  }
+  // The content type must describe the encoded body, not a caller header.
+  for (const key of Object.keys(extraHeaders)) {
+    if (key.toLowerCase() === "content-type") delete extraHeaders[key];
+  }
+  const headers = { "Content-Type": protocol === "http/protobuf" ? "application/x-protobuf" : "application/json", ...extraHeaders };
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     if (attempt > 0) {
       await new Promise(resolve => setTimeout(resolve, baseDelayMs * 2 ** (attempt - 1)));
@@ -1097,12 +1436,31 @@ async function sendOTLPSpan(endpoint, payload, { maxRetries = 2, baseDelayMs = 1
             method: "POST",
             headers,
             body: sanitizedBody,
+            signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
           });
       if (response.ok) {
-        return;
+        let diagnostic;
+        try {
+          const bytes = "responseBody" in response ? response.responseBody : await readOTLPResponse(response.body);
+          const contentType = "contentType" in response ? response.contentType : response.headers?.get("content-type") || "";
+          if ("diagnosticsUnavailable" in response && response.diagnosticsUnavailable) throw new Error("Response unavailable");
+          diagnostic = inspectOTLPResponse(bytes, contentType, protocol, signal);
+        } catch {
+          diagnostic = unavailableOTLPResponse(signal);
+        }
+        if (diagnostic.reason) {
+          console.warn(diagnostic.reason);
+          if (diagnostic.error) recordOTLPExportError({ endpoint, status: response.status, reason: diagnostic.reason });
+        }
+        return diagnostic.error !== true;
       }
       const reason = getOTLPExportFailureReason(response);
       const msg = formatOTLPExportFailureMessage(response, reason);
+      if (response.status === 401 || response.status === 403) {
+        console.warn(`OTLP export authorization failed: ${msg}. Check this collector's configured authorization header and write permissions; unchanged credentials will not be retried.`);
+        recordOTLPExportError({ endpoint, status: response.status, reason });
+        return false;
+      }
       if (attempt < maxRetries) {
         console.warn(`OTLP export attempt ${attempt + 1}/${maxRetries + 1} failed: ${msg}, retrying…`);
       } else {
@@ -1123,41 +1481,12 @@ async function sendOTLPSpan(endpoint, payload, { maxRetries = 2, baseDelayMs = 1
       }
     }
   }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
 // High-level: job setup span
 // ---------------------------------------------------------------------------
-
-/**
- * Regular expression that matches a valid OTLP trace ID: 32 lowercase hex characters.
- * @type {RegExp}
- */
-const TRACE_ID_RE = /^[0-9a-f]{32}$/;
-
-/**
- * Validate that a string is a well-formed OTLP trace ID (32 lowercase hex chars).
- * @param {string} id
- * @returns {boolean}
- */
-function isValidTraceId(id) {
-  return TRACE_ID_RE.test(id);
-}
-
-/**
- * Regular expression that matches a valid OTLP span ID: 16 lowercase hex characters.
- * @type {RegExp}
- */
-const SPAN_ID_RE = /^[0-9a-f]{16}$/;
-
-/**
- * Validate that a string is a well-formed OTLP span ID (16 lowercase hex chars).
- * @param {string} id
- * @returns {boolean}
- */
-function isValidSpanId(id) {
-  return SPAN_ID_RE.test(id);
-}
 
 /**
  * @typedef {Object} SendJobSetupSpanOptions
@@ -1233,7 +1562,7 @@ async function sendJobSetupSpan(options = {}) {
   // When this job was dispatched by a parent workflow, the parent's trace ID is
   // propagated via aw_context.otel_trace_id → aw_info.context.otel_trace_id so that
   // composite-action spans share a single trace with their caller.
-  const awInfo = readJSONIfExists("/tmp/gh-aw/aw_info.json") || {};
+  const awInfo = readJSONIfExists(getGhAwPath("aw_info.json")) || {};
   const setupAwContext = parseSetupAwContext(process.env.GH_AW_SETUP_AW_CONTEXT);
   if ((!awInfo.context || typeof awInfo.context !== "object") && Object.keys(setupAwContext).length > 0) {
     awInfo.context = setupAwContext;
@@ -1294,11 +1623,11 @@ async function sendJobSetupSpan(options = {}) {
 
   const attributes = [
     buildAttr("gh-aw.job.name", jobName),
-    buildAttr("gh-aw.workflow.name", workflowName),
-    buildAttr("gh-aw.run.id", runId),
+    buildAttr(OTEL_ATTR_WORKFLOW_NAME, workflowName),
+    buildAttr(OTEL_ATTR_RUN_ID, runId),
     buildAttr("gh-aw.run.attempt", runAttempt),
     buildAttr("gh-aw.run.actor", actor),
-    buildAttr("gh-aw.repository", repository),
+    buildAttr(OTEL_ATTR_REPOSITORY, repository),
   ];
   const runUrlAttr = buildGitHubActionsRunUrlAttribute(repository, runId);
   if (runUrlAttr) {
@@ -1309,9 +1638,11 @@ async function sendJobSetupSpan(options = {}) {
   }
 
   if (engineId) {
-    const genAiSystem = ENGINE_TO_SYSTEM_MAP[engineId] || engineId;
-    attributes.push(buildAttr("gen_ai.system", genAiSystem));
-    attributes.push(buildAttr("gh-aw.engine.id", engineId));
+    if (!isGenAiV1()) {
+      attributes.push(buildAttr("gen_ai.system", ENGINE_TO_SYSTEM_MAP[engineId] || engineId));
+    }
+    attributes.push(buildAttr(OTEL_ATTR_GEN_AI_PROVIDER_NAME, resolveGenAiProvider(engineId)));
+    attributes.push(buildAttr(OTEL_ATTR_ENGINE_ID, engineId));
   }
   if (eventName) {
     attributes.push(buildAttr("gh-aw.event_name", eventName));
@@ -1364,6 +1695,7 @@ async function sendJobSetupSpan(options = {}) {
     awmgVersion,
     staged,
     runAttempt,
+    workflowName,
   });
 
   const payload = buildOTLPPayload({
@@ -1401,13 +1733,47 @@ async function sendJobSetupSpan(options = {}) {
  * file, invalid JSON, permission denied, etc.).
  *
  * @param {string} filePath - Absolute path to the JSON file
- * @returns {object | null}
+ * @returns {any | null}
  */
 function readJSONIfExists(filePath) {
   try {
     return JSON.parse(fs.readFileSync(filePath, "utf8"));
   } catch {
     return null;
+  }
+}
+
+/**
+ * Safely read and parse a JSONL file. Returns an empty array on any error.
+ *
+ * @param {string} filePath - Absolute path to the JSONL file
+ * @returns {any[]}
+ */
+function readJSONLIfExists(filePath) {
+  try {
+    return Array.from(readJsonlFile(filePath));
+  } catch {
+    return [];
+  }
+}
+
+function readDurableParentRunId(runId, runAttempt) {
+  const file = getGhAwPath("agent/durable-session.jsonl");
+  try {
+    const info = fs.lstatSync(file);
+    if (!info.isFile() || info.size > 1024 * 1024 || fs.lstatSync(path.dirname(file)).isSymbolicLink()) throw new Error("Invalid durable session source");
+    let parentRunId;
+    for (const record of iterateJsonl(fs.readFileSync(file, "utf8"), { strict: true })) {
+      if (!isDurableSessionRecord(record)) throw new Error("Invalid durable session metadata");
+      if (record.data.runId !== String(runId) || record.data.runAttempt !== String(runAttempt) || record.type !== "durable.restore" || record.data.status !== "restored") continue;
+      if (parentRunId && parentRunId !== record.data.parentRunId) throw new Error("Conflicting durable session parents");
+      parentRunId = record.data.parentRunId;
+    }
+    return parentRunId;
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+    if (code !== "ENOENT") console.warn("[otlp] Durable session parent unavailable: invalid or unreadable metadata");
+    return undefined;
   }
 }
 
@@ -1430,6 +1796,7 @@ const OTLP_EXPORT_ERRORS_PATH = "/tmp/gh-aw/otlp-export-errors.count";
  * @type {string}
  */
 const OTLP_EXPORT_ERROR_DETAILS_PATH = "/tmp/gh-aw/otlp-export-errors.jsonl";
+const AGENT_EXECUTION_EXIT_CODE_PATH = "/tmp/gh-aw/agent_execution_exit_code.txt";
 
 /**
  * Path to the failure categories file written by handle_agent_failure and read
@@ -1473,10 +1840,8 @@ const PERMISSION_DENIED_RE = /\b(?:permissions?\s+denied(?!\s+counts?\b)|EACCES|
  */
 function readLastRateLimitEntry() {
   try {
-    const content = fs.readFileSync(GITHUB_RATE_LIMITS_JSONL_PATH, "utf8");
-    const entries = parseJsonlContent(content);
-    if (entries.length === 0) return null;
-    const last = entries[entries.length - 1];
+    let last = null;
+    for (const entry of readJsonlFile(GITHUB_RATE_LIMITS_JSONL_PATH)) last = entry;
     // Rate-limit enrichment requires object entries (not primitive values or
     // arrays) so the expected fields can be extracted as attributes.
     return last && typeof last === "object" && !Array.isArray(last) ? last : null;
@@ -1497,6 +1862,25 @@ function readOTLPExportErrorCount() {
     return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
   } catch {
     return 0;
+  }
+}
+
+/**
+ * Read an integer value from a file.
+ *
+ * @param {string} filePath
+ * @returns {number | null}
+ */
+function readIntegerIfExists(filePath) {
+  try {
+    const raw = fs.readFileSync(filePath, "utf8").trim();
+    if (!raw) {
+      return null;
+    }
+    const parsed = parseInt(raw, 10);
+    return Number.isInteger(parsed) ? parsed : null;
+  } catch {
+    return null;
   }
 }
 
@@ -1554,10 +1938,9 @@ function normalizeOTLPExportErrorDetail(detail) {
  */
 function readOTLPExportErrorDetails() {
   try {
-    const content = fs.readFileSync(OTLP_EXPORT_ERROR_DETAILS_PATH, "utf8");
     /** @type {OTLPExportErrorDetail[]} */
     const details = [];
-    for (const parsed of parseJsonlContent(content)) {
+    for (const parsed of readJsonlFile(OTLP_EXPORT_ERROR_DETAILS_PATH)) {
       if (isValidOTLPExportErrorDetail(parsed)) {
         details.push(normalizeOTLPExportErrorDetail(parsed));
       }
@@ -1710,16 +2093,16 @@ function normalizeNonNegativeNumber(rawValue) {
  * Normalize token usage counters from an engine result event usage block.
  *
  * @param {unknown} rawUsage
- * @returns {{input_tokens?: number, output_tokens?: number, cache_read_tokens?: number, cache_write_tokens?: number, ai_credits?: number} | undefined}
+ * @returns {{input_tokens?: number, output_tokens?: number, cache_read_tokens?: number, cache_write_tokens?: number, input_tokens_inclusive?: number, input_tokens_include_cache?: boolean, ai_credits?: number} | undefined}
  */
 function normalizeRuntimeTokenUsage(rawUsage) {
   if (!rawUsage || typeof rawUsage !== "object" || Array.isArray(rawUsage)) {
     return undefined;
   }
 
-  /** @type {{input_tokens?: number, output_tokens?: number, cache_read_tokens?: number, cache_write_tokens?: number, cache_read_input_tokens?: number, cache_creation_input_tokens?: number, ai_credits?: number}} */
+  /** @type {{input_tokens?: number, output_tokens?: number, cache_read_tokens?: number, cache_write_tokens?: number, input_tokens_inclusive?: number, input_tokens_include_cache?: boolean, cache_read_input_tokens?: number, cache_creation_input_tokens?: number, ai_credits?: number}} */
   const usage = rawUsage;
-  /** @type {{input_tokens?: number, output_tokens?: number, cache_read_tokens?: number, cache_write_tokens?: number, ai_credits?: number}} */
+  /** @type {{input_tokens?: number, output_tokens?: number, cache_read_tokens?: number, cache_write_tokens?: number, input_tokens_inclusive?: number, input_tokens_include_cache?: boolean, ai_credits?: number}} */
   const normalized = {};
 
   const inputTokens = normalizeNonNegativeNumber(usage.input_tokens);
@@ -1741,12 +2124,42 @@ function normalizeRuntimeTokenUsage(rawUsage) {
     normalized.cache_write_tokens = cacheWriteTokens;
   }
 
+  const inclusiveInputTokens = normalizeNonNegativeNumber(usage.input_tokens_inclusive);
+  if (typeof inclusiveInputTokens === "number") {
+    normalized.input_tokens_inclusive = inclusiveInputTokens;
+  }
+  if (typeof usage.input_tokens_include_cache === "boolean") {
+    normalized.input_tokens_include_cache = usage.input_tokens_include_cache;
+  }
+
   const aiCredits = normalizeNonNegativeNumber(usage.ai_credits);
   if (typeof aiCredits === "number") {
     normalized.ai_credits = aiCredits;
   }
 
   return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
+/**
+ * Resolve inclusive input tokens when the usage source provides enough cache semantics.
+ * @param {Record<string, any>} usage
+ * @returns {number | undefined}
+ */
+function resolveInclusiveInputTokens(usage) {
+  const input = normalizeNonNegativeNumber(usage.input_tokens);
+  if (typeof input !== "number") return undefined;
+  const cacheRead = normalizeNonNegativeNumber(usage.cache_read_tokens);
+  const cacheWrite = normalizeNonNegativeNumber(usage.cache_write_tokens);
+  if (typeof usage.input_tokens_inclusive === "number" && Number.isFinite(usage.input_tokens_inclusive) && usage.input_tokens_inclusive >= 0) {
+    return usage.input_tokens_inclusive;
+  }
+  if (usage.input_tokens_include_cache === true) return input;
+  if (usage.input_tokens_include_cache === false) {
+    if (typeof cacheRead !== "number" || typeof cacheWrite !== "number") return undefined;
+    return input + cacheRead + cacheWrite;
+  }
+  if (cacheRead === 0 && cacheWrite === 0) return input;
+  return undefined;
 }
 
 /**
@@ -1778,9 +2191,10 @@ function readApiProxySteeringEventCount() {
 /**
  * Read turns, token usage, and warning volume from agent-stdio.log.
  *
+ * @param {string} [engineId]
  * @returns {AgentRuntimeMetrics}
  */
-function readAgentRuntimeMetrics() {
+function readAgentRuntimeMetrics(engineId = "") {
   /** @type {AgentRuntimeMetrics} */
   const metrics = { turns: undefined, stopReason: undefined, resolvedModel: undefined, tokenUsage: undefined, warningCount: 0, permissionDeniedCount: 0, steeringEventCount: readApiProxySteeringEventCount() };
   let fallbackPermissionDeniedCount = 0;
@@ -1788,7 +2202,7 @@ function readAgentRuntimeMetrics() {
 
   try {
     const content = fs.readFileSync(AGENT_STDIO_LOG_PATH, "utf8");
-    const lines = content.split("\n");
+    const codexRecords = engineId.toLowerCase() === "codex" ? collectCodexMixedRecords(content) : null;
 
     const applyRuntimeEntry = parsed => {
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -1827,7 +2241,7 @@ function readAgentRuntimeMetrics() {
       }
     };
 
-    for (const rawLine of lines) {
+    for (const rawLine of iterateLines(content)) {
       const line = rawLine.trim();
       if (!line) {
         continue;
@@ -1839,32 +2253,21 @@ function readAgentRuntimeMetrics() {
       if (PERMISSION_DENIED_RE.test(line)) {
         fallbackPermissionDeniedCount += 1;
       }
-
-      const jsonObjectStart = line.indexOf("{");
-      const jsonArrayStart = line.indexOf("[{");
-      let jsonStart = -1;
-      if (jsonObjectStart >= 0 && jsonArrayStart >= 0) {
-        jsonStart = Math.min(jsonObjectStart, jsonArrayStart);
-      } else if (jsonObjectStart >= 0) {
-        jsonStart = jsonObjectStart;
-      } else {
-        jsonStart = jsonArrayStart;
-      }
-      if (jsonStart < 0) {
-        continue;
-      }
-
-      try {
-        const parsed = JSON.parse(line.slice(jsonStart));
-        if (Array.isArray(parsed)) {
-          for (const entry of parsed) {
-            applyRuntimeEntry(entry);
-          }
-          continue;
-        }
-        applyRuntimeEntry(parsed);
-      } catch {
-        // Ignore non-JSON and truncated log lines.
+    }
+    if (codexRecords) {
+      for (const record of codexRecords) applyRuntimeEntry(record);
+      const session = normalizeCodexSession(codexRecords);
+      applyRuntimeEntry(projectSessionResult(session));
+      const model = observedSessionModel(session);
+      if (model) metrics.resolvedModel = model;
+    } else {
+      for (const parsed of iterateJsonl(content, {
+        lineTransform: line => {
+          const starts = [line.indexOf("{"), line.indexOf("[{")].filter(index => index >= 0);
+          return starts.length ? line.slice(Math.min(...starts)) : line;
+        },
+      })) {
+        for (const entry of Array.isArray(parsed) ? parsed : [parsed]) applyRuntimeEntry(entry);
       }
     }
   } catch {
@@ -1899,8 +2302,8 @@ function readAgentRuntimeMetrics() {
  * - `OTEL_SERVICE_NAME`             – service name (defaults to "gh-aw")
  * - `GH_AW_AIC`                     – total AI Credits for the run
  * - `GH_AW_AGENT_CONCLUSION`        – agent job result ("success", "failure", "timed_out",
- *                                     "cancelled", "skipped"); when "failure" or "timed_out"
- *                                     the span status is set to STATUS_CODE_ERROR (2)
+ *                                     "cancelled", "skipped"); when "failure", "timed_out",
+ *                                     or "cancelled", the span status is STATUS_CODE_ERROR (2)
  * - `GH_AW_DETECTION_CONCLUSION`   – threat-detection scan outcome ("success", "warning",
  *                                     "failure", "skipped"); emitted as
  *                                     `gh-aw.detection.conclusion` when present.
@@ -1932,9 +2335,11 @@ function readAgentRuntimeMetrics() {
  * - `/tmp/gh-aw/agent_usage.json` – per-type token breakdown written by parse_token_usage.cjs;
  *                                    provides `input_tokens`, `output_tokens`,
  *                                    `cache_read_tokens`, and `cache_write_tokens` counters
+ * - `/tmp/gh-aw/usage/graders/grader_results.json` – deterministic grader
+ *                                    summary attributes and per-result span events
  *
  * @param {string} spanName - OTLP span name (e.g. `"gh-aw.job.conclusion"`)
- * @param {{ startMs?: number }} [options]
+ * @param {{ startMs?: number, jobResult?: string }} [options]
  * @returns {Promise<void>}
  */
 async function sendJobConclusionSpan(spanName, options = {}) {
@@ -1942,7 +2347,7 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   const endMs = nowMs();
 
   // Read workflow metadata from aw_info.json (written by the agent job setup step).
-  const awInfo = readJSONIfExists("/tmp/gh-aw/aw_info.json") || {};
+  const awInfo = readJSONIfExists(getGhAwPath("aw_info.json")) || {};
 
   const serviceName = process.env.OTEL_SERVICE_NAME || "gh-aw";
   const version = (typeof awInfo.cli_version === "string" ? awInfo.cli_version : "") || process.env.GH_AW_INFO_CLI_VERSION || awInfo.agent_version || awInfo.version || process.env.GH_AW_INFO_VERSION || process.env.GITHUB_SHA || "unknown";
@@ -1969,7 +2374,8 @@ async function sendJobConclusionSpan(spanName, options = {}) {
 
   const workflowName = awInfo.workflow_name || process.env.GH_AW_INFO_WORKFLOW_NAME || process.env.GITHUB_WORKFLOW || "";
   const engineId = resolveEngineId(awInfo);
-  const model = awInfo.model || "";
+  const modelAttribution = resolveEffectiveModel(getGhAwPath("aw_info.json"), process.env.GH_AW_PHASE || "agent");
+  const model = modelAttribution.model || (modelAttribution.routing ? "" : awInfo.model || "");
   const staged = awInfo.staged === true;
   const itemType = typeof awInfo.context?.item_type === "string" ? awInfo.context.item_type : "";
   const itemNumber = typeof awInfo.context?.item_number === "string" ? awInfo.context.item_number : "";
@@ -1982,6 +2388,8 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   const bodyModified = typeof awInfo.body_modified === "boolean" ? awInfo.body_modified : parseBooleanEnv(process.env.GH_AW_INFO_BODY_MODIFIED);
   const trackerId = process.env.GH_AW_TRACKER_ID || awInfo.tracker_id || "";
   const jobName = resolveConclusionJobName(spanName);
+  const optIn = isGenAiV1();
+  const modelRoutingSummary = jobName === "agent" ? resolveModelRoutingSummary({ infoPath: getGhAwPath("aw_info.json"), ghAwDir: getGhAwPath("") }) : null;
   const jobEmitsOwnTokenUsage = jobName === "agent" || jobName === "detection" || (!!engineId && jobName === engineId);
   const runId = process.env.GITHUB_RUN_ID || "";
   const runAttempt = awInfo.run_attempt || process.env.GITHUB_RUN_ATTEMPT || "1";
@@ -2009,19 +2417,21 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   // needs.detection.outputs.* in downstream jobs (conclusion, safe_outputs, etc.).
   const detectionConclusion = process.env.GH_AW_DETECTION_CONCLUSION || "";
   const detectionReason = process.env.GH_AW_DETECTION_REASON || "";
-  const runtimeMetrics = readAgentRuntimeMetrics();
+  const jobResult = options.jobResult || (jobName === "detection" ? detectionConclusion : "");
+  const runtimeMetrics = readAgentRuntimeMetrics(engineId);
   // Read once and reuse for both gh-aw.aic and gen_ai.usage.* attributes.
-  const agentUsageFilePath = "/tmp/gh-aw/agent_usage.json";
+  const agentUsageFilePath = jobName === "detection" ? "/tmp/gh-aw/threat-detection/detection_usage.json" : "/tmp/gh-aw/agent_usage.json";
   const agentUsageRaw = readJSONIfExists(agentUsageFilePath);
   const agentUsageNormalized = normalizeRuntimeTokenUsage(agentUsageRaw);
-  const agentUsage = agentUsageNormalized || runtimeMetrics.tokenUsage || {};
+  // Detection uses its own counters and must not inherit usage from downloaded agent logs.
+  const agentUsage = jobName === "detection" ? (detectionConclusion === "skipped" ? {} : agentUsageNormalized || {}) : agentUsageNormalized || runtimeMetrics.tokenUsage || {};
   // Mark the span as an error when the agent job failed, timed out, or was cancelled.
   const isAgentTimedOut = agentConclusion === "timed_out";
   const isAgentFailure = agentConclusion === "failure" || isAgentTimedOut;
   const isAgentCancelled = agentConclusion === "cancelled";
   const isAgentNonOK = isAgentFailure || isAgentCancelled;
   // STATUS_CODE_ERROR = 2, STATUS_CODE_OK = 1
-  let statusCode = isAgentNonOK ? 2 : 1;
+  let statusCode = isAgentNonOK ? 2 : optIn ? 0 : 1;
   let statusMessage;
   if (isAgentFailure) {
     statusMessage = `agent ${agentConclusion}`;
@@ -2037,6 +2447,8 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   const outputErrors = Array.isArray(agentOutput.errors) ? agentOutput.errors : [];
   const outputItems = Array.isArray(agentOutput.items) ? agentOutput.items : [];
   const errorMessages = outputErrors.map(getErrorMessage).filter(Boolean).slice(0, 5);
+  const agentExecutionExitCode = readIntegerIfExists(AGENT_EXECUTION_EXIT_CODE_PATH);
+  const hasAgentExecutionFailureExitCode = Number.isInteger(agentExecutionExitCode) && agentExecutionExitCode !== 0;
   const warningCount = runtimeMetrics.warningCount + (detectionConclusion === "warning" ? 1 : 0);
   const workflowRunConclusion = (typeof awInfo.workflow_run_conclusion === "string" ? awInfo.workflow_run_conclusion : "") || (typeof awInfo.context?.workflow_run_conclusion === "string" ? awInfo.context.workflow_run_conclusion : "");
 
@@ -2055,17 +2467,28 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   // When GH_AW_AGENT_CONCLUSION and workflowRunConclusion are both absent (e.g. in the
   // agent job's own post-step where needs.<job>.result is not yet visible), fall back to
   // observable failure evidence so gh-aw.run.status and status.code are accurate.
-  if (!rawRunStatus && outputErrors.length > 0) {
+  if (!rawRunStatus && hasAgentExecutionFailureExitCode) {
+    runStatus = "failure";
+    statusCode = 2;
+    statusMessage = `copilot cli exited with code ${agentExecutionExitCode}`;
+  } else if (!rawRunStatus && outputErrors.length > 0) {
     runStatus = "failure";
     statusCode = 2;
     statusMessage = (errorMessages.length > 0 ? `errors detected: ${errorMessages[0]}` : "errors detected").slice(0, 256);
   }
+  // Only the agent job's own run status reflects its result; other jobs leave the
+  // job result unset rather than inheriting the agent/run outcome.
+  const metricJobConclusion = jobResult || (jobName === "agent" ? (runStatus === "timeout" ? "timed_out" : runStatus) : "");
 
   if (isAgentFailure && errorMessages.length > 0) {
     statusMessage = `agent ${agentConclusion}: ${errorMessages[0]}`.slice(0, 256);
   }
 
-  const attributes = [buildAttr("gh-aw.workflow.name", workflowName), buildAttr("gh-aw.run.id", runId), buildAttr("gh-aw.run.attempt", runAttempt), buildAttr("gh-aw.run.actor", actor), buildAttr("gh-aw.repository", repository)];
+  const attributes = [buildAttr(OTEL_ATTR_WORKFLOW_NAME, workflowName), buildAttr(OTEL_ATTR_RUN_ID, runId), buildAttr("gh-aw.run.attempt", runAttempt), buildAttr("gh-aw.run.actor", actor), buildAttr(OTEL_ATTR_REPOSITORY, repository)];
+  if (jobName === "agent") {
+    const durableParentRunId = readDurableParentRunId(runId, runAttempt);
+    if (durableParentRunId) attributes.push(buildAttr("gh-aw.durable.parent_run_id", durableParentRunId));
+  }
   const runUrlAttr = buildGitHubActionsRunUrlAttribute(repository, runId);
   if (runUrlAttr) {
     attributes.push(runUrlAttr);
@@ -2076,17 +2499,86 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   attributes.push(buildAttr("gh-aw.run.status", runStatus));
   attributes.push(buildAttr("gh-aw.error_count", outputErrors.length));
   attributes.push(buildAttr("gh-aw.warning_count", warningCount));
+  if (typeof agentExecutionExitCode === "number" && Number.isInteger(agentExecutionExitCode)) {
+    attributes.push(buildAttr("gh-aw.agent.execution.exit_code", agentExecutionExitCode));
+  }
   attributes.push(buildAttr("gh-aw.permission_denied_count", runtimeMetrics.permissionDeniedCount));
   attributes.push(buildAttr("gh-aw.steering_event_count", runtimeMetrics.steeringEventCount));
   attributes.push(buildAttr("gh-aw.action_minutes", Math.max(0, endMs - startMs) / 60000));
 
+  // The compact usage summary is assembled by the conclusion job before its
+  // setup action post-step emits this run-level span.
+  if (jobName === "conclusion") {
+    const usageActivity = readJSONIfExists("/tmp/gh-aw/usage/activity/summary.json");
+    for (const [attributeName, sectionName, fieldName] of [
+      ["gh-aw.integrity.filtered_events", "integrity", "total_filtered"],
+      ["gh-aw.firewall.requests", "firewall", "total_requests"],
+      ["gh-aw.firewall.allowed_requests", "firewall", "allowed_requests"],
+      ["gh-aw.firewall.blocked_requests", "firewall", "blocked_requests"],
+      ["gh-aw.mcp.tool_calls", "gateway", "total_calls"],
+      ["gh-aw.mcp.failed_tool_calls", "gateway", "failed_calls"],
+      ["gh-aw.mcp.input_bytes", "gateway", "total_input_size"],
+      ["gh-aw.mcp.max_input_bytes", "gateway", "max_input_size"],
+      ["gh-aw.mcp.output_bytes", "gateway", "total_output_size"],
+      ["gh-aw.mcp.max_output_bytes", "gateway", "max_output_size"],
+    ]) {
+      const value = usageActivity?.[sectionName]?.[fieldName];
+      if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+        attributes.push(buildAttr(attributeName, value));
+      }
+    }
+    const workingSet = usageActivity?.working_set;
+    const measurementState = workingSet?.measurement_state;
+    if (measurementState === "measured" || measurementState === "partial" || measurementState === "unavailable") {
+      attributes.push(buildAttr("gh-aw.working_set.measurement_state", measurementState));
+      if (measurementState !== "unavailable") {
+        if (typeof workingSet.rebuild_factor === "number" && Number.isFinite(workingSet.rebuild_factor)) {
+          attributes.push(buildDoubleAttr("gh-aw.working_set.rebuild_factor", workingSet.rebuild_factor));
+        }
+        for (const [attributeName, fieldName] of [
+          ["gh-aw.working_set.cumulative_input_tokens", "cumulative_input_tokens"],
+          ["gh-aw.working_set.peak_input_tokens", "peak_input_tokens"],
+          ["gh-aw.working_set.rebuild_excess_tokens", "rebuild_excess_tokens"],
+          ["gh-aw.working_set.invocations", "invocations"],
+        ]) {
+          const value = workingSet[fieldName];
+          // Use the same finite-number acceptance as buildAttr's own encoding
+          // logic (rather than Number.isSafeInteger) so that legitimate large
+          // token counters from high-volume runs are still emitted -
+          // buildAttr already falls back to doubleValue for values that
+          // exceed safe-integer precision instead of dropping them.
+          if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+            attributes.push(buildAttr(attributeName, value));
+          }
+        }
+      }
+    }
+  }
+
   if (jobName) attributes.push(buildAttr("gh-aw.job.name", jobName));
   if (engineId) {
-    const genAiSystem = ENGINE_TO_SYSTEM_MAP[engineId] || engineId;
-    attributes.push(buildAttr("gen_ai.system", genAiSystem));
-    attributes.push(buildAttr("gh-aw.engine.id", engineId));
+    if (!optIn) attributes.push(buildAttr("gen_ai.system", ENGINE_TO_SYSTEM_MAP[engineId] || engineId));
+    attributes.push(buildAttr(OTEL_ATTR_GEN_AI_PROVIDER_NAME, resolveGenAiProvider(engineId)));
+    attributes.push(buildAttr(OTEL_ATTR_ENGINE_ID, engineId));
   }
   if (model) attributes.push(buildAttr("gen_ai.request.model", model));
+  if (modelAttribution.routing) {
+    if (modelAttribution.requestedModel) attributes.push(buildAttr("gh-aw.model.requested", modelAttribution.requestedModel));
+    if (modelAttribution.effort) attributes.push(buildAttr("gh-aw.model.effort", modelAttribution.effort));
+  }
+  if (modelRoutingSummary) {
+    attributes.push(buildAttr("gh-aw.model_routing.status", modelRoutingSummary.status));
+    if (modelRoutingSummary.mode) attributes.push(buildAttr("gh-aw.model_routing.mode", modelRoutingSummary.mode));
+    if (modelRoutingSummary.router_version) attributes.push(buildAttr("gh-aw.model_routing.router_version", modelRoutingSummary.router_version));
+    if (modelRoutingSummary.failure_code) attributes.push(buildAttr("gh-aw.model_routing.failure_code", modelRoutingSummary.failure_code));
+    if (modelRoutingSummary.objective) attributes.push(buildAttr("gh-aw.model_routing.objective", modelRoutingSummary.objective));
+    if (modelRoutingSummary.task_type) attributes.push(buildAttr("gh-aw.model_routing.task_type", modelRoutingSummary.task_type));
+    if (modelRoutingSummary.scope) attributes.push(buildAttr("gh-aw.model_routing.scope", modelRoutingSummary.scope));
+    if (modelRoutingSummary.complexity) attributes.push(buildAttr("gh-aw.model_routing.complexity", modelRoutingSummary.complexity));
+    if (typeof modelRoutingSummary.degraded === "boolean") attributes.push(buildAttr("gh-aw.model_routing.degraded", modelRoutingSummary.degraded));
+    if (typeof modelRoutingSummary.classifier_aic === "number") attributes.push(buildDoubleAttr("gh-aw.model_routing.classifier_aic", modelRoutingSummary.classifier_aic));
+    if (typeof modelRoutingSummary.deviated_requests === "number") attributes.push(buildAttr("gh-aw.model_routing.deviated_requests", modelRoutingSummary.deviated_requests));
+  }
   if (trackerId) attributes.push(buildAttr("gh-aw.tracker.id", trackerId));
   if (eventName) attributes.push(buildAttr("gh-aw.event_name", eventName));
   // Deployment state: prefer the env var (set from github.event.deployment_status.state
@@ -2113,37 +2605,39 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   // Ranked AIC sources: env var → non-zero file → engine metrics → file (may be zero).
   // When the firewall proxy writes ai_credits=0 to agent_usage.json, the engine result
   // event (from agent-stdio.log) is tried next so its non-zero value is not lost.
-  // For jobs that own token usage (agent, detection, engine), gh-aw.aic is ALWAYS
-  // emitted as a numeric attribute — defaulting to 0 when no data is available.
-  // This guarantees Sentry EAP infers the field as numeric (not string) so that
-  // sum()/avg()/percentile() aggregations work without manual schema configuration,
-  // and Tempo indexes it so { span."gh-aw.aic" > 0 } is queryable immediately.
+  // Missing cost data must remain unknown, not a synthetic zero. Explicit zero
+  // values remain numeric so consumers can distinguish them from absent data.
   const aiCreditsFromEnv = normalizeNonNegativeNumber(process.env.GH_AW_AIC);
-  const aiCreditsFromFile = agentUsage.ai_credits;
-  const aiCreditsFromMetrics = runtimeMetrics.tokenUsage?.ai_credits;
-  const aiCredits = jobEmitsOwnTokenUsage ? (aiCreditsFromEnv ?? ((aiCreditsFromFile ?? 0) > 0 ? aiCreditsFromFile : (aiCreditsFromMetrics ?? aiCreditsFromFile ?? 0))) : undefined;
-  if (typeof aiCredits === "number") {
-    // Always encode gh-aw.aic as doubleValue (not intValue) so that Sentry EAP
-    // infers the field schema as float on first emission, enabling sum()/avg()/
-    // percentile() aggregations even when the value is 0 (an integer in JS).
-    attributes.push(buildDoubleAttr("gh-aw.aic", aiCredits));
-  }
+  // Detection may download agent artifacts even when its own scan is skipped.
+  // Only its job-local env value can establish detection's cost.
+  const aiCreditsFromFile = jobName === "detection" ? undefined : agentUsage.ai_credits;
+  const aiCreditsFromMetrics = jobName === "detection" ? undefined : runtimeMetrics.tokenUsage?.ai_credits;
+  const aiCredits = jobEmitsOwnTokenUsage ? (aiCreditsFromEnv ?? ((aiCreditsFromFile ?? 0) > 0 ? aiCreditsFromFile : (aiCreditsFromMetrics ?? aiCreditsFromFile))) : undefined;
   if (typeof runtimeMetrics.turns === "number") {
     attributes.push(buildAttr("gh-aw.turns", runtimeMetrics.turns));
   }
+  /** GenAI attributes that describe the agent invocation (spec §9.5). */
+  const agentGenAiAttrs = [];
+  let agentErrorType = "";
   if (jobName === "agent") {
     // Emit OTel GenAI semantic attributes on agent conclusion spans even when the
     // dedicated agent sub-span is missing, so LLM activity remains discoverable.
-    attributes.push(buildAttr("gen_ai.operation.name", "chat"));
-    if (workflowName) attributes.push(buildAttr("gen_ai.workflow.name", workflowName));
-    if (runtimeMetrics.resolvedModel) attributes.push(buildAttr("gen_ai.response.model", runtimeMetrics.resolvedModel));
+    agentGenAiAttrs.push(buildAttr("gen_ai.operation.name", optIn ? "invoke_agent" : "chat"));
+    if (workflowName) {
+      agentGenAiAttrs.push(buildAttr(OTEL_ATTR_GEN_AI_AGENT_NAME, workflowName));
+      if (!optIn) agentGenAiAttrs.push(buildAttr("gen_ai.workflow.name", workflowName));
+    }
+    if (runtimeMetrics.resolvedModel) agentGenAiAttrs.push(buildAttr("gen_ai.response.model", runtimeMetrics.resolvedModel));
     // Use the engine-reported stop_reason when available; fall back to "timeout" when
     // the agent was killed before it could write a result entry to agent-stdio.log;
     // use "unknown" as a sentinel for engines (e.g. copilot, codex) that do not emit
     // a result entry at all, so that gen_ai.response.finish_reasons is always present
     // and length-truncation is always queryable in Sentry/dashboards.
     const effectiveStopReason = runtimeMetrics.stopReason || (isAgentTimedOut ? "timeout" : "unknown");
-    attributes.push(buildArrayAttr("gen_ai.response.finish_reasons", [effectiveStopReason]));
+    agentGenAiAttrs.push(buildArrayAttr("gen_ai.response.finish_reasons", [effectiveStopReason]));
+    const hasInferredAgentFailure = !rawRunStatus && (hasAgentExecutionFailureExitCode || outputErrors.length > 0);
+    agentErrorType = isAgentTimedOut ? "timeout" : isAgentCancelled ? "cancelled" : isAgentFailure || hasInferredAgentFailure ? "agent_failed" : "";
+    if (agentErrorType) agentGenAiAttrs.push(buildAttr(OTEL_ATTR_ERROR_TYPE, agentErrorType));
   }
 
   if (agentConclusion) {
@@ -2209,23 +2703,8 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   // Append user-defined custom attributes from observability.otlp.attributes.
   attributes.push(...buildCustomOTLPAttributes());
 
-  // Enrich conclusion span with outcome evaluation fleet metrics when available.
-  // Written by the outcome-collector workflow's pre-agent step.
-  const outcomeSummary = readJSONIfExists("/tmp/gh-aw/outcome-summary.json");
-  if (outcomeSummary && typeof outcomeSummary.total_outcomes === "number" && outcomeSummary.total_outcomes > 0) {
-    attributes.push(buildAttr("gh-aw.outcome.total", outcomeSummary.total_outcomes));
-    attributes.push(buildAttr("gh-aw.outcome.accepted", outcomeSummary.accepted || 0));
-    attributes.push(buildAttr("gh-aw.outcome.rejected", outcomeSummary.rejected || 0));
-    attributes.push(buildAttr("gh-aw.outcome.pending", outcomeSummary.pending || 0));
-    attributes.push(buildAttr("gh-aw.outcome.ignored", outcomeSummary.ignored || 0));
-    attributes.push(buildAttr("gh-aw.outcome.runs_checked", outcomeSummary.runs_checked || 0));
-    if (typeof outcomeSummary.acceptance_rate === "number") {
-      attributes.push(buildAttr("gh-aw.outcome.acceptance_rate", outcomeSummary.acceptance_rate));
-    }
-    if (typeof outcomeSummary.waste_rate === "number") {
-      attributes.push(buildAttr("gh-aw.outcome.waste_rate", outcomeSummary.waste_rate));
-    }
-  }
+  const graderTelemetry = buildGraderTelemetry(selectGraderOutputForJob(jobName), endMs);
+  const evalTelemetry = jobName === "evals" ? buildEvalTelemetry(readJSONLIfExists("/tmp/gh-aw/evals.jsonl"), endMs, readEvalsNotEvaluatedStatus()) : { attributes: [], events: [] };
 
   const resourceAttributes = buildGitHubActionsResourceAttributes({
     repository,
@@ -2246,6 +2725,7 @@ async function sendJobConclusionSpan(spanName, options = {}) {
     awmgVersion,
     staged,
     runAttempt,
+    workflowName,
   });
   // OpenTelemetry semantic convention for exceptions.  Each event has
   // name="exception" with "exception.type" and "exception.message" attributes,
@@ -2285,7 +2765,7 @@ async function sendJobConclusionSpan(spanName, options = {}) {
       });
   };
 
-  const spanEvents = buildSpanEvents(endMs);
+  const spanEvents = [...buildSpanEvents(endMs), ...graderTelemetry.events, ...evalTelemetry.events];
 
   // Prefer the timestamp written at the very beginning of the Execute Agent CLI step
   // (captures true step start on the host, before the AWF container launches) so the
@@ -2301,6 +2781,7 @@ async function sendJobConclusionSpan(spanName, options = {}) {
       return options.startMs;
     }
   })();
+  /** @type {any} */
   let agentEndMs = null;
   try {
     agentEndMs = fs.statSync("/tmp/gh-aw/agent_output.json").mtimeMs;
@@ -2320,30 +2801,48 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   // When no agent span is emitted the attributes fall through to the conclusion span
   // so a single query is still sufficient for observability.
   const usageAttrs = [];
-  if (typeof agentUsage.input_tokens === "number" && agentUsage.input_tokens > 0) {
+  const harnessRetry = jobEmitsOwnTokenUsage ? normalizeHarnessRetryRecord(readJSONIfExists(getGhAwPath(jobName === "detection" ? "threat-detection/detection_harness_retry.json" : "agent/harness_retry.json"))) : undefined;
+  if (harnessRetry) {
+    const retryReasons = harnessRetry.attemptResults.flatMap(attempt => attempt.failureClasses);
+    usageAttrs.push(buildAttr("gh-aw.harness.attempts", harnessRetry.attempts));
+    usageAttrs.push(buildArrayAttr("gh-aw.harness.retry_reasons", retryReasons));
+  }
+  if (typeof aiCredits === "number") {
+    usageAttrs.push(buildDoubleAttr("gh-aw.aic", aiCredits));
+  }
+  const inclusiveInputTokens = resolveInclusiveInputTokens(agentUsage);
+  if (optIn) {
+    if (typeof inclusiveInputTokens === "number") usageAttrs.push(buildAttr("gen_ai.usage.input_tokens", inclusiveInputTokens));
+  } else if (typeof agentUsage.input_tokens === "number") {
     usageAttrs.push(buildAttr("gen_ai.usage.input_tokens", agentUsage.input_tokens));
   }
-  if (typeof agentUsage.output_tokens === "number" && agentUsage.output_tokens > 0) {
+  if (typeof agentUsage.output_tokens === "number") {
     usageAttrs.push(buildAttr("gen_ai.usage.output_tokens", agentUsage.output_tokens));
   }
-  if (typeof agentUsage.cache_read_tokens === "number" && agentUsage.cache_read_tokens > 0) {
+  if (typeof agentUsage.cache_read_tokens === "number") {
     usageAttrs.push(buildAttr("gen_ai.usage.cache_read.input_tokens", agentUsage.cache_read_tokens));
   }
-  if (typeof agentUsage.cache_write_tokens === "number" && agentUsage.cache_write_tokens > 0) {
-    usageAttrs.push(buildAttr("gen_ai.usage.cache_creation.input_tokens", agentUsage.cache_write_tokens));
+  if (typeof agentUsage.cache_write_tokens === "number") {
+    usageAttrs.push(buildAttr(OTEL_ATTR_GEN_AI_USAGE_CACHE_WRITE_INPUT_TOKENS, agentUsage.cache_write_tokens));
+    if (!optIn) usageAttrs.push(buildAttr("gen_ai.usage.cache_creation.input_tokens", agentUsage.cache_write_tokens));
   }
-  // Emit gen_ai.usage.total_tokens as the sum of input and output so OTel GenAI
-  // semantic-convention aggregations (e.g. sum(gen_ai.usage.total_tokens)) work
-  // without per-backend normalization. Cache tokens are excluded from the total
-  // to match the OpenTelemetry GenAI spec definition of "total tokens consumed".
-  const totalTokens = (typeof agentUsage.input_tokens === "number" ? agentUsage.input_tokens : 0) + (typeof agentUsage.output_tokens === "number" ? agentUsage.output_tokens : 0);
-  if (totalTokens > 0) {
-    usageAttrs.push(buildAttr("gen_ai.usage.total_tokens", totalTokens));
+  // gen_ai.usage.total_tokens is a gh-aw compatibility attribute that is not part
+  // of the OpenTelemetry GenAI conventions. Cache tokens are excluded.
+  if (!optIn && typeof agentUsage.input_tokens === "number" && typeof agentUsage.output_tokens === "number") {
+    const totalTokens = agentUsage.input_tokens + agentUsage.output_tokens;
+    if (Number.isFinite(totalTokens)) {
+      usageAttrs.push(buildAttr("gen_ai.usage.total_tokens", totalTokens));
+    }
   }
 
   const endpoints = parseOTLPEndpoints();
   const conclusionSpanId = generateSpanId();
   const hasDedicatedAgentSpan = jobName === "agent" && typeof agentStartMs === "number" && agentStartMs > 0 && typeof agentEndMs === "number" && agentEndMs > agentStartMs;
+  if (!optIn || !hasDedicatedAgentSpan) {
+    attributes.push(...agentGenAiAttrs);
+  } else if (agentErrorType) {
+    attributes.push(buildAttr(OTEL_ATTR_ERROR_TYPE, agentErrorType));
+  }
   if (hasDedicatedAgentSpan && typeof agentEndMs === "number") {
     const agentSpanEndMs = agentEndMs;
     const agentSpanEvents = buildSpanEvents(agentSpanEndMs);
@@ -2353,15 +2852,13 @@ async function sendJobConclusionSpan(spanName, options = {}) {
     // LLM dashboards in Grafana, Datadog, and Honeycomb without custom mappings.
     // Token-usage attributes are included here (and only here) to prevent
     // double-counting with the conclusion span.
-    const agentAttributes = [...attributes, ...usageAttrs];
-    // gen_ai.operation.name / gen_ai.workflow.name / gen_ai.response.finish_reasons
-    // are already included via the shared attributes list above.
+    const agentAttributes = [...attributes, ...(optIn ? agentGenAiAttrs.filter(attr => attr.key !== OTEL_ATTR_ERROR_TYPE) : []), ...usageAttrs];
 
     const agentPayload = buildOTLPPayload({
       traceId,
       spanId: generateSpanId(),
-      parentSpanId: conclusionSpanId,
-      spanName: jobName ? `gh-aw.${jobName}.agent` : "gh-aw.job.agent",
+      ...(optIn ? (parentSpanId ? { parentSpanId } : {}) : { parentSpanId: conclusionSpanId }),
+      spanName: optIn ? (workflowName ? `invoke_agent ${workflowName}` : "invoke_agent") : jobName ? `gh-aw.${jobName}.agent` : "gh-aw.job.agent",
       startMs: agentStartMs,
       endMs: agentSpanEndMs,
       serviceName,
@@ -2371,13 +2868,19 @@ async function sendJobConclusionSpan(spanName, options = {}) {
       statusCode,
       statusMessage,
       events: agentSpanEvents,
-      kind: SPAN_KIND_CLIENT,
+      kind: optIn ? SPAN_KIND_INTERNAL : SPAN_KIND_CLIENT,
     });
     appendToOTLPJSONL(agentPayload);
     if (endpoints.length > 0) {
       await sendOTLPToAllEndpoints(endpoints, agentPayload, { skipJSONL: true });
     }
   }
+
+  // Grader results are run-level outcomes. They belong only on the agent job's
+  // conclusion span, rather than its dedicated child span or downstream jobs
+  // which may have downloaded the agent artifact.
+  attributes.push(...graderTelemetry.attributes);
+  attributes.push(...evalTelemetry.attributes);
 
   // Only attach token-usage attributes to jobs that actually executed model usage.
   // Most downstream jobs (conclusion, safe_outputs) may have agent_usage.json on
@@ -2418,15 +2921,77 @@ async function sendJobConclusionSpan(spanName, options = {}) {
   // Always mirror to JSONL — the artifact is useful even without a live collector.
   appendToOTLPJSONL(payload);
 
-  if (endpoints.length === 0) {
-    return;
+  if (endpoints.length > 0) {
+    // Pass skipJSONL: true so sendOTLPToAllEndpoints/sendOTLPSpan don't double-write the mirror.
+    await sendOTLPToAllEndpoints(endpoints, payload, { skipJSONL: true });
   }
 
-  // Pass skipJSONL: true so sendOTLPToAllEndpoints/sendOTLPSpan don't double-write the mirror.
-  await sendOTLPToAllEndpoints(endpoints, payload, { skipJSONL: true });
+  if (process.env.GH_AW_OTEL_METRICS === "true") {
+    try {
+      const { buildBuiltinRunMetrics, buildOTLPMetricsPayload, sendOTLPMetrics, flushCustomMetrics, getUnreportedOTLPMetricFailures } = require("./otlp_metrics.cjs");
+      await flushCustomMetrics();
+      const gatewayMetrics = jobName === "conclusion" ? readJSONIfExists("/tmp/gh-aw/usage/activity/summary.json")?.gateway : undefined;
+      const metricAttributes = [
+        ...(eventName ? [buildAttr("github.event_name", eventName)] : []),
+        ...(job ? [buildAttr("github.job", job)] : []),
+        ...(repository ? [buildAttr(OTEL_ATTR_REPOSITORY, repository)] : []),
+        ...(workflowName ? [buildAttr(OTEL_ATTR_WORKFLOW_NAME, workflowName)] : []),
+        ...(engineId ? [buildAttr(OTEL_ATTR_ENGINE_ID, engineId)] : []),
+      ];
+      const metricVersion =
+        (typeof awInfo.cli_version === "string" ? awInfo.cli_version : "") ||
+        process.env.GH_AW_INFO_CLI_VERSION ||
+        (typeof awInfo.agent_version === "string" ? awInfo.agent_version : "") ||
+        (typeof awInfo.version === "string" ? awInfo.version : "") ||
+        "unknown";
+      const runConclusion = agentConclusion || (runStatus === "timeout" ? "timed_out" : runStatus);
+      const metrics = buildBuiltinRunMetrics({
+        jobName,
+        workflow: workflowName,
+        engine: engineId,
+        model,
+        jobConclusion: metricJobConclusion,
+        runConclusion,
+        startMs,
+        endMs,
+        inputTokens: agentUsage.input_tokens,
+        outputTokens: agentUsage.output_tokens,
+        cacheReadTokens: agentUsage.cache_read_tokens,
+        cacheWriteTokens: agentUsage.cache_write_tokens,
+        provider: engineId ? resolveGenAiProvider(engineId) : "",
+        inclusiveInputTokens,
+        agentName: jobName === "agent" ? workflowName : "",
+        agentDurationSeconds: hasDedicatedAgentSpan ? (agentEndMs - agentStartMs) / 1000 : undefined,
+        agentErrorType,
+        semconvLatest: optIn,
+        emitsTokenUsage: jobEmitsOwnTokenUsage,
+        turns: jobName === "agent" ? runtimeMetrics.turns : undefined,
+        toolCalls: gatewayMetrics?.total_calls,
+        failedToolCalls: gatewayMetrics?.failed_calls,
+        outputItemTypes: jobName === "conclusion" ? rawItemTypes : [],
+        maxAICreditsExceeded: maxAICreditsExceeded === true,
+        aiCreditsRateLimitError: aiCreditsRateLimitError === true,
+        exportFailures: getUnreportedOTLPMetricFailures(),
+        traceContext: { traceId, spanId: conclusionSpanId },
+      });
+      await sendOTLPMetrics(
+        buildOTLPMetricsPayload({
+          serviceName,
+          scopeVersion: metricVersion,
+          resourceAttributes: metricAttributes,
+          metrics,
+        }),
+        { traceId, spanId: conclusionSpanId }
+      );
+    } catch {
+      console.warn("[otlp] failed to emit built-in metrics");
+    }
+  }
 }
 
 module.exports = {
+  buildTraceparent,
+  buildServiceRequestHeaders,
   SPAN_KIND_INTERNAL,
   SPAN_KIND_SERVER,
   SPAN_KIND_CLIENT,
@@ -2445,13 +3010,17 @@ module.exports = {
   buildOTLPBatchPayload,
   buildOTLPBatchPayloads,
   buildOTLPPayload,
+  buildOTLPResourceAttributes,
   sanitizeOTLPPayload,
+  sanitizeAttrs,
+  parseOTELResourceAttributes,
   parseOTLPHeaders,
   parseOTLPEndpoints,
   sendOTLPSpan,
   sendOTLPToAllEndpoints,
   hasProxyConfigured,
   readJSONIfExists,
+  readOTLPExportErrorCount,
   readLastRateLimitEntry,
   buildCurrentWorkflowCallId,
   buildEpisodeAttributesFromContext,
@@ -2463,6 +3032,13 @@ module.exports = {
   OTEL_JSONL_PATH,
   appendToOTLPJSONL,
   buildExperimentAttributes,
+  buildGraderTelemetry,
+  selectGraderOutputForJob,
+  buildEvalTelemetry,
   parseOTLPCustomAttributes,
   buildCustomOTLPAttributes,
+  resolveGenAiProvider,
+  isGenAiV1,
+  GEN_AI_SCHEMA_URL,
+  resolveInclusiveInputTokens,
 };

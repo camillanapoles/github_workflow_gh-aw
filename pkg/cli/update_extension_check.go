@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -45,7 +46,15 @@ const backupCleanupRetryDelay = 300 * time.Millisecond
 // baked in. The caller should re-launch the freshly-installed binary (at
 // installPath) so that subsequent work (e.g. lock-file compilation) uses the
 // correct new version string.
-func upgradeExtensionIfOutdated(verbose bool, includePrereleases bool) (bool, string, error) {
+func upgradeExtensionIfOutdated(ctx context.Context, verbose bool, includePrereleases bool) (upgraded bool, installPath string, runErr error) {
+	var targetVersion string
+	currentVersionBefore := GetVersion()
+	defer func() {
+		if upgraded && runErr == nil {
+			runErr = emitUpdateEvent(ctx, updateJSONLEvent{Event: "change", Kind: "extension",
+				Operation: "modified", Before: currentVersionBefore, After: targetVersion})
+		}
+	}()
 	currentVersion := GetVersion()
 	updateExtensionCheckLog.Printf("Checking if extension needs upgrade (current: %s)", currentVersion)
 
@@ -59,7 +68,8 @@ func upgradeExtensionIfOutdated(verbose bool, includePrereleases bool) (bool, st
 	}
 
 	// Query GitHub API for latest release
-	latestVersion, err := getLatestRelease(includePrereleases)
+	latestVersion, err := getLatestRelease(ctx, includePrereleases)
+	targetVersion = latestVersion
 	if err != nil {
 		// Fail silently - don't block the upgrade command if we can't reach GitHub
 		updateExtensionCheckLog.Printf("Failed to check for latest release (silently ignoring): %v", err)
@@ -191,7 +201,6 @@ func upgradeExtensionIfOutdated(verbose bool, includePrereleases bool) (bool, st
 
 	// Resolve the current executable path before renaming; after the rename
 	// os.Executable() returns a "(deleted)"-suffixed path on Linux.
-	var installPath string
 	var backupPath string
 	if exe, exeErr := os.Executable(); exeErr == nil {
 		if resolved, resolveErr := filepath.EvalSymlinks(exe); resolveErr == nil {
@@ -476,8 +485,8 @@ func prereleaseChannelNotice(currentVersion, latestStable string, includePrerele
 		return nil
 	}
 	return []string{
-		fmt.Sprintf("Current gh-aw version %s is newer than the latest stable release %s.", renderReleaseVersion(currentVersion), renderReleaseVersion(latestStable)),
-		"Run `gh aw upgrade --pre-releases` to check for newer pre-releases.",
+		fmt.Sprintf("Current gh-aw version %s is newer than the latest stable release %s; upgrading without --pre-releases would downgrade to that release.", renderReleaseVersion(currentVersion), renderReleaseVersion(latestStable)),
+		"Run `gh aw upgrade --pre-releases` to get the latest pre-release.",
 	}
 }
 

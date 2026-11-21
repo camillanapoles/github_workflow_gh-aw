@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/constants"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -49,7 +50,7 @@ func TestGeminiEngine(t *testing.T) {
 		}
 		secrets := engine.GetRequiredSecretNames(workflowData)
 		assert.Contains(t, secrets, "GEMINI_API_KEY", "Should require GEMINI_API_KEY")
-		assert.Contains(t, secrets, "MCP_GATEWAY_API_KEY", "Should require MCP_GATEWAY_API_KEY when MCP servers present")
+		assert.Contains(t, secrets, "MCP_GATEWAY_AGENT_ID", "Should require MCP_GATEWAY_AGENT_ID when MCP servers present")
 		assert.Contains(t, secrets, "GITHUB_MCP_SERVER_TOKEN", "Should require GITHUB_MCP_SERVER_TOKEN for GitHub tool")
 	})
 
@@ -97,7 +98,7 @@ func TestGeminiEngineInstallation(t *testing.T) {
 			stepContent := strings.Join(steps[1], "\n")
 			assert.Contains(t, stepContent, "Install Gemini CLI", "Second step should install Gemini CLI")
 			assert.Contains(t, stepContent, "@google/gemini-cli", "Should install @google/gemini-cli package")
-			assert.NotContains(t, stepContent, "NPM_CONFIG_MIN_RELEASE_AGE", "Gemini installation should not set npm release-age cooldown")
+			assert.Contains(t, stepContent, "NPM_CONFIG_MIN_RELEASE_AGE: '3'", "Gemini installation should set the default release-age cooldown")
 		}
 	})
 
@@ -111,6 +112,31 @@ func TestGeminiEngineInstallation(t *testing.T) {
 
 		steps := engine.GetInstallationSteps(workflowData)
 		assert.Empty(t, steps, "Should skip installation when custom command is specified")
+	})
+
+	t.Run("default version is installed and recorded", func(t *testing.T) {
+		workflowData := &WorkflowData{
+			Name:         "test-workflow",
+			EngineConfig: &EngineConfig{},
+		}
+
+		steps := engine.GetInstallationSteps(workflowData)
+		assert.Equal(t, string(constants.DefaultGeminiVersion), workflowData.EngineConfig.Version)
+		assert.Contains(t, stepsToString(steps), "npm install -g @google/gemini-cli@"+string(constants.DefaultGeminiVersion))
+	})
+
+	t.Run("explicit version overrides the default", func(t *testing.T) {
+		workflowData := &WorkflowData{
+			Name: "test-workflow",
+			EngineConfig: &EngineConfig{
+				Version: "0.62.0",
+			},
+		}
+
+		steps := engine.GetInstallationSteps(workflowData)
+		assert.Equal(t, "0.62.0", workflowData.EngineConfig.Version)
+		assert.Contains(t, stepsToString(steps), "npm install -g @google/gemini-cli@0.62.0")
+		assert.NotContains(t, stepsToString(steps), "@google/gemini-cli@"+string(constants.DefaultGeminiVersion))
 	})
 
 	t.Run("with firewall", func(t *testing.T) {
@@ -161,16 +187,17 @@ func TestGeminiEngineExecution(t *testing.T) {
 		assert.Contains(t, stepContent, "--skip-trust", "Should include --skip-trust flag to prevent workspace trust check from overriding --yolo")
 		assert.Contains(t, stepContent, "--output-format stream-json", "Should use streaming JSON output format")
 		assert.Contains(t, stepContent, `--prompt "$(cat /tmp/gh-aw/aw-prompts/prompt.txt)"`, "Should include prompt argument with correct shell quoting")
+		assert.Contains(t, stepContent, "shell_harness.cjs", "Should run the CLI through the shared shell harness")
 		assert.Contains(t, stepContent, "/tmp/test.log", "Should include log file")
 		assert.Contains(t, stepContent, "GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}", "Should set GEMINI_API_KEY env var")
+		assert.Contains(t, stepContent, "GH_AW_TIMEOUT_MINUTES: 20", "Should expose the step timeout to the shared harness")
 	})
 
 	t.Run("with model", func(t *testing.T) {
 		workflowData := &WorkflowData{
-			Name: "test-workflow",
-			EngineConfig: &EngineConfig{
-				Model: "gemini-1.5-pro",
-			},
+			Name:         "test-workflow",
+			Model:        "gemini-1.5-pro",
+			EngineConfig: &EngineConfig{},
 		}
 
 		steps := engine.GetExecutionSteps(workflowData, "/tmp/test.log")
@@ -253,10 +280,9 @@ func TestGeminiEngineExecution(t *testing.T) {
 
 		// When model is configured, use the native GEMINI_MODEL env var
 		modelWorkflow := &WorkflowData{
-			Name: "model-configured",
-			EngineConfig: &EngineConfig{
-				Model: "gemini-2.0-flash",
-			},
+			Name:         "model-configured",
+			Model:        "gemini-2.0-flash",
+			EngineConfig: &EngineConfig{},
 		}
 
 		steps = engine.GetExecutionSteps(modelWorkflow, "/tmp/test.log")
@@ -333,6 +359,9 @@ func TestGeminiEngineFirewallIntegration(t *testing.T) {
 					Enabled: true,
 				},
 			},
+			SandboxConfig: &SandboxConfig{
+				Agent: &AgentSandboxConfig{ID: "awf"},
+			},
 		}
 
 		steps := engine.GetExecutionSteps(workflowData, "/tmp/test.log")
@@ -342,10 +371,11 @@ func TestGeminiEngineFirewallIntegration(t *testing.T) {
 
 		// Should use AWF command
 		assert.Contains(t, stepContent, "awf", "Should use AWF when firewall is enabled")
+		assert.Contains(t, stepContent, "shell_harness.cjs", "Should run the sandboxed CLI through the shared shell harness")
 		// With config file support, domains and apiProxy are in the JSON config
 		assert.Contains(t, stepContent, "allowDomains", "Should include allowDomains in config JSON")
 		assert.Contains(t, stepContent, `\"enabled\":true`, "Should include apiProxy enabled in config JSON")
-		assert.Contains(t, stepContent, "GEMINI_API_BASE_URL: http://host.docker.internal:10003", "Should set GEMINI_API_BASE_URL to LLM gateway URL")
+		assert.Contains(t, stepContent, "GEMINI_API_BASE_URL: http://api-proxy:10003", "Should use the isolated AWF API proxy hostname")
 	})
 
 	t.Run("firewall disabled", func(t *testing.T) {
@@ -596,8 +626,145 @@ func TestGenerateGeminiSettingsStep(t *testing.T) {
 
 		assert.Contains(t, content, "run_shell_command(echo)", "Should include original restricted bash command")
 		assert.Contains(t, content, "run_shell_command(mymcp:*)", "Should include mounted custom MCP CLI command")
-		assert.Contains(t, content, "run_shell_command(playwright:*)", "Should include mounted playwright CLI command")
+		assert.Contains(t, content, "run_shell_command(playwright-cli:*)", "Should include Playwright CLI command")
 		assert.Contains(t, content, "run_shell_command(safeoutputs:*)", "Should include mounted safeoutputs CLI command")
+	})
+}
+
+func TestGeminiVertexWIF(t *testing.T) {
+	engine := NewGeminiEngine()
+
+	makeVertexWIFData := func(project, location string) *WorkflowData {
+		return &WorkflowData{
+			Name:        "test-vertex-wif",
+			ParsedTools: &ToolsConfig{},
+			Tools:       map[string]any{},
+			EngineConfig: &EngineConfig{
+				ID: "gemini",
+				Auth: &EngineAuthConfig{
+					Type:                           "github-oidc",
+					Provider:                       "gcp",
+					GoogleWorkloadIdentityProvider: "projects/123/locations/global/workloadIdentityPools/pool/providers/github",
+					GoogleServiceAccount:           "my-sa@my-project.iam.gserviceaccount.com",
+					GoogleProject:                  project,
+					GoogleLocation:                 location,
+				},
+			},
+		}
+	}
+
+	t.Run("isGeminiVertexWIF returns true when auth type is github-oidc and provider is gcp with required fields", func(t *testing.T) {
+		wd := makeVertexWIFData("my-project", "us-central1")
+		assert.True(t, isGeminiVertexWIF(wd), "Should detect Vertex WIF")
+	})
+
+	t.Run("isGeminiVertexWIF returns false when no auth", func(t *testing.T) {
+		wd := &WorkflowData{Name: "test"}
+		assert.False(t, isGeminiVertexWIF(wd), "Should not detect WIF when no auth")
+	})
+
+	t.Run("isGeminiVertexWIF returns false when provider is not gcp", func(t *testing.T) {
+		wd := &WorkflowData{
+			Name: "test",
+			EngineConfig: &EngineConfig{
+				Auth: &EngineAuthConfig{
+					Type:     "github-oidc",
+					Provider: "anthropic",
+				},
+			},
+		}
+		assert.False(t, isGeminiVertexWIF(wd), "Should not detect WIF when provider is not gcp")
+	})
+
+	t.Run("isGeminiVertexWIF returns false when required fields are missing", func(t *testing.T) {
+		wd := &WorkflowData{
+			Name: "test",
+			EngineConfig: &EngineConfig{
+				Auth: &EngineAuthConfig{
+					Type:     "github-oidc",
+					Provider: "gcp",
+					// Missing: GoogleWorkloadIdentityProvider, GoogleServiceAccount, GoogleProject
+				},
+			},
+		}
+		assert.False(t, isGeminiVertexWIF(wd), "Should not detect WIF when required fields are missing")
+	})
+
+	t.Run("GEMINI_API_KEY not required when Vertex WIF is configured", func(t *testing.T) {
+		wd := makeVertexWIFData("my-project", "us-central1")
+		secrets := engine.GetRequiredSecretNames(wd)
+		assert.NotContains(t, secrets, "GEMINI_API_KEY", "Should not require GEMINI_API_KEY with Vertex WIF")
+	})
+
+	t.Run("GEMINI_API_KEY still required without Vertex WIF", func(t *testing.T) {
+		wd := &WorkflowData{
+			Name:        "test",
+			ParsedTools: &ToolsConfig{},
+			Tools:       map[string]any{},
+		}
+		secrets := engine.GetRequiredSecretNames(wd)
+		assert.Contains(t, secrets, "GEMINI_API_KEY", "Should require GEMINI_API_KEY without WIF")
+	})
+
+	t.Run("secret validation step is empty when Vertex WIF is configured", func(t *testing.T) {
+		wd := makeVertexWIFData("my-project", "us-central1")
+		step := engine.GetSecretValidationStep(wd)
+		assert.Empty(t, step, "Should return empty validation step with Vertex WIF")
+	})
+
+	t.Run("secret validation step present without Vertex WIF", func(t *testing.T) {
+		wd := &WorkflowData{Name: "test"}
+		step := engine.GetSecretValidationStep(wd)
+		assert.NotEmpty(t, step, "Should return validation step without WIF")
+	})
+
+	t.Run("execution step uses Vertex AI env vars when WIF configured", func(t *testing.T) {
+		wd := makeVertexWIFData("my-project", "us-central1")
+		steps := engine.GetExecutionSteps(wd, "/tmp/test.log")
+		require.Len(t, steps, 2, "Should generate settings step and execution step")
+
+		stepContent := strings.Join(steps[1], "\n")
+		assert.Contains(t, stepContent, "GOOGLE_GENAI_USE_VERTEXAI: true", "Should set Vertex AI backend env var to 'true'")
+		assert.Contains(t, stepContent, "GOOGLE_CLOUD_PROJECT: my-project", "Should set project env var")
+		assert.Contains(t, stepContent, "GOOGLE_CLOUD_LOCATION: us-central1", "Should set location env var")
+		assert.NotContains(t, stepContent, "GEMINI_API_KEY", "Should not include GEMINI_API_KEY with Vertex WIF")
+	})
+
+	t.Run("execution step defaults location to us-central1 when not configured", func(t *testing.T) {
+		wd := makeVertexWIFData("my-project", "")
+		steps := engine.GetExecutionSteps(wd, "/tmp/test.log")
+		require.Len(t, steps, 2, "Should generate settings step and execution step")
+
+		stepContent := strings.Join(steps[1], "\n")
+		assert.Contains(t, stepContent, "GOOGLE_GENAI_USE_VERTEXAI: true", "Should set Vertex AI backend env var to 'true'")
+		assert.Contains(t, stepContent, "GOOGLE_CLOUD_PROJECT: my-project", "Should set project env var")
+		assert.Contains(t, stepContent, "GOOGLE_CLOUD_LOCATION: us-central1", "Should default location to us-central1")
+		assert.NotContains(t, stepContent, "GEMINI_API_KEY", "Should not include GEMINI_API_KEY with Vertex WIF")
+	})
+
+	t.Run("execution step uses GEMINI_API_KEY without Vertex WIF", func(t *testing.T) {
+		wd := &WorkflowData{Name: "test"}
+		steps := engine.GetExecutionSteps(wd, "/tmp/test.log")
+		require.Len(t, steps, 2, "Should generate settings step and execution step")
+
+		stepContent := strings.Join(steps[1], "\n")
+		assert.Contains(t, stepContent, "GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}", "Should include GEMINI_API_KEY without WIF")
+		assert.NotContains(t, stepContent, "GOOGLE_GENAI_USE_VERTEXAI", "Should not set Vertex AI vars without WIF")
+	})
+
+	t.Run("engine.env cannot overwrite WIF-emitted Vertex AI env vars", func(t *testing.T) {
+		wd := makeVertexWIFData("my-project", "us-central1")
+		// User tries to override WIF vars via engine.env — compiler must ignore them.
+		wd.EngineConfig.Env = map[string]string{
+			"GOOGLE_GENAI_USE_VERTEXAI": "false",
+			"GOOGLE_CLOUD_PROJECT":      "other-project",
+		}
+		steps := engine.GetExecutionSteps(wd, "/tmp/test.log")
+		require.Len(t, steps, 2, "Should generate settings step and execution step")
+
+		stepContent := strings.Join(steps[1], "\n")
+		assert.Contains(t, stepContent, "GOOGLE_GENAI_USE_VERTEXAI: true", "WIF env var must not be overridden by engine.env")
+		assert.Contains(t, stepContent, "GOOGLE_CLOUD_PROJECT: my-project", "WIF project must not be overridden by engine.env")
 	})
 }
 
@@ -642,5 +809,73 @@ func TestGeminiEngineWithExpressionVersion(t *testing.T) {
 	// Should NOT embed expression directly in npm install command
 	if strings.Contains(installStep, "@google/gemini-cli@"+expressionVersion) {
 		t.Errorf("Expression should NOT be embedded directly in npm install command, got:\n%s", installStep)
+	}
+}
+
+func TestGeminiEngineWithVersion(t *testing.T) {
+	engine := NewGeminiEngine()
+
+	customVersion := "0.99.0"
+	workflowData := &WorkflowData{
+		Name: "test-workflow",
+		EngineConfig: &EngineConfig{
+			ID:      "gemini",
+			Version: customVersion,
+		},
+	}
+
+	installSteps := engine.GetInstallationSteps(workflowData)
+
+	var installStep string
+	for _, step := range installSteps {
+		stepContent := strings.Join([]string(step), "\n")
+		if strings.Contains(stepContent, "npm install") {
+			installStep = stepContent
+			break
+		}
+	}
+
+	if installStep == "" {
+		t.Fatal("Could not find npm install step")
+	}
+
+	if !strings.Contains(installStep, "@google/gemini-cli@"+customVersion) {
+		t.Errorf("Expected custom version %q in install step, got:\n%s", customVersion, installStep)
+	}
+	if strings.Contains(installStep, "@google/gemini-cli@"+string(constants.DefaultGeminiVersion)) {
+		t.Errorf("Expected user-specified version, not default, in install step:\n%s", installStep)
+	}
+}
+
+func TestGeminiEngineWithoutVersion(t *testing.T) {
+	engine := NewGeminiEngine()
+
+	workflowData := &WorkflowData{
+		Name:         "test-workflow",
+		EngineConfig: &EngineConfig{},
+	}
+
+	installSteps := engine.GetInstallationSteps(workflowData)
+
+	// EngineConfig.Version must be normalized to the default version.
+	if workflowData.EngineConfig.Version != string(constants.DefaultGeminiVersion) {
+		t.Fatalf("Expected engine config version to be normalized to default Gemini version %q, got: %q", constants.DefaultGeminiVersion, workflowData.EngineConfig.Version)
+	}
+
+	var installStep string
+	for _, step := range installSteps {
+		stepContent := strings.Join([]string(step), "\n")
+		if strings.Contains(stepContent, "npm install") {
+			installStep = stepContent
+			break
+		}
+	}
+
+	if installStep == "" {
+		t.Fatal("Could not find npm install step")
+	}
+
+	if !strings.Contains(installStep, "@google/gemini-cli@"+string(constants.DefaultGeminiVersion)) {
+		t.Errorf("Expected default version %q in install step when no engine.version set, got:\n%s", constants.DefaultGeminiVersion, installStep)
 	}
 }

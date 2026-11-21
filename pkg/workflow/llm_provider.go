@@ -1,7 +1,8 @@
 package workflow
 
 import (
-	"fmt"
+	"net"
+	"strconv"
 	"strings"
 
 	"github.com/github/gh-aw/pkg/constants"
@@ -10,41 +11,71 @@ import (
 
 var llmProviderLog = logger.New("workflow:llm_provider")
 
+// LLMProvider identifies the inference provider used by an engine (e.g. "github", "anthropic", "openai").
+type LLMProvider string
+
+// String returns the string representation of the provider, satisfying the fmt.Stringer interface.
+func (p LLMProvider) String() string {
+	return string(p)
+}
+
 const (
-	LLMProviderGitHub    = "github"
-	LLMProviderAnthropic = "anthropic"
-	LLMProviderOpenAI    = "openai"
+	LLMProviderGitHub    LLMProvider = "github"
+	LLMProviderAnthropic LLMProvider = "anthropic"
+	LLMProviderOpenAI    LLMProvider = "openai"
 )
 
+var llmProviderAliases = map[string]LLMProvider{
+	"copilot":        LLMProviderGitHub,
+	"github":         LLMProviderGitHub,
+	"github-copilot": LLMProviderGitHub,
+	"github_models":  LLMProviderGitHub,
+	"anthropic":      LLMProviderAnthropic,
+	"openai":         LLMProviderOpenAI,
+}
+
 type llmProviderProfile struct {
-	id          string
+	id          LLMProvider
 	gatewayPort int
 }
 
-func normalizeLLMProvider(provider string) string {
-	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case LLMProviderGitHub:
-		return LLMProviderGitHub
-	case LLMProviderOpenAI:
-		return LLMProviderOpenAI
-	default:
+func normalizeLLMProvider(provider string) LLMProvider {
+	normalized := strings.TrimSpace(provider)
+	if normalized == "" {
 		return LLMProviderAnthropic
 	}
+	normalized = strings.ToLower(normalized)
+	if alias, ok := llmProviderAliases[normalized]; ok {
+		return alias
+	}
+	return LLMProvider(normalized)
 }
 
-func resolveEngineLLMProvider(workflowData *WorkflowData, defaultProvider string) string {
+func resolveEngineLLMProvider(workflowData *WorkflowData, defaultProvider LLMProvider) LLMProvider {
 	if workflowData == nil || workflowData.EngineConfig == nil || workflowData.EngineConfig.LLMProvider == "" {
-		provider := normalizeLLMProvider(defaultProvider)
+		provider := normalizeLLMProvider(string(defaultProvider))
 		llmProviderLog.Printf("Resolved LLM provider from default: %s", provider)
 		return provider
 	}
-	provider := normalizeLLMProvider(workflowData.EngineConfig.LLMProvider)
+	provider := normalizeLLMProvider(string(workflowData.EngineConfig.LLMProvider))
 	llmProviderLog.Printf("Resolved LLM provider from engine config: %s", provider)
 	return provider
 }
 
-func llmProviderProfileFor(provider string) llmProviderProfile {
-	switch normalizeLLMProvider(provider) {
+func resolveEngineLLMProviderFromModel(workflowData *WorkflowData, defaultProvider LLMProvider) LLMProvider {
+	if workflowData != nil && workflowData.EngineConfig != nil && len(workflowData.EngineConfig.FallbackModels) > 0 &&
+		workflowData.EngineConfig.LLMProvider == "" {
+		return fallbackModelProvider(workflowData.Model, defaultProvider)
+	}
+	if workflowData != nil && (workflowData.EngineConfig == nil || workflowData.EngineConfig.LLMProvider == "") &&
+		strings.HasPrefix(strings.ToLower(strings.TrimSpace(workflowData.Model)), "copilot/") {
+		return LLMProviderGitHub
+	}
+	return resolveEngineLLMProvider(workflowData, defaultProvider)
+}
+
+func llmProviderProfileFor(provider LLMProvider) llmProviderProfile {
+	switch provider {
 	case LLMProviderGitHub:
 		return llmProviderProfile{
 			id:          LLMProviderGitHub,
@@ -63,19 +94,21 @@ func llmProviderProfileFor(provider string) llmProviderProfile {
 	}
 }
 
-func llmProviderSecretNames(provider string) []string {
-	switch normalizeLLMProvider(provider) {
+func llmProviderSecretNames(provider LLMProvider) []string {
+	switch provider {
 	case LLMProviderGitHub:
 		return []string{"COPILOT_GITHUB_TOKEN"}
 	case LLMProviderOpenAI:
 		return []string{"CODEX_API_KEY", "OPENAI_API_KEY"}
+	case "gemini":
+		return []string{"GEMINI_API_KEY"}
 	default:
 		return []string{"ANTHROPIC_API_KEY"}
 	}
 }
 
-func llmProviderSecretExpression(provider string, workflowData *WorkflowData) string {
-	switch normalizeLLMProvider(provider) {
+func llmProviderSecretExpression(provider LLMProvider, workflowData *WorkflowData) string {
+	switch provider {
 	case LLMProviderGitHub:
 		if hasCopilotRequestsWritePermission(workflowData) {
 			llmProviderLog.Print("Using github.token for GitHub Copilot (copilot-requests write permission present)")
@@ -85,18 +118,28 @@ func llmProviderSecretExpression(provider string, workflowData *WorkflowData) st
 		return "${{ secrets.COPILOT_GITHUB_TOKEN }}"
 	case LLMProviderOpenAI:
 		return "${{ secrets.CODEX_API_KEY || secrets.OPENAI_API_KEY }}"
+	case "gemini":
+		return "${{ secrets.GEMINI_API_KEY }}"
 	default:
 		return "${{ secrets.ANTHROPIC_API_KEY }}"
 	}
 }
 
-func llmProviderGatewayBaseURL(provider string) string {
+func llmProviderGatewayBaseURL(provider LLMProvider, workflowData *WorkflowData) string {
 	profile := llmProviderProfileFor(provider)
-	return fmt.Sprintf("http://host.docker.internal:%d", profile.gatewayPort)
+	return llmGatewayBaseURL(profile.gatewayPort, workflowData)
 }
 
-func llmProviderDocsURL(provider string) string {
-	switch normalizeLLMProvider(provider) {
+func llmGatewayBaseURL(port int, workflowData *WorkflowData) string {
+	host := "host.docker.internal"
+	if isAWFAgentOnNetworkIsolationTopology(workflowData) {
+		host = constants.AWFAPIProxyHostname
+	}
+	return "http://" + net.JoinHostPort(host, strconv.Itoa(port))
+}
+
+func llmProviderDocsURL(provider LLMProvider) string {
+	switch provider {
 	case LLMProviderGitHub:
 		return "https://github.github.com/gh-aw/reference/engines/#github-copilot-default"
 	case LLMProviderOpenAI:

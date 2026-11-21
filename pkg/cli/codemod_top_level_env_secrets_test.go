@@ -11,9 +11,11 @@ import (
 )
 
 func TestTopLevelEnvSecretsGuidedErrorCodemod(t *testing.T) {
+	t.Parallel()
 	codemod := getTopLevelEnvSecretsGuidedErrorCodemod()
 
 	t.Run("returns guided error when top-level env contains a secret", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 on: workflow_dispatch
 env:
@@ -32,13 +34,25 @@ env:
 		_, applied, err := codemod.Apply(content, frontmatter)
 		require.Error(t, err, "should return an error for top-level env secrets")
 		assert.False(t, applied, "should not modify the file")
-		assert.Contains(t, err.Error(), "top-level env: contains secrets")
-		assert.Contains(t, err.Error(), "${{ secrets.GITHUB_TOKEN }}")
-		assert.Contains(t, err.Error(), "Manual fix required")
-		assert.Contains(t, err.Error(), "https://github.github.com/gh-aw/reference/engines/")
+		codemodErr := err
+		for _, tc := range []struct {
+			name string
+			msg  string
+		}{
+			{name: "contains_secrets_message", msg: "top-level env: contains secrets"},
+			{name: "github_token_reference", msg: "${{ secrets.GITHUB_TOKEN }}"},
+			{name: "manual_fix_guidance", msg: "Manual fix required"},
+			{name: "documentation_link", msg: "https://github.github.com/gh-aw/reference/engines/"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				require.ErrorContains(t, codemodErr, tc.msg)
+			})
+		}
 	})
 
 	t.Run("returns deduplicated guided error with multiple secret references", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 on: workflow_dispatch
 env:
@@ -57,11 +71,12 @@ env:
 		_, applied, err := codemod.Apply(content, frontmatter)
 		require.Error(t, err)
 		assert.False(t, applied)
-		assert.Contains(t, err.Error(), "top-level env: contains secrets")
+		require.ErrorContains(t, err, "top-level env: contains secrets")
 		assert.Equal(t, 1, strings.Count(err.Error(), "${{ secrets.GITHUB_PERSONAL_ACCESS_TOKEN || secrets.GITHUB_TOKEN }}"))
 	})
 
 	t.Run("no-op when top-level env has no secrets", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 on: workflow_dispatch
 env:
@@ -86,6 +101,7 @@ env:
 	})
 
 	t.Run("no-op when there is no top-level env section", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 on: workflow_dispatch
 engine:
@@ -108,6 +124,7 @@ engine:
 	})
 
 	t.Run("no-op when env only uses vars not secrets", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 on: workflow_dispatch
 env:
@@ -130,6 +147,7 @@ env:
 	})
 
 	t.Run("does not modify content even when secret found", func(t *testing.T) {
+		t.Parallel()
 		content := `---
 on: workflow_dispatch
 env:

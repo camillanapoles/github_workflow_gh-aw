@@ -289,7 +289,8 @@ func TestBuildActionSteps(t *testing.T) {
 		},
 	}
 
-	steps := compiler.buildActionSteps(data)
+	steps, err := compiler.buildActionSteps(data)
+	require.NoError(t, err)
 	require.NotEmpty(t, steps, "Should generate steps")
 
 	fullYAML := strings.Join(steps, "")
@@ -318,12 +319,37 @@ func TestBuildActionStepsFallbackPayload(t *testing.T) {
 		},
 	}
 
-	steps := compiler.buildActionSteps(data)
+	steps, err := compiler.buildActionSteps(data)
+	require.NoError(t, err)
 	require.NotEmpty(t, steps, "Should generate steps even without inputs")
 
 	fullYAML := strings.Join(steps, "")
 	assert.Contains(t, fullYAML, "payload:", "Should use payload as single with: key when inputs unknown")
 	assert.Contains(t, fullYAML, "steps.process_safe_outputs.outputs.action_unknown_inputs_tool_payload", "Should reference payload output")
+}
+
+func TestFetchAndParseActionYAMLUsesMappedTargetMetadata(t *testing.T) {
+	cache := NewActionCache(t.TempDir())
+	const targetSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	require.True(t, cache.Set("internal/script", "v1", targetSHA))
+	targetInputs := map[string]*ActionYAMLInput{"title": {Required: true}}
+	cache.SetInputs("internal/script", "v1", targetInputs)
+	cache.SetActionDescription("internal/script", "v1", "Mapped action")
+
+	data := &WorkflowData{
+		ActionCache:    cache,
+		ActionResolver: NewActionResolver(cache),
+		ActionPinMappings: map[string]string{
+			"actions/source@v1": "internal/script@v1",
+		},
+	}
+	config := &SafeOutputActionConfig{Uses: "actions/source@v1"}
+
+	err := NewCompiler().fetchAndParseActionYAML("mapped-tool", config, "workflow.md", data)
+	require.NoError(t, err)
+	assert.Equal(t, "internal/script@"+targetSHA+" # v1 "+exactPinMappingMarker, config.ResolvedRef)
+	assert.Equal(t, targetInputs, config.Inputs)
+	assert.Equal(t, "Mapped action", config.ActionDescription)
 }
 
 // TestBuildActionStepsEmpty verifies no steps when no actions
@@ -332,7 +358,9 @@ func TestBuildActionStepsEmpty(t *testing.T) {
 	data := &WorkflowData{
 		SafeOutputs: &SafeOutputsConfig{},
 	}
-	assert.Nil(t, compiler.buildActionSteps(data), "Should return nil for empty actions")
+	steps, err := compiler.buildActionSteps(data)
+	require.NoError(t, err)
+	assert.Nil(t, steps, "Should return nil for empty actions")
 }
 
 // TestExtractSafeOutputsConfigIncludesActions verifies extractSafeOutputsConfig handles actions
@@ -500,7 +528,8 @@ func TestBuildActionStepsWithEnv(t *testing.T) {
 		},
 	}
 
-	steps := compiler.buildActionSteps(data)
+	steps, err := compiler.buildActionSteps(data)
+	require.NoError(t, err)
 	require.NotEmpty(t, steps, "Should generate steps")
 
 	fullYAML := strings.Join(steps, "")
@@ -530,7 +559,8 @@ func TestBuildActionStepsNoEnv(t *testing.T) {
 		},
 	}
 
-	steps := compiler.buildActionSteps(data)
+	steps, err := compiler.buildActionSteps(data)
+	require.NoError(t, err)
 	fullYAML := strings.Join(steps, "")
 	assert.NotContains(t, fullYAML, "env:", "Should not have env block when Env is nil/empty")
 }
@@ -602,7 +632,8 @@ func TestBuildActionStepsSkipsGitHubExpressionDefaultInputs(t *testing.T) {
 		},
 	}
 
-	steps := compiler.buildActionSteps(data)
+	steps, err := compiler.buildActionSteps(data)
+	require.NoError(t, err)
 	fullYAML := strings.Join(steps, "")
 
 	// Only 'labels' should be in with: block

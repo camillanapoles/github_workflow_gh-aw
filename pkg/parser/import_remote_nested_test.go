@@ -16,11 +16,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func mustParseRemoteOrigin(t *testing.T, spec string) *remoteImportOrigin {
+	t.Helper()
+	origin, err := parseRemoteOrigin(spec)
+	require.NoError(t, err)
+	return origin
+}
+
 func TestParseRemoteOrigin(t *testing.T) {
 	tests := []struct {
-		name     string
-		spec     string
-		expected *remoteImportOrigin
+		name        string
+		spec        string
+		expected    *remoteImportOrigin
+		errContains string
 	}{
 		{
 			name: "basic workflowspec with ref",
@@ -122,11 +130,23 @@ func TestParseRemoteOrigin(t *testing.T) {
 			spec:     "file.md",
 			expected: nil,
 		},
+		{
+			name:        "invalid ref returns error",
+			spec:        "owner/repo/file.md@--upload-pack=malicious",
+			errContains: "must not start with '-'",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := parseRemoteOrigin(tt.spec)
+			result, err := parseRemoteOrigin(tt.spec)
+			if tt.errContains != "" {
+				require.Error(t, err)
+				require.ErrorContains(t, err, tt.errContains)
+				assert.Nil(t, result)
+				return
+			}
+			require.NoError(t, err)
 			if tt.expected == nil {
 				assert.Nilf(t, result, "Expected nil for spec: %s", tt.spec)
 			} else {
@@ -176,7 +196,7 @@ func TestLocalImportResolutionBaseline(t *testing.T) {
 // The preferred convention is "./serena.md" (explicit relative path), which is the
 // pattern used by shared/mcp/serena-go.md.
 func TestSiblingImportResolution(t *testing.T) {
-	serenaContent := "---\nmcp-servers:\n  serena:\n    image: ghcr.io/oraios/serena\n---\n"
+	serenaContent := "---\nmcp-servers:\n  serena:\n    container: ghcr.io/oraios/serena\n---\n"
 
 	tests := []struct {
 		name          string
@@ -279,7 +299,7 @@ func TestRemoteOriginPropagation(t *testing.T) {
 		spec := "elastic/ai-github-actions/gh-agent-workflows/mention-in-pr/rwxp.md@main"
 		assert.True(t, IsWorkflowSpec(spec), "Should be recognized as workflowspec")
 
-		origin := parseRemoteOrigin(spec)
+		origin := mustParseRemoteOrigin(t, spec)
 		require.NotNil(t, origin, "Should parse remote origin")
 		assert.Equal(t, "elastic", origin.Owner, "Owner should be elastic")
 		assert.Equal(t, "ai-github-actions", origin.Repo, "Repo should be ai-github-actions")
@@ -291,7 +311,8 @@ func TestRemoteOriginPropagation(t *testing.T) {
 		localPath := "shared/tools.md"
 		assert.False(t, IsWorkflowSpec(localPath), "Should not be recognized as workflowspec")
 
-		origin := parseRemoteOrigin(localPath)
+		origin, err := parseRemoteOrigin(localPath)
+		require.NoError(t, err)
 		assert.Nil(t, origin, "Local paths should not produce remote origin")
 	})
 
@@ -385,7 +406,7 @@ func TestRemoteOriginPropagation(t *testing.T) {
 		nestedSpec := "other-org/other-repo/path/file.md@v2.0"
 		assert.True(t, IsWorkflowSpec(nestedSpec), "Should be recognized as workflowspec")
 
-		origin := parseRemoteOrigin(nestedSpec)
+		origin := mustParseRemoteOrigin(t, nestedSpec)
 		require.NotNil(t, origin, "Should parse remote origin for nested workflowspec")
 		assert.Equal(t, "other-org", origin.Owner, "Should use nested spec's owner")
 		assert.Equal(t, "other-repo", origin.Repo, "Should use nested spec's repo")
@@ -439,7 +460,7 @@ func TestRemoteOriginPropagation(t *testing.T) {
 		// → file1.md imports: file2.md (should resolve to shared/file2.md)
 
 		// Step 1: Top-level workflow import produces this remoteOrigin
-		topLevelOrigin := parseRemoteOrigin("githubnext/agentics/workflows/workflow.md@main")
+		topLevelOrigin := mustParseRemoteOrigin(t, "githubnext/agentics/workflows/workflow.md@main")
 		require.NotNil(t, topLevelOrigin, "Should parse top-level workflow")
 		assert.Equal(t, "workflows", topLevelOrigin.BasePath, "Top-level BasePath should be 'workflows'")
 
@@ -460,7 +481,7 @@ func TestRemoteOriginPropagation(t *testing.T) {
 
 		// Step 3: Parse the remoteOrigin from file1's resolved spec
 		// This is the KEY fix - file1's origin should have BasePath="workflows/shared"
-		file1Origin := parseRemoteOrigin(file1ResolvedSpec)
+		file1Origin := mustParseRemoteOrigin(t, file1ResolvedSpec)
 		require.NotNil(t, file1Origin, "Should parse file1's remote origin from resolved spec")
 		assert.Equal(t, "githubnext", file1Origin.Owner, "File1 Owner")
 		assert.Equal(t, "agentics", file1Origin.Repo, "File1 Repo")
@@ -672,7 +693,7 @@ func TestParseRemoteOriginWithCleanedPaths(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := parseRemoteOrigin(tt.spec)
+			result := mustParseRemoteOrigin(t, tt.spec)
 			require.NotNil(t, result, "Should parse remote origin for spec: %s", tt.spec)
 			assert.Equal(t, tt.expected.Owner, result.Owner, "Owner mismatch")
 			assert.Equal(t, tt.expected.Repo, result.Repo, "Repo mismatch")
@@ -702,7 +723,8 @@ func TestParseRemoteOriginWithURLFormats(t *testing.T) {
 			// - Parts: ["https:", "", "github.com", "owner", "repo", "path", "file.md"]
 			// - Owner would be "https:" (first part after splitting by /)
 			// This test documents the current behavior for future reference
-			origin := parseRemoteOrigin(urlPath)
+			origin, err := parseRemoteOrigin(urlPath)
+			require.NoError(t, err)
 			if origin != nil {
 				t.Logf("URL %s parsed as: owner=%s, repo=%s, basePath=%s",
 					urlPath, origin.Owner, origin.Repo, origin.BasePath)
@@ -715,7 +737,7 @@ func TestParseRemoteOriginWithURLFormats(t *testing.T) {
 		// The domain is handled by GH_HOST environment variable, not in the workflowspec
 		spec := "enterprise-org/enterprise-repo/workflows/test.md@main"
 
-		result := parseRemoteOrigin(spec)
+		result := mustParseRemoteOrigin(t, spec)
 		require.NotNil(t, result, "Should parse enterprise workflowspec")
 		assert.Equal(t, "enterprise-org", result.Owner)
 		assert.Equal(t, "enterprise-repo", result.Repo)
@@ -737,10 +759,10 @@ func TestMixedImportStylesInSingleFile(t *testing.T) {
 	require.NoError(t, os.MkdirAll(extraDir, 0o755), "create shared/extra dir")
 
 	// shared/mcp/base.md – leaf with one MCP server
-	writeFile(t, mcpDir, "base.md", "---\nmcp-servers:\n  base-server:\n    image: example/base\n---\n")
+	writeFile(t, mcpDir, "base.md", "---\nmcp-servers:\n  base-server:\n    container: example/base\n---\n")
 
 	// shared/extra/extra-server.md – leaf with another MCP server in a different directory
-	writeFile(t, extraDir, "extra-server.md", "---\nmcp-servers:\n  extra-server:\n    image: example/extra\n---\n")
+	writeFile(t, extraDir, "extra-server.md", "---\nmcp-servers:\n  extra-server:\n    container: example/extra\n---\n")
 
 	// shared/mcp/meta.md – imports both a sibling (./) and a root-relative path
 	writeFile(t, mcpDir, "meta.md",
@@ -778,7 +800,7 @@ func TestChainedMixedImportStyles(t *testing.T) {
 
 	// chain-c.md – leaf, carries an MCP server definition
 	writeFile(t, chainDir, "chain-c.md",
-		"---\nmcp-servers:\n  chain-c-server:\n    image: example/chain-c\n---\n")
+		"---\nmcp-servers:\n  chain-c-server:\n    container: example/chain-c\n---\n")
 
 	// chain-b.md – imports chain-c.md using a bare filename (backward-compatible)
 	writeFile(t, chainDir, "chain-b.md",
@@ -815,7 +837,7 @@ func TestCrossDirectoryAbsoluteImport(t *testing.T) {
 
 	// shared/dir-b/file-b.md – leaf with an MCP server
 	writeFile(t, dirB, "file-b.md",
-		"---\nmcp-servers:\n  dir-b-server:\n    image: example/dir-b\n---\n")
+		"---\nmcp-servers:\n  dir-b-server:\n    container: example/dir-b\n---\n")
 
 	// shared/dir-a/file-a.md – cross-directory root-relative import
 	writeFile(t, dirA, "file-a.md",
@@ -846,11 +868,11 @@ func TestMultipleSiblingStylesFromSameDirectory(t *testing.T) {
 
 	// Three leaf files in the same directory, each contributing one MCP server
 	writeFile(t, sharedDir, "server-a.md",
-		"---\nmcp-servers:\n  server-a:\n    image: example/a\n---\n")
+		"---\nmcp-servers:\n  server-a:\n    container: example/a\n---\n")
 	writeFile(t, sharedDir, "server-b.md",
-		"---\nmcp-servers:\n  server-b:\n    image: example/b\n---\n")
+		"---\nmcp-servers:\n  server-b:\n    container: example/b\n---\n")
 	writeFile(t, sharedDir, "server-c.md",
-		"---\nmcp-servers:\n  server-c:\n    image: example/c\n---\n")
+		"---\nmcp-servers:\n  server-c:\n    container: example/c\n---\n")
 
 	// hub.md imports all three siblings using three different path styles
 	writeFile(t, sharedDir, "hub.md",

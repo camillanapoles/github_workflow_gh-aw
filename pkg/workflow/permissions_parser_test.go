@@ -212,6 +212,98 @@ func TestPermissionsParser_HasContentsReadAccess(t *testing.T) {
 	}
 }
 
+func TestPermissionsParser_ContentsIsNone(t *testing.T) {
+	tests := []struct {
+		name        string
+		permissions string
+		expected    bool
+	}{
+		{
+			name:        "shorthand none reports contents is none",
+			permissions: "permissions: none",
+			expected:    true,
+		},
+		{
+			name:        "shorthand read-all does not report contents is none",
+			permissions: "permissions: read-all",
+			expected:    false,
+		},
+		{
+			name: "explicit contents: none reports contents is none",
+			permissions: `permissions:
+  contents: none
+  issues: write`,
+			expected: true,
+		},
+		{
+			name: "explicit contents: read does not report contents is none",
+			permissions: `permissions:
+  contents: read`,
+			expected: false,
+		},
+		{
+			name: "no contents permission does not report contents is none",
+			permissions: `permissions:
+  issues: write`,
+			expected: false,
+		},
+		{
+			name:        "empty permissions does not report contents is none",
+			permissions: "",
+			expected:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parser := NewPermissionsParser(tt.permissions)
+			result := parser.ContentsIsNone()
+			if result != tt.expected {
+				t.Errorf("ContentsIsNone() = %v, expected %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestNewPermissionsParserFromValue_ContentsIsNone(t *testing.T) {
+	tests := []struct {
+		name        string
+		permissions any
+		expected    bool
+	}{
+		{
+			name:        "raw string shorthand none",
+			permissions: "none",
+			expected:    true,
+		},
+		{
+			name:        "raw map with contents: none",
+			permissions: map[string]any{"contents": "none", "issues": "write"},
+			expected:    true,
+		},
+		{
+			name:        "raw map with contents: read",
+			permissions: map[string]any{"contents": "read"},
+			expected:    false,
+		},
+		{
+			name:        "nil permissions",
+			permissions: nil,
+			expected:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parser := NewPermissionsParserFromValue(tt.permissions)
+			result := parser.ContentsIsNone()
+			if result != tt.expected {
+				t.Errorf("ContentsIsNone() = %v, expected %v", result, tt.expected)
+			}
+		})
+	}
+}
+
 func TestContainsCheckout(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -324,7 +416,7 @@ func TestContainsCheckout(t *testing.T) {
 			customSteps: `steps:
   - name: Echo checkout
     run: echo "actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd"`,
-			expected: true, // Current implementation does simple string match
+			expected: false,
 		},
 		{
 			name: "checkout in comment (should not match)",
@@ -332,14 +424,14 @@ func TestContainsCheckout(t *testing.T) {
   - name: Setup
     uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f
     # TODO: add actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd`,
-			expected: true, // Current implementation does simple string match
+			expected: false,
 		},
 		{
 			name: "similar but not checkout action",
 			customSteps: `steps:
   - uses: actions/cache@v3
   - uses: my-actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd`,
-			expected: true, // Current implementation matches substring
+			expected: false,
 		},
 		{
 			name: "checkout in different format",
@@ -350,10 +442,11 @@ func TestContainsCheckout(t *testing.T) {
 			expected: true,
 		},
 		{
+			// Malformed YAML: returns false — see findFirstCheckoutStepIndex godoc.
 			name: "malformed YAML with checkout",
 			customSteps: `steps
   - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd`,
-			expected: true, // Still detects the string
+			expected: false,
 		},
 		{
 			name: "checkout with complex parameters",
@@ -404,6 +497,36 @@ func TestContainsCheckout(t *testing.T) {
   - name: Step 5
     run: echo "fifth"`,
 			expected: true,
+		},
+		// Bare sequence form (no "steps:" wrapper): older call sites pass the
+		// step list directly as a YAML sequence.
+		{
+			name: "bare sequence with unnamed checkout",
+			customSteps: `- uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+  with:
+    fetch-depth: 0
+    persist-credentials: false`,
+			expected: true,
+		},
+		{
+			name: "bare sequence with named checkout",
+			customSteps: `- name: Checkout
+  uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd`,
+			expected: true,
+		},
+		{
+			name: "bare sequence without checkout",
+			customSteps: `- name: Setup Node
+  uses: actions/setup-node@v4`,
+			expected: false,
+		},
+		// Malformed YAML: findFirstCheckoutStepIndex returns (0, false) rather
+		// than attempting substring detection on unparseable input.  Callers
+		// that need checkout detection must supply valid YAML.
+		{
+			name:        "malformed YAML — explicit parse-error path",
+			customSteps: `{invalid: [yaml`,
+			expected:    false,
 		},
 	}
 
@@ -676,6 +799,11 @@ func TestPermissionsParser_ToPermissions(t *testing.T) {
 				"contents": "none",
 			},
 			wantYAML: "",
+		},
+		{
+			name:     "explicit empty map preserves deny-all",
+			input:    map[string]any{},
+			wantYAML: "permissions: {}",
 		},
 	}
 

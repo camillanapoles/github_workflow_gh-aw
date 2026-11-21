@@ -6,14 +6,15 @@ on:
   schedule: daily
   workflow_dispatch:
 permissions:
+  copilot-requests: write
   contents: read
   issues: read
 
-sandbox:
-  agent:
-    sudo: false
 
-engine: codex
+model: router/economy
+engine:
+  id: codex
+  model-provider: github
 strict: true
 network:
   allowed:
@@ -27,14 +28,12 @@ imports:
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     min-integrity: approved
     toolsets:
       - issues
   bash:
-    - "cat *"
-    - "jq *"
-    - "./.github/skills/jqschema/jqschema.sh"
+    - "*"
 steps:
   - name: Fetch issues
     env:
@@ -51,19 +50,21 @@ steps:
       gh issue list --repo "$GITHUB_REPOSITORY" \
         --search "-parent-issue:*" \
         --state open \
-        --json number,title,author,createdAt,state,url,body,labels,updatedAt,closedAt,milestone,assignees \
+        --json number,title,url,createdAt,updatedAt,body,labels \
         --limit 100 \
+        | jq 'map({
+            number,
+            title,
+            url,
+            createdAt,
+            updatedAt,
+            labels: ((.labels // []) | map(.name)),
+            body_excerpt: ((.body // "") | gsub("\\s+"; " ") | .[0:800])
+          })' \
         > /tmp/gh-aw/agent/issues-data/issues.json
 
-      # Generate schema for reference using jqschema
-      ./.github/skills/jqschema/jqschema.sh < /tmp/gh-aw/agent/issues-data/issues.json > /tmp/gh-aw/agent/issues-data/issues-schema.json
-
       echo "✓ Issues data saved to /tmp/gh-aw/agent/issues-data/issues.json"
-      echo "✓ Schema saved to /tmp/gh-aw/agent/issues-data/issues-schema.json"
       echo "Total issues fetched: $(jq 'length' /tmp/gh-aw/agent/issues-data/issues.json)"
-      echo ""
-      echo "Schema of the issues data:"
-      cat /tmp/gh-aw/agent/issues-data/issues-schema.json | jq .
 safe-outputs:
   create-issue:
     expires: 2d
@@ -72,6 +73,7 @@ safe-outputs:
     group: true
   link-sub-issue:
     max: 50
+    target: "*"
   create-discussion:
     expires: 1d
     title-prefix: "[Issue Arborist] "
@@ -96,6 +98,11 @@ experiments:
     issue: 30015
 
 
+evals:
+  - id: issues_analyzed
+    question: Did the agent analyze recent issues and identify related issue relationships?
+  - id: sub_issues_linked_or_noop
+    question: Were related issues linked as sub-issues, or was noop used when no linkable relationships were found?
 ---
 
 {{#if experiments.prompt_style == 'detailed'}}
@@ -110,8 +117,7 @@ Analyze the last 100 open issues in repository $GITHUB_REPOSITORY (see `issues_a
 ## Pre-Downloaded Data
 
 The issue data has been pre-downloaded and is available at:
-- **Issues data**: `/tmp/gh-aw/agent/issues-data/issues.json` - Contains the last 100 open issues (excluding those that are already sub-issues)
-- **Schema**: `/tmp/gh-aw/agent/issues-data/issues-schema.json` - JSON schema showing the structure of the data
+- **Issues data**: `/tmp/gh-aw/agent/issues-data/issues.json` - Contains the last 100 open issues (excluding those that are already sub-issues) with compact fields and `body_excerpt` snippets
 
 Use `cat /tmp/gh-aw/agent/issues-data/issues.json | jq ...` to query and analyze the issues.
 
@@ -122,21 +128,17 @@ Use `cat /tmp/gh-aw/agent/issues-data/issues.json | jq ...` to query and analyze
 Read the pre-downloaded issues data from `/tmp/gh-aw/agent/issues-data/issues.json`. The data includes:
 - Issue number
 - Title
-- Body/description
+- Body excerpt (first 800 normalized characters)
 - Labels
-- State (open/closed)
-- Author, assignees, milestone, timestamps
+- URL and timestamps
 
 Use `jq` to filter and analyze the data. Example queries:
 ```bash
 # Get count of issues
 jq 'length' /tmp/gh-aw/agent/issues-data/issues.json
 
-# Get open issues only
-jq '[.[] | select(.state == "OPEN")]' /tmp/gh-aw/agent/issues-data/issues.json
-
 # Get issues with specific label
-jq '[.[] | select(.labels | any(.name == "bug"))]' /tmp/gh-aw/agent/issues-data/issues.json
+jq '[.[] | select(.labels | any(. == "bug"))]' /tmp/gh-aw/agent/issues-data/issues.json
 ```
 
 ### Step 2: Analyze Relationships

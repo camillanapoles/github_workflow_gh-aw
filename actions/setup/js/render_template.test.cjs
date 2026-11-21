@@ -4,7 +4,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url),
   __dirname = path.dirname(__filename),
-  core = { info: vi.fn(), warning: vi.fn(), setFailed: vi.fn(), summary: { addHeading: vi.fn().mockReturnThis(), addRaw: vi.fn().mockReturnThis(), write: vi.fn() } };
+  core = { info: vi.fn(), debug: vi.fn(), warning: vi.fn(), setFailed: vi.fn(), summary: { addHeading: vi.fn().mockReturnThis(), addRaw: vi.fn().mockReturnThis(), write: vi.fn() } };
 global.core = core;
 const { isTruthy } = require("./is_truthy.cjs"),
   { selectBranch } = require("./template_branch.cjs"),
@@ -51,6 +51,10 @@ describe("renderMarkdownTemplate", () => {
     it("should collapse multiple false blocks without excessive empty lines", () => {
       const output = renderMarkdownTemplate("Start\n\n{{#if false}}\nBlock 1\n{{/if}}\n\n{{#if false}}\nBlock 2\n{{/if}}\n\n{{#if false}}\nBlock 3\n{{/if}}\n\nEnd");
       (expect(output).not.toMatch(/\n{3,}/), expect(output).toContain("Start"), expect(output).toContain("End"));
+    }),
+    it("should not merge the surrounding lines when a single-newline-separated falsy block is removed", () => {
+      const output = renderMarkdownTemplate("Line1\n{{#if false}}\nRemoved\n{{/if}}\nLine2\n");
+      expect(output).toBe("Line1\nLine2\n");
     }),
     it("should preserve leading spaces with truthy block", () => {
       const output = renderMarkdownTemplate("  {{#if true}}\n  Content with leading spaces\n  {{/if}}");

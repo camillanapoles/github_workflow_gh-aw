@@ -3,7 +3,11 @@
 package cli
 
 import (
+	"bytes"
+	"net/url"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -11,7 +15,32 @@ import (
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/github/gh-aw/pkg/setutil"
+	"github.com/github/gh-aw/pkg/testutil"
+	"github.com/github/gh-aw/pkg/workflow"
 )
+
+func TestDisplaySecretsSummaryTable_UnicodeNameAlignment(t *testing.T) {
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	os.Stderr = w
+	t.Cleanup(func() {
+		os.Stderr = oldStderr
+	})
+
+	displaySecretsSummaryTable([]SecretRequirement{
+		{Name: "名称", WhenNeeded: "needed"},
+		{Name: "LONGEST", WhenNeeded: "needed"},
+	}, nil)
+
+	require.NoError(t, w.Close())
+	var output bytes.Buffer
+	_, err = output.ReadFrom(r)
+	require.NoError(t, err)
+
+	assert.Contains(t, output.String(), "名称    - needed")
+	assert.Contains(t, output.String(), "LONGEST - needed")
+}
 
 func TestGetRequiredSecretsForEngine(t *testing.T) {
 	tests := []struct {
@@ -145,6 +174,178 @@ func TestGetRequiredSecretsForEngineAttributes(t *testing.T) {
 	})
 }
 
+func TestBuildCopilotPATCreationURL(t *testing.T) {
+	t.Run("defaults to public github", func(t *testing.T) {
+		// Clear all host env vars so the remote-detection fallback is exercised in
+		// isolation.  Higher-priority variables (GITHUB_SERVER_URL, etc.) are set
+		// by GitHub Actions and would otherwise override the expected default.
+		t.Setenv("GITHUB_SERVER_URL", "")
+		t.Setenv("GITHUB_ENTERPRISE_HOST", "")
+		t.Setenv("GITHUB_HOST", "")
+		t.Setenv("GH_HOST", "")
+
+		// Run outside any git checkout so that getHostFromOriginRemote() has no
+		// remote to detect, guaranteeing the github.com default is returned.
+		tmpDir := testutil.TempDir(t, "copilot-pat-url-default-*")
+		t.Chdir(tmpDir)
+
+		rawURL := buildCopilotPATCreationURL()
+		parsed, err := url.Parse(rawURL)
+		require.NoError(t, err)
+
+		assert.Equal(t, "https", parsed.Scheme)
+		assert.Equal(t, "github.com", parsed.Host)
+		assert.Equal(t, "/settings/personal-access-tokens/new", parsed.Path)
+		assert.Equal(t, constants.CopilotGitHubToken, parsed.Query().Get("name"), "token name must be prefilled to COPILOT_GITHUB_TOKEN")
+		assert.Equal(t, "read", parsed.Query().Get("user_copilot_requests"))
+		assert.Empty(t, parsed.Query().Get("contents"), "Copilot PAT setup URL should not request unrelated repository permissions")
+		assert.Empty(t, parsed.Query().Get("issues"), "Copilot PAT setup URL should not request unrelated issue permissions")
+		assert.Empty(t, parsed.Query().Get("pull_requests"), "Copilot PAT setup URL should not request unrelated pull request permissions")
+	})
+
+	t.Run("uses GH_HOST when gh auth is configured for enterprise", func(t *testing.T) {
+		// Clear higher-priority variables first so GH_HOST (the lowest-priority
+		// consumer in getGitHubHost) is actually honoured.
+		t.Setenv("GITHUB_SERVER_URL", "")
+		t.Setenv("GITHUB_ENTERPRISE_HOST", "")
+		t.Setenv("GITHUB_HOST", "")
+		t.Setenv("GH_HOST", "ghe.example.com")
+
+		rawURL := buildCopilotPATCreationURL()
+		parsed, err := url.Parse(rawURL)
+		require.NoError(t, err)
+
+		assert.Equal(t, "https", parsed.Scheme)
+		assert.Equal(t, "ghe.example.com", parsed.Host)
+		assert.Equal(t, "/settings/personal-access-tokens/new", parsed.Path)
+	})
+
+	t.Run("falls back to origin remote host when GH_HOST is unset", func(t *testing.T) {
+		t.Setenv("GH_HOST", "")
+		t.Setenv("GITHUB_HOST", "")
+		t.Setenv("GITHUB_ENTERPRISE_HOST", "")
+		t.Setenv("GITHUB_SERVER_URL", "")
+
+		tmpDir := testutil.TempDir(t, "copilot-pat-url-host-*")
+		require.NoError(t, initTestGitRepo(tmpDir))
+		require.NoError(t, addOriginRemoteToTestRepo(tmpDir, "https://ghes.example.com/org/repo.git"))
+		t.Chdir(tmpDir)
+
+		rawURL := buildCopilotPATCreationURL()
+		parsed, err := url.Parse(rawURL)
+		require.NoError(t, err)
+
+		assert.Equal(t, "https", parsed.Scheme)
+		assert.Equal(t, "ghes.example.com", parsed.Host)
+		assert.Equal(t, "/settings/personal-access-tokens/new", parsed.Path)
+	})
+}
+
+func TestEnsureSecretAvailable_ExistingCopilotSecret(t *testing.T) {
+	copilotReq := SecretRequirement{
+		Name:           constants.CopilotGitHubToken,
+		IsEngineSecret: true,
+		EngineName:     string(constants.CopilotEngine),
+	}
+	claudeReq := SecretRequirement{
+		Name:           "ANTHROPIC_API_KEY",
+		IsEngineSecret: true,
+		EngineName:     string(constants.ClaudeEngine),
+	}
+
+	t.Run("uses existing Copilot secret when confirmed", func(t *testing.T) {
+		promptCalled := false
+		origConfirm := engineSecretsConfirmExistingFn
+		origPrompt := engineSecretsPromptFn
+		t.Cleanup(func() {
+			engineSecretsConfirmExistingFn = origConfirm
+			engineSecretsPromptFn = origPrompt
+		})
+		engineSecretsConfirmExistingFn = func(secretName string, _ EngineSecretConfig) (bool, error) {
+			assert.Equal(t, constants.CopilotGitHubToken, secretName)
+			return true, nil
+		}
+		engineSecretsPromptFn = func(_ SecretRequirement, _ EngineSecretConfig) error {
+			promptCalled = true
+			return nil
+		}
+
+		cfg := EngineSecretConfig{
+			ExistingSecrets: map[string]struct{}{constants.CopilotGitHubToken: {}},
+		}
+		require.NoError(t, ensureSecretAvailable(copilotReq, cfg))
+		assert.False(t, promptCalled, "confirmed existing secret must not trigger a token prompt")
+	})
+
+	t.Run("replaces existing Copilot secret when requested", func(t *testing.T) {
+		var capturedConfig EngineSecretConfig
+		origConfirm := engineSecretsConfirmExistingFn
+		origPrompt := engineSecretsPromptFn
+		t.Cleanup(func() {
+			engineSecretsConfirmExistingFn = origConfirm
+			engineSecretsPromptFn = origPrompt
+		})
+		engineSecretsConfirmExistingFn = func(_ string, _ EngineSecretConfig) (bool, error) {
+			return false, nil
+		}
+		engineSecretsPromptFn = func(req SecretRequirement, config EngineSecretConfig) error {
+			capturedConfig = config
+			return nil
+		}
+
+		cfg := EngineSecretConfig{
+			ExistingSecrets: map[string]struct{}{constants.CopilotGitHubToken: {}},
+		}
+		require.NoError(t, ensureSecretAvailable(copilotReq, cfg))
+		assert.True(t, capturedConfig.OverwriteExistingSecret, "replacement prompt must overwrite the existing secret")
+	})
+
+	t.Run("existing non-Copilot secret skips prompt", func(t *testing.T) {
+		called := false
+		orig := engineSecretsPromptFn
+		t.Cleanup(func() { engineSecretsPromptFn = orig })
+		engineSecretsPromptFn = func(_ SecretRequirement, _ EngineSecretConfig) error {
+			called = true
+			return nil
+		}
+
+		cfg := EngineSecretConfig{
+			ExistingSecrets: map[string]struct{}{"ANTHROPIC_API_KEY": {}},
+		}
+		require.NoError(t, ensureSecretAvailable(claudeReq, cfg))
+		assert.False(t, called, "non-Copilot existing secret must not trigger a prompt")
+	})
+}
+
+func TestEnsureSecretAvailableClaudeOAuthToken(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "private-oauth-token")
+	req := SecretRequirement{
+		Name:           "ANTHROPIC_API_KEY",
+		IsEngineSecret: true,
+		EngineName:     string(constants.ClaudeEngine),
+	}
+	originalPrompt := engineSecretsPromptFn
+	t.Cleanup(func() { engineSecretsPromptFn = originalPrompt })
+	prompted := false
+	engineSecretsPromptFn = func(_ SecretRequirement, _ EngineSecretConfig) error {
+		prompted = true
+		return nil
+	}
+
+	err := ensureSecretAvailable(req, EngineSecretConfig{})
+	require.ErrorIs(t, err, errUnsupportedClaudeOAuthToken)
+	assert.NotContains(t, err.Error(), "private-oauth-token")
+	assert.False(t, prompted)
+
+	t.Run("existing repository secret is accepted", func(t *testing.T) {
+		err := ensureSecretAvailable(req, EngineSecretConfig{
+			ExistingSecrets: map[string]struct{}{"ANTHROPIC_API_KEY": {}},
+		})
+		require.NoError(t, err)
+	})
+}
+
 func TestStringContainsSecretName(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -222,6 +423,39 @@ func TestStringContainsSecretName(t *testing.T) {
 				tt.output, tt.secretName, got, tt.want)
 		})
 	}
+}
+
+func TestUploadSecretToRepo_UsesStdinForSecretValue(t *testing.T) {
+	fakeBinDir := t.TempDir()
+	fakeGH := filepath.Join(fakeBinDir, "gh")
+	argsLog := filepath.Join(fakeBinDir, "gh-args.log")
+	stdinLog := filepath.Join(fakeBinDir, "gh-stdin.log")
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> \"" + argsLog + "\"\n" +
+		"if [ \"$1\" = \"secret\" ] && [ \"$2\" = \"list\" ]; then\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = \"secret\" ] && [ \"$2\" = \"set\" ]; then\n" +
+		"  cat > \"" + stdinLog + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 1\n"
+	require.NoError(t, os.WriteFile(fakeGH, []byte(script), 0o755))
+	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	err := uploadSecretToRepo(t.Context(), "TEST_SECRET", "super-secret-value", "owner/repo", false, true)
+	require.NoError(t, err)
+
+	argsBytes, readArgsErr := os.ReadFile(argsLog)
+	require.NoError(t, readArgsErr)
+	args := string(argsBytes)
+	assert.Contains(t, args, "secret set TEST_SECRET --repo owner/repo")
+	assert.NotContains(t, args, "--body")
+	assert.NotContains(t, args, "super-secret-value")
+
+	stdinBytes, readStdinErr := os.ReadFile(stdinLog)
+	require.NoError(t, readStdinErr)
+	assert.Equal(t, "super-secret-value", strings.TrimSpace(string(stdinBytes)))
 }
 
 func TestGetEngineSecretDescription(t *testing.T) {
@@ -304,33 +538,7 @@ func TestEngineSecretConfigStructure(t *testing.T) {
 }
 
 func TestGetEngineSecretNameAndValue(t *testing.T) {
-	// Save current env and restore after test
-	oldCopilotToken := os.Getenv("COPILOT_GITHUB_TOKEN")
-	oldAnthropicKey := os.Getenv("ANTHROPIC_API_KEY")
-	oldOpenAIKey := os.Getenv("OPENAI_API_KEY")
-	oldCodexKey := os.Getenv("CODEX_API_KEY")
-	defer func() {
-		if oldCopilotToken != "" {
-			os.Setenv("COPILOT_GITHUB_TOKEN", oldCopilotToken)
-		} else {
-			os.Unsetenv("COPILOT_GITHUB_TOKEN")
-		}
-		if oldAnthropicKey != "" {
-			os.Setenv("ANTHROPIC_API_KEY", oldAnthropicKey)
-		} else {
-			os.Unsetenv("ANTHROPIC_API_KEY")
-		}
-		if oldOpenAIKey != "" {
-			os.Setenv("OPENAI_API_KEY", oldOpenAIKey)
-		} else {
-			os.Unsetenv("OPENAI_API_KEY")
-		}
-		if oldCodexKey != "" {
-			os.Setenv("CODEX_API_KEY", oldCodexKey)
-		} else {
-			os.Unsetenv("CODEX_API_KEY")
-		}
-	}()
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
 
 	t.Run("secret exists in repository", func(t *testing.T) {
 		existingSecrets := map[string]struct {
@@ -347,8 +555,7 @@ func TestGetEngineSecretNameAndValue(t *testing.T) {
 	})
 
 	t.Run("secret found in environment", func(t *testing.T) {
-		os.Setenv("ANTHROPIC_API_KEY", "test-api-key-12345")
-		defer os.Unsetenv("ANTHROPIC_API_KEY")
+		t.Setenv("ANTHROPIC_API_KEY", "test-api-key-12345")
 
 		existingSecrets := map[string]struct {
 		}{}
@@ -362,8 +569,8 @@ func TestGetEngineSecretNameAndValue(t *testing.T) {
 	})
 
 	t.Run("secret not in repo or environment", func(t *testing.T) {
-		os.Unsetenv("OPENAI_API_KEY")
-		os.Unsetenv("CODEX_API_KEY")
+		t.Setenv("OPENAI_API_KEY", "")
+		t.Setenv("CODEX_API_KEY", "")
 
 		existingSecrets := map[string]struct {
 		}{}
@@ -383,10 +590,12 @@ func TestGetEngineSecretNameAndValue(t *testing.T) {
 		_, _, _, err := GetEngineSecretNameAndValue("unknown-engine", existingSecrets)
 
 		require.Error(t, err, "Should error for unknown engine")
-		assert.Contains(t, err.Error(), "unknown engine", "Error should mention unknown engine")
+		require.ErrorContains(t, err, "unknown engine", "Error should mention unknown engine")
 	})
 
 	t.Run("no alternative secret in repo", func(t *testing.T) {
+		t.Setenv("ANTHROPIC_API_KEY", "")
+
 		existingSecrets := map[string]struct {
 		}{}
 
@@ -399,8 +608,7 @@ func TestGetEngineSecretNameAndValue(t *testing.T) {
 	})
 
 	t.Run("prefers primary secret over environment", func(t *testing.T) {
-		os.Setenv("COPILOT_GITHUB_TOKEN", "test-token-from-env")
-		defer os.Unsetenv("COPILOT_GITHUB_TOKEN")
+		t.Setenv("COPILOT_GITHUB_TOKEN", "test-token-from-env")
 
 		existingSecrets := map[string]struct {
 		}{
@@ -413,6 +621,68 @@ func TestGetEngineSecretNameAndValue(t *testing.T) {
 		assert.Equal(t, "COPILOT_GITHUB_TOKEN", name)
 		assert.Empty(t, value, "Should prefer existing repo secret over environment")
 		assert.True(t, existsInRepo, "Should indicate secret exists in repo")
+	})
+}
+
+func TestGetEngineSecretNameAndValueClaudeOAuthToken(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "private-oauth-token")
+
+	t.Run("unsupported token alone", func(t *testing.T) {
+		_, _, _, err := GetEngineSecretNameAndValue("claude", nil)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "CLAUDE_CODE_OAUTH_TOKEN")
+		require.ErrorContains(t, err, "ANTHROPIC_API_KEY")
+		require.ErrorContains(t, err, "Workload Identity Federation")
+		assert.NotContains(t, err.Error(), "private-oauth-token")
+	})
+
+	t.Run("API key in environment takes precedence", func(t *testing.T) {
+		t.Setenv("ANTHROPIC_API_KEY", "supported-api-key")
+		name, value, exists, err := GetEngineSecretNameAndValue("claude", nil)
+		require.NoError(t, err)
+		assert.Equal(t, "ANTHROPIC_API_KEY", name)
+		assert.Equal(t, "supported-api-key", value)
+		assert.False(t, exists)
+	})
+
+	t.Run("repository secret takes precedence", func(t *testing.T) {
+		name, value, exists, err := GetEngineSecretNameAndValue("claude", map[string]struct{}{"ANTHROPIC_API_KEY": {}})
+		require.NoError(t, err)
+		assert.Equal(t, "ANTHROPIC_API_KEY", name)
+		assert.Empty(t, value)
+		assert.True(t, exists)
+	})
+}
+
+func TestMustValidateExistingSecretValue(t *testing.T) {
+	t.Run("copilot engine secret requires revalidation", func(t *testing.T) {
+		req := SecretRequirement{
+			Name:           "COPILOT_GITHUB_TOKEN",
+			IsEngineSecret: true,
+			EngineName:     string(constants.CopilotEngine),
+		}
+
+		assert.True(t, mustValidateExistingSecretValue(req))
+	})
+
+	t.Run("non-copilot engine secret does not require revalidation", func(t *testing.T) {
+		req := SecretRequirement{
+			Name:           "ANTHROPIC_API_KEY",
+			IsEngineSecret: true,
+			EngineName:     string(constants.ClaudeEngine),
+		}
+
+		assert.False(t, mustValidateExistingSecretValue(req))
+	})
+
+	t.Run("system secret does not require revalidation", func(t *testing.T) {
+		req := SecretRequirement{
+			Name:           "GH_AW_GITHUB_TOKEN",
+			IsEngineSecret: false,
+		}
+
+		assert.False(t, mustValidateExistingSecretValue(req))
 	})
 }
 
@@ -611,4 +881,157 @@ func TestGetMissingRequiredSecrets(t *testing.T) {
 		assert.Len(t, missing, 1, "Should have 1 missing required secret")
 		assert.Equal(t, "ANTHROPIC_API_KEY", missing[0].Name, "Should only include ANTHROPIC_API_KEY")
 	})
+}
+
+func TestSecretRequirementsFromAuthDefinition(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		auth       *workflow.AuthDefinition
+		engineName string
+		want       []SecretRequirement
+	}{
+		{
+			name:       "nil auth returns nil",
+			auth:       nil,
+			engineName: "custom",
+			want:       nil,
+		},
+		{
+			name: "oauth strategy with both client id and secret refs",
+			auth: &workflow.AuthDefinition{
+				Strategy:        workflow.AuthStrategyOAuthClientCreds,
+				ClientIDRef:     "OAUTH_CLIENT_ID",
+				ClientSecretRef: "OAUTH_CLIENT_SECRET",
+			},
+			engineName: "myengine",
+			want: []SecretRequirement{
+				{
+					Name:           "OAUTH_CLIENT_ID",
+					WhenNeeded:     "OAuth client ID for myengine engine",
+					Description:    "GitHub Actions secret holding the OAuth 2.0 client ID used to obtain access tokens.",
+					IsEngineSecret: true,
+					EngineName:     "myengine",
+				},
+				{
+					Name:           "OAUTH_CLIENT_SECRET",
+					WhenNeeded:     "OAuth client secret for myengine engine",
+					Description:    "GitHub Actions secret holding the OAuth 2.0 client secret used to obtain access tokens.",
+					IsEngineSecret: true,
+					EngineName:     "myengine",
+				},
+			},
+		},
+		{
+			name: "oauth strategy with only client id ref",
+			auth: &workflow.AuthDefinition{
+				Strategy:    workflow.AuthStrategyOAuthClientCreds,
+				ClientIDRef: "OAUTH_CLIENT_ID",
+			},
+			engineName: "myengine",
+			want: []SecretRequirement{
+				{
+					Name:           "OAUTH_CLIENT_ID",
+					WhenNeeded:     "OAuth client ID for myengine engine",
+					Description:    "GitHub Actions secret holding the OAuth 2.0 client ID used to obtain access tokens.",
+					IsEngineSecret: true,
+					EngineName:     "myengine",
+				},
+			},
+		},
+		{
+			name: "oauth strategy with only client secret ref",
+			auth: &workflow.AuthDefinition{
+				Strategy:        workflow.AuthStrategyOAuthClientCreds,
+				ClientSecretRef: "OAUTH_CLIENT_SECRET",
+			},
+			engineName: "myengine",
+			want: []SecretRequirement{
+				{
+					Name:           "OAUTH_CLIENT_SECRET",
+					WhenNeeded:     "OAuth client secret for myengine engine",
+					Description:    "GitHub Actions secret holding the OAuth 2.0 client secret used to obtain access tokens.",
+					IsEngineSecret: true,
+					EngineName:     "myengine",
+				},
+			},
+		},
+		{
+			name: "oauth strategy with neither ref returns empty",
+			auth: &workflow.AuthDefinition{
+				Strategy: workflow.AuthStrategyOAuthClientCreds,
+			},
+			engineName: "myengine",
+			want:       nil,
+		},
+		{
+			name: "api-key strategy with secret",
+			auth: &workflow.AuthDefinition{
+				Strategy: workflow.AuthStrategyAPIKey,
+				Secret:   "MY_API_KEY",
+			},
+			engineName: "myengine",
+			want: []SecretRequirement{
+				{
+					Name:           "MY_API_KEY",
+					WhenNeeded:     "API key or token for myengine engine",
+					Description:    "GitHub Actions secret holding the API key or bearer token for provider authentication.",
+					IsEngineSecret: true,
+					EngineName:     "myengine",
+				},
+			},
+		},
+		{
+			name: "bearer strategy with secret",
+			auth: &workflow.AuthDefinition{
+				Strategy: workflow.AuthStrategyBearer,
+				Secret:   "MY_BEARER_TOKEN",
+			},
+			engineName: "myengine",
+			want: []SecretRequirement{
+				{
+					Name:           "MY_BEARER_TOKEN",
+					WhenNeeded:     "API key or token for myengine engine",
+					Description:    "GitHub Actions secret holding the API key or bearer token for provider authentication.",
+					IsEngineSecret: true,
+					EngineName:     "myengine",
+				},
+			},
+		},
+		{
+			name: "unset strategy with secret defaults to direct secret handling",
+			auth: &workflow.AuthDefinition{
+				Secret: "DEFAULT_SECRET",
+			},
+			engineName: "myengine",
+			want: []SecretRequirement{
+				{
+					Name:           "DEFAULT_SECRET",
+					WhenNeeded:     "API key or token for myengine engine",
+					Description:    "GitHub Actions secret holding the API key or bearer token for provider authentication.",
+					IsEngineSecret: true,
+					EngineName:     "myengine",
+				},
+			},
+		},
+		{
+			name: "default strategy branch with empty secret returns empty",
+			auth: &workflow.AuthDefinition{
+				Strategy: workflow.AuthStrategyAPIKey,
+			},
+			engineName: "myengine",
+			want:       nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := secretRequirementsFromAuthDefinition(tt.auth, tt.engineName)
+
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }

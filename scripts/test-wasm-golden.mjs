@@ -22,15 +22,10 @@ import { execSync } from "child_process";
 import { createRequire } from "module";
 
 const ROOT = resolve(import.meta.dirname, "..");
-const FIXTURES_DIR = join(
-  ROOT,
-  "pkg/workflow/testdata/wasm_golden/fixtures"
-);
-const GOLDEN_DIR = join(
-  ROOT,
-  "pkg/workflow/testdata/wasm_golden"
-);
+const FIXTURES_DIR = join(ROOT, "pkg/workflow/testdata/wasm_golden/fixtures");
+const GOLDEN_DIR = join(ROOT, "pkg/workflow/testdata/wasm_golden");
 const WASM_FILE = join(ROOT, "gh-aw.wasm");
+const VERSION_CONSTANTS_FILE = join(ROOT, "pkg/constants/version_constants.go");
 const UPDATE_MODE = process.argv.includes("--update");
 
 // Fixtures with known wasm-vs-native divergence due to filesystem limitations.
@@ -38,10 +33,43 @@ const UPDATE_MODE = process.argv.includes("--update");
 // workflow_run triggers (missing fork validation, zizmor annotations) and
 // pre_activation job generation. These are tracked for future resolution.
 const KNOWN_WASM_DIVERGENCE = new Set([
-  "ci-doctor",            // workflow_run trigger: missing zizmor annotation + fork validation
+  "ci-doctor", // workflow_run trigger: missing zizmor annotation + fork validation
   "copilot-cli-deep-research", // pre_activation job generated differently in wasm
-  "dev-hawk",             // workflow_run trigger: missing zizmor annotation + fork validation
+  "dev-hawk", // workflow_run trigger: missing zizmor annotation + fork validation
 ]);
+
+function escapeRegex(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function loadDefaultRuntimeVersions() {
+  const source = readFileSync(VERSION_CONSTANTS_FILE, "utf8");
+  const getVersion = name => {
+    const match = source.match(new RegExp(`^const\\s+${name}\\s+Version\\s+=\\s+"([^"]+)"`, "m"));
+    if (!match) {
+      throw new Error(`Could not find ${name} in ${VERSION_CONSTANTS_FILE}`);
+    }
+    return match[1];
+  };
+
+  const awfVersion = getVersion("DefaultFirewallVersion");
+  const copilotChecksumsSHA256 = source.match(/^const DefaultCopilotChecksumsSHA256 = "([0-9a-f]{64})"$/m)?.[1];
+  if (!copilotChecksumsSHA256) {
+    throw new Error(`Could not find DefaultCopilotChecksumsSHA256 in ${VERSION_CONSTANTS_FILE}`);
+  }
+  return {
+    awfVersion,
+    awfImageTag: awfVersion.replace(/^v/, ""),
+    mcpgVersion: getVersion("DefaultMCPGatewayVersion"),
+    ghMcpVersion: getVersion("DefaultGitHubMCPServerVersion"),
+    codexVersion: getVersion("DefaultCodexVersion"),
+    piVersion: getVersion("DefaultPiVersion"),
+    copilotVersion: getVersion("DefaultCopilotVersion"),
+    copilotChecksumsSHA256,
+  };
+}
+
+const DEFAULT_RUNTIME_VERSIONS = loadDefaultRuntimeVersions();
 
 // ── Build wasm if needed ─────────────────────────────────────────────
 function ensureWasmBuilt() {
@@ -63,8 +91,9 @@ function loadWasmExecJs() {
   if (!existsSync(wasmExecPath)) {
     throw new Error(`wasm_exec.js not found in ${goRoot}/lib/wasm/ or ${goRoot}/misc/wasm/`);
   }
-  // wasm_exec.js expects a global `require` for Node.js
+  // Supply Node's filesystem so wasm_exec.js does not fall back to ENOSYS stubs.
   globalThis.require = createRequire(import.meta.url);
+  globalThis.fs = globalThis.require("fs");
   // Load the wasm_exec.js script (it defines globalThis.Go)
   const script = readFileSync(wasmExecPath, "utf8");
   // Use indirect eval to run in global scope
@@ -80,13 +109,10 @@ async function instantiateWasm() {
   // Start the Go runtime (it blocks, runs in background)
   go.run(result.instance);
   // Wait a moment for the Go runtime to register the global function
-  await new Promise((r) => setTimeout(r, 200));
+  await new Promise(r => setTimeout(r, 200));
 
   if (typeof globalThis.compileWorkflow !== "function") {
-    throw new Error(
-      "compileWorkflow function not registered by wasm module. " +
-        "Ensure cmd/gh-aw-wasm/main.go sets js.Global().Set('compileWorkflow', ...)"
-    );
+    throw new Error("compileWorkflow function not registered by wasm module. " + "Ensure cmd/gh-aw-wasm/main.go sets js.Global().Set('compileWorkflow', ...)");
   }
   console.log("Wasm module loaded, compileWorkflow function available");
   return globalThis.compileWorkflow;
@@ -122,8 +148,8 @@ function loadAllSharedFiles() {
 // ── Load fixtures ────────────────────────────────────────────────────
 function loadFixtures() {
   const sharedFiles = loadAllSharedFiles();
-  const files = readdirSync(FIXTURES_DIR).filter((f) => f.endsWith(".md"));
-  return files.map((f) => ({
+  const files = readdirSync(FIXTURES_DIR).filter(f => f.endsWith(".md"));
+  return files.map(f => ({
     name: f.replace(/\.md$/, ""),
     filename: f,
     content: readFileSync(join(FIXTURES_DIR, f), "utf8"),
@@ -169,10 +195,51 @@ function normalizeProjectUTC(content) {
 // Keep golden fixtures stable across copilot default model fallback updates.
 // Mirrors normalizeOutput() in pkg/workflow/wasm_golden_test.go.
 function normalizeCopilotDefaultModel(content) {
-  return content.replace(
-    /\|\| 'claude-sonnet-\d+\.\d+'/g,
-    "|| 'default'"
-  );
+  return content
+    .replace(/\|\| 'claude-sonnet-[\d.]+'/g, "|| 'default'")
+    .replace(/\|\| 'auto'/g, "|| 'default'")
+    .replace(/\|\| 'gpt-[\d.][\w.-]*'/g, "|| 'default'");
+}
+
+// ── Normalize AWF config payload ─────────────────────────────────────────
+// Keep golden fixtures stable across AWF config payload changes (model aliases,
+// domain allowlists, container image tags). The entire JSON body is replaced with
+// a stable placeholder so that model/domain additions don't break golden comparisons.
+// Mirrors testAWFConfigPayloadRE / normalizeOutput() in pkg/workflow/wasm_golden_test.go.
+function normalizeAWFConfigPayload(content) {
+  return content.replace(/(printf '%s\\n' ")(\{.*\})(" > "\$\{RUNNER_TEMP\}\/gh-aw\/awf-config\.json")/g, "$1AWF_CONFIG_PAYLOAD$3");
+}
+
+// ── Normalize actions/checkout pin ──────────────────────────────────────
+// Keep golden fixtures stable across actions/checkout pin version bumps.
+// Mirrors testCheckoutPinRE / normalizeOutput() in pkg/workflow/wasm_golden_test.go.
+function normalizeCheckoutPin(content) {
+  return content.replace(/actions\/checkout@[0-9a-f]{40}\s+#\s+v\d+\.\d+\.\d+/g, "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0");
+}
+
+// ── Normalize default runtime versions ───────────────────────────────────
+// Keep tracked wasm snapshots stable across default AWF/MCPG version bumps
+// without masking explicitly pinned non-default versions in fixtures.
+function normalizeDefaultRuntimeVersions(content) {
+  const { awfVersion, awfImageTag, mcpgVersion, ghMcpVersion, codexVersion, piVersion, copilotVersion, copilotChecksumsSHA256 } = DEFAULT_RUNTIME_VERSIONS;
+  return content
+    .replace(new RegExp(`GH_AW_INFO_AWF_VERSION: "${escapeRegex(awfVersion)}"`, "g"), 'GH_AW_INFO_AWF_VERSION: "vAWF_VERSION"')
+    .replace(new RegExp(`GH_AW_INFO_AWMG_VERSION: "${escapeRegex(mcpgVersion)}"`, "g"), 'GH_AW_INFO_AWMG_VERSION: "vMCPG_VERSION"')
+    .replace(new RegExp(`(install_awf_binary\\.sh"\\s+)${escapeRegex(awfVersion)}\\b`, "g"), "$1vAWF_VERSION")
+    .replace(new RegExp(`(ghcr\\.io/github/gh-aw-firewall/(?:agent|api-proxy|cli-proxy|router|squid):)${escapeRegex(awfImageTag)}\\b`, "g"), "$1AWF_VERSION")
+    .replace(new RegExp(`(releases/download/)${escapeRegex(awfVersion)}(/awf-config\\.schema\\.json)`, "g"), "$1vAWF_VERSION$2")
+    .replace(new RegExp(`("imageTag"\\s*:\\s*")(?:v)?${escapeRegex(awfImageTag)}"`, "g"), '$1AWF_VERSION"')
+    .replace(new RegExp(`(ghcr\\.io/github/gh-aw-mcpg:)${escapeRegex(mcpgVersion)}\\b`, "g"), "$1MCPG_VERSION")
+    .replace(new RegExp(`(ghcr\\.io/github/github-mcp-server:)${escapeRegex(ghMcpVersion)}\\b`, "g"), "$1GH_MCP_VERSION")
+    .replace(new RegExp(`GH_AW_INFO_VERSION: "${escapeRegex(codexVersion)}"`, "g"), 'GH_AW_INFO_VERSION: "CODEX_VERSION"')
+    .replace(new RegExp(`GH_AW_INFO_AGENT_VERSION: "${escapeRegex(codexVersion)}"`, "g"), 'GH_AW_INFO_AGENT_VERSION: "CODEX_VERSION"')
+    .replace(new RegExp(`(@openai/codex@)${escapeRegex(codexVersion)}\\b`, "g"), "$1CODEX_VERSION")
+    .replace(new RegExp(`GH_AW_INFO_VERSION: "${escapeRegex(piVersion)}"`, "g"), 'GH_AW_INFO_VERSION: "PI_VERSION"')
+    .replace(new RegExp(`GH_AW_INFO_AGENT_VERSION: "${escapeRegex(piVersion)}"`, "g"), 'GH_AW_INFO_AGENT_VERSION: "PI_VERSION"')
+    .replace(new RegExp(`(@earendil-works/pi-coding-agent@)${escapeRegex(piVersion)}\\b`, "g"), "$1PI_VERSION")
+    .replace(new RegExp(`GH_AW_INFO_VERSION: "${escapeRegex(copilotVersion)}"`, "g"), 'GH_AW_INFO_VERSION: "COPILOT_VERSION"')
+    .replace(new RegExp(`GH_AW_INFO_AGENT_VERSION: "${escapeRegex(copilotVersion)}"`, "g"), 'GH_AW_INFO_AGENT_VERSION: "COPILOT_VERSION"')
+    .replace(new RegExp(`(install_copilot_cli\\.sh"\\s+)v?${escapeRegex(copilotVersion)}(\\s+(?:--rootless\\s+)?--checksums-sha256\\s+)${escapeRegex(copilotChecksumsSHA256)}\\b`, "g"), "$1COPILOT_VERSION$2COPILOT_CHECKSUMS_SHA256");
 }
 
 // ── Normalize output ──────────────────────────────────────────────────
@@ -181,24 +248,21 @@ function normalizeCopilotDefaultModel(content) {
 // new normalization steps only need to be added in one place.
 // Mirrors normalizeOutput() in pkg/workflow/wasm_golden_test.go.
 function normalize(content) {
-  return normalizeCopilotDefaultModel(
-    normalizeProjectUTC(
-      normalizeAWFImageTagDigests(
-        normalizeContainerPins(normalizeHeredocDelimiters(content))
-      )
-    )
-  );
+  const heredocNormalized = normalizeHeredocDelimiters(content);
+  const containerNormalized = normalizeContainerPins(heredocNormalized);
+  const imageTagsNormalized = normalizeAWFImageTagDigests(containerNormalized);
+  const projectUTCNormalized = normalizeProjectUTC(imageTagsNormalized);
+  const modelNormalized = normalizeCopilotDefaultModel(projectUTCNormalized);
+  const runtimeNormalized = normalizeDefaultRuntimeVersions(modelNormalized);
+  const checkoutNormalized = normalizeCheckoutPin(runtimeNormalized);
+  return normalizeAWFConfigPayload(checkoutNormalized);
 }
 
 // ── Load golden file ─────────────────────────────────────────────────
 function loadGoldenFile(testName) {
   // Golden files follow the charmbracelet/x/exp/golden convention:
   // pkg/workflow/testdata/TestWasmGolden_CompileFixtures/<name>.golden
-  const goldenPath = join(
-    ROOT,
-    "pkg/workflow/testdata/TestWasmGolden_CompileFixtures",
-    testName + ".golden"
-  );
+  const goldenPath = join(ROOT, "pkg/workflow/testdata/TestWasmGolden_CompileFixtures", testName + ".golden");
   if (!existsSync(goldenPath)) {
     return null;
   }
@@ -212,13 +276,15 @@ function saveWasmGoldenFile(testName, content) {
     mkdirSync(dir, { recursive: true });
   }
   const goldenPath = join(dir, testName + ".golden");
-  writeFileSync(goldenPath, content);
+  writeFileSync(goldenPath, normalize(content));
 }
 
 // ── Main test runner ─────────────────────────────────────────────────
 async function main() {
   ensureWasmBuilt();
   loadWasmExecJs();
+  // Resolve configuration and runtime imports from the same directory as the Go tests.
+  process.chdir(FIXTURES_DIR);
   const compileWorkflow = await instantiateWasm();
   const fixtures = loadFixtures();
 
@@ -284,11 +350,7 @@ async function main() {
         // Find first difference
         const wasmLines = normalizedWasm.split("\n");
         const goldenLines = normalizedGolden.split("\n");
-        for (
-          let i = 0;
-          i < Math.min(wasmLines.length, goldenLines.length);
-          i++
-        ) {
+        for (let i = 0; i < Math.min(wasmLines.length, goldenLines.length); i++) {
           if (wasmLines[i] !== goldenLines[i]) {
             failures.push({
               name: fixture.name,
@@ -300,9 +362,7 @@ async function main() {
         if (wasmLines.length !== goldenLines.length) {
           failures.push({
             name: fixture.name,
-            error:
-              (failures.length > 0 ? failures[failures.length - 1].error + "\n" : "") +
-              `Line count: wasm=${wasmLines.length}, golden=${goldenLines.length}`,
+            error: (failures.length > 0 ? failures[failures.length - 1].error + "\n" : "") + `Line count: wasm=${wasmLines.length}, golden=${goldenLines.length}`,
           });
         }
         failed++;
@@ -321,7 +381,7 @@ async function main() {
         msg.includes("Validation failed") ||
         msg.includes("file not found in virtual filesystem");
       if (isWasmLimitation) {
-        console.log("SKIP (cannot compile in wasm)");
+        console.log(`SKIP (cannot compile in wasm: ${msg})`);
         skipped++;
       } else {
         console.log("ERROR");
@@ -336,9 +396,7 @@ async function main() {
 
   // Summary
   console.log(`\n${"=".repeat(60)}`);
-  console.log(
-    `Results: ${passed} passed, ${failed} failed, ${skipped} skipped (${fixtures.length} total)`
-  );
+  console.log(`Results: ${passed} passed, ${failed} failed, ${skipped} skipped (${fixtures.length} total)`);
 
   if (failures.length > 0) {
     console.log(`\nFailures:`);
@@ -356,7 +414,7 @@ async function main() {
   process.exit(failed > 0 ? 1 : 0);
 }
 
-main().catch((err) => {
+main().catch(err => {
   console.error("Fatal error:", err);
   process.exit(2);
 });

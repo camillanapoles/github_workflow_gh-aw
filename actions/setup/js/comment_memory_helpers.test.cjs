@@ -1,7 +1,16 @@
+import fs from "fs";
+import path from "path";
 import { describe, it, expect, vi } from "vitest";
-import { extractCommentMemoryEntries, isSafeMemoryId, stripCommentMemoryCodeFence, buildCodeFenceOpener } from "./comment_memory_helpers.cjs";
+import { buildCodeFenceOpener, extractCommentMemoryEntries, isSafeMemoryId, listCommentMemoryFiles, stripCommentMemoryCodeFence } from "./comment_memory_helpers.cjs";
+import { renderReport } from "./report_ast.cjs";
 
 describe("comment_memory_helpers", () => {
+  it("extracts a rendered memory tree without truncating embedded fences or marker examples", () => {
+    const content = "before\n``````\ninside\n````````\n<!-- gh-aw-execution: literal -->\nafter";
+    const body = renderReport({ type: "report", title: "Memory", children: [{ type: "code_block", language: "gh-aw-comment-memory:notes", fenceLength: 6, value: content, agentTainted: true }] }).body;
+    expect(extractCommentMemoryEntries(body)).toEqual([{ memoryId: "notes", content }]);
+  });
+
   it("builds code-fence opener with memory id", () => {
     expect(buildCodeFenceOpener("default")).toBe("``````gh-aw-comment-memory:default");
     expect(buildCodeFenceOpener("session-1")).toBe("``````gh-aw-comment-memory:session-1");
@@ -10,6 +19,15 @@ describe("comment_memory_helpers", () => {
   it("extracts managed memory entries from new code-fence format", () => {
     const entries = extractCommentMemoryEntries("``````gh-aw-comment-memory:default\nhello\n``````\n");
     expect(entries).toEqual([{ memoryId: "default", content: "hello" }]);
+  });
+
+  it("extracts adjacent memory blocks with different fence lengths without consuming the next opener", () => {
+    const body = "``````gh-aw-comment-memory:one\nfirst\n``````\n```````gh-aw-comment-memory:two\nsecond\n```````\n``````gh-aw-comment-memory:three\nthird\n``````\n";
+    expect(extractCommentMemoryEntries(body)).toEqual([
+      { memoryId: "one", content: "first" },
+      { memoryId: "two", content: "second" },
+      { memoryId: "three", content: "third" },
+    ]);
   });
 
   it("extracts multiple entries from new code-fence format", () => {
@@ -86,5 +104,23 @@ describe("comment_memory_helpers", () => {
     const tooLongId = "b".repeat(129);
     expect(isSafeMemoryId(maxLengthId)).toBe(true);
     expect(isSafeMemoryId(tooLongId)).toBe(false);
+  });
+
+  it("wraps directory read failures with the memory directory path", () => {
+    const memoryDir = fs.mkdtempSync(path.join("/tmp", "comment-memory-"));
+    const originalReaddirSync = fs.readdirSync;
+    const readdirSpy = vi.spyOn(fs, "readdirSync").mockImplementation((dirPath, options) => {
+      if (dirPath === memoryDir) {
+        throw new Error("EACCES");
+      }
+      return originalReaddirSync.call(fs, dirPath, options);
+    });
+
+    try {
+      expect(() => listCommentMemoryFiles(memoryDir)).toThrow(`Failed to read comment-memory directory ${memoryDir}: EACCES`);
+    } finally {
+      readdirSpy.mockRestore();
+      fs.rmSync(memoryDir, { recursive: true, force: true });
+    }
   });
 });

@@ -81,6 +81,147 @@ Reads cache memory and dispatches tasks.
 	assert.NotContains(t, yamlStr, "update_cache_memory:", "update_cache_memory job should not be created without threat detection")
 }
 
+func TestCustomJobRestoreMemoryDriveMemory(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "custom-job-restore-drive-memory")
+
+	frontmatter := `---
+name: Orchestrator
+on: workflow_dispatch
+permissions:
+  contents: read
+engine: copilot
+strict: false
+tools:
+  drive-memory: true
+jobs:
+  orchestrator:
+    runs-on: ubuntu-latest
+    restore-memory: true
+    steps:
+      - name: Read memory and dispatch
+        run: echo "dispatching"
+---
+
+# Orchestrator Workflow
+`
+
+	testFile := filepath.Join(tmpDir, "test.md")
+	require.NoError(t, os.WriteFile(testFile, []byte(frontmatter), 0o644))
+
+	compiler := NewCompiler()
+	require.NoError(t, compiler.CompileWorkflow(testFile))
+
+	content, err := os.ReadFile(filepath.Join(tmpDir, "test.lock.yml"))
+	require.NoError(t, err)
+	yamlStr := string(content)
+	section := extractJobSection(yamlStr, "orchestrator")
+	require.NotEmpty(t, section)
+
+	assert.Contains(t, section, "Checkout drive-memory file share (default)")
+	assert.Contains(t, section, "actions/gh-drives-preview/checkout@")
+	assert.Contains(t, section, "write: false")
+	assert.Contains(t, section, "drives: read")
+	assert.Contains(t, section, "id-token: write")
+	assert.NotContains(t, section, "actions/gh-drives-preview/commit@")
+}
+
+// TestCustomJobRestoreMemoryUsesDefaultRunsOn verifies that custom restore-memory
+// jobs inherit the workflow runner when runs-on is omitted.
+func TestCustomJobRestoreMemoryUsesDefaultRunsOn(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "custom-job-restore-default-runs-on")
+
+	frontmatter := `---
+name: Orchestrator
+on: workflow_dispatch
+permissions:
+  contents: read
+engine: copilot
+strict: false
+tools:
+  cache-memory: true
+jobs:
+  setup:
+    restore-memory: true
+    steps:
+      - name: Verify setup
+        run: echo "ok"
+---
+
+# Orchestrator Workflow
+`
+
+	testFile := filepath.Join(tmpDir, "test.md")
+	require.NoError(t, os.WriteFile(testFile, []byte(frontmatter), 0644))
+
+	compiler := NewCompiler()
+	require.NoError(t, compiler.CompileWorkflow(testFile))
+
+	lockFile := filepath.Join(tmpDir, "test.lock.yml")
+	content, err := os.ReadFile(lockFile)
+	require.NoError(t, err)
+
+	section := extractJobSection(string(content), "setup")
+	require.NotEmpty(t, section, "Expected setup job section in lock file")
+	assert.Contains(t, section, "runs-on: ubuntu-latest", "custom job should inherit default workflow runner when runs-on is omitted")
+	assert.Contains(t, section, "Restore cache-memory", "restore-memory steps should still be present")
+}
+
+// TestCustomJobRestoreMemoryInheritsArrayRunsOn verifies that a custom job with
+// restore-memory: true and no explicit runs-on properly inherits a workflow-level
+// array/object runs-on, with continuation lines correctly indented.
+func TestCustomJobRestoreMemoryInheritsArrayRunsOn(t *testing.T) {
+	tmpDir := testutil.TempDir(t, "custom-job-restore-array-runs-on")
+
+	frontmatter := `---
+name: Orchestrator
+on: workflow_dispatch
+permissions:
+  contents: read
+engine: copilot
+strict: false
+runs-on:
+  group: ubuntu-runners
+  labels: [self-hosted]
+tools:
+  cache-memory: true
+jobs:
+  setup:
+    restore-memory: true
+    steps:
+      - name: Verify setup
+        run: echo "ok"
+---
+
+# Orchestrator Workflow
+`
+
+	testFile := filepath.Join(tmpDir, "test.md")
+	require.NoError(t, os.WriteFile(testFile, []byte(frontmatter), 0644))
+
+	compiler := NewCompiler()
+	require.NoError(t, compiler.CompileWorkflow(testFile))
+
+	lockFile := filepath.Join(tmpDir, "test.lock.yml")
+	content, err := os.ReadFile(lockFile)
+	require.NoError(t, err)
+
+	section := extractJobSection(string(content), "setup")
+	require.NotEmpty(t, section, "Expected setup job section in lock file")
+	assert.Contains(t, section, "runs-on:", "custom job should inherit workflow-level runs-on")
+	assert.Contains(t, section, "group: ubuntu-runners", "custom job should include group from inherited runs-on")
+	// Verify continuation lines are properly indented (4 spaces) inside the job section.
+	for line := range strings.SplitSeq(section, "\n") {
+		if strings.TrimSpace(line) == "" || strings.HasPrefix(strings.TrimSpace(line), "setup:") {
+			continue
+		}
+		if strings.TrimSpace(line) != "" {
+			assert.True(t, strings.HasPrefix(line, "    "),
+				"all non-empty lines inside job section should be indented with at least 4 spaces, got: %q", line)
+		}
+	}
+	assert.Contains(t, section, "Restore cache-memory", "restore-memory steps should still be present")
+}
+
 // TestCustomJobRestoreMemoryRepoMemory verifies that a custom job with
 // restore-memory: true gets repo-memory clone steps injected when repo-memory is configured.
 func TestCustomJobRestoreMemoryRepoMemory(t *testing.T) {
@@ -314,7 +455,7 @@ jobs:
 	compiler := NewCompiler()
 	err := compiler.CompileWorkflow(testFile)
 	require.Error(t, err, "expected compilation to fail")
-	assert.Contains(t, err.Error(), "no memory stores are configured in tools")
+	require.ErrorContains(t, err, "no memory stores are configured in tools")
 }
 
 // TestCustomJobRestoreMemoryOnlyEmitsRestoreSteps verifies that when restore-memory
@@ -427,9 +568,7 @@ func TestExtractRestoreMemoryConfig(t *testing.T) {
 		RepoMemoryConfig: &RepoMemoryConfig{
 			Memories: []RepoMemoryEntry{{ID: "default"}},
 		},
-		SafeOutputs: &SafeOutputsConfig{
-			CommentMemory: &CommentMemoryConfig{},
-		},
+		CommentMemoryConfig: &CommentMemoryConfig{},
 	}
 	emptyData := &WorkflowData{}
 
@@ -538,10 +677,10 @@ func TestBuildCacheRestoreKeysEmptyForSinglePartKey(t *testing.T) {
 
 // TestGenerateRepoMemoryRestoreLinesNilData verifies nil/empty RepoMemoryConfig returns nil.
 func TestGenerateRepoMemoryRestoreLinesNilData(t *testing.T) {
-	assert.Nil(t, generateRepoMemoryRestoreLines(&WorkflowData{}))
-	assert.Nil(t, generateRepoMemoryRestoreLines(&WorkflowData{
+	assert.Nil(t, NewCompiler().generateRepoMemoryRestoreLines(&WorkflowData{}, "custom"))
+	assert.Nil(t, NewCompiler().generateRepoMemoryRestoreLines(&WorkflowData{
 		RepoMemoryConfig: &RepoMemoryConfig{},
-	}))
+	}, "custom"))
 }
 
 // TestGenerateCommentMemoryRestoreLinesNilData verifies nil/empty SafeOutputs returns nil.

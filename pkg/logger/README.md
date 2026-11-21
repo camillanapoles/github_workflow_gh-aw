@@ -40,7 +40,7 @@ The `Logger` type provides namespace-based debug logging with pattern matching, 
 
 **Behavioral contracts**:
 
-- `New` MUST compute the enabled state exactly once at construction time from the `DEBUG` environment variable (or `ACTIONS_RUNNER_DEBUG=true` as a fallback); subsequent changes to those variables MUST NOT affect already-constructed `Logger` instances.
+- `New` MUST compute the enabled state exactly once at construction time from the `DEBUG` environment variable (or `ACTIONS_RUNNER_DEBUG=true` / `RUNNER_DEBUG=1` as a fallback); subsequent changes to those variables MUST NOT affect already-constructed `Logger` instances.
 - `Logger.Printf` and `Logger.Print` MUST be no-ops (return immediately before any string formatting or I/O) when `Enabled()` returns `false`.
 - `Logger.Printf` and `Logger.Print` MUST write all output to `os.Stderr` and MUST append a trailing newline to every message.
 - `Logger.Printf` and `Logger.Print` MUST include a `+<duration>` suffix showing elapsed time since the previous call on the same instance.
@@ -96,7 +96,7 @@ log.Printf("Task completed")  // Shows +2.5s (or +500ms, +100µs, etc.)
 
 ## DEBUG Environment Variable
 
-Control which loggers are enabled using the `DEBUG` environment variable with patterns. When `ACTIONS_RUNNER_DEBUG=true` is set (as it is in GitHub Actions debug runs) and `DEBUG` is not explicitly set, all loggers are enabled automatically — equivalent to `DEBUG=*`.
+Control which loggers are enabled using the `DEBUG` environment variable with patterns. When `ACTIONS_RUNNER_DEBUG=true` or `RUNNER_DEBUG=1` is set and `DEBUG` is not explicitly set, all loggers are enabled automatically — equivalent to `DEBUG=*`.
 
 ### Examples
 
@@ -260,6 +260,27 @@ slogLogger.Warn("something unusual happened", "count", 42)
 - Colors assigned using FNV-1a hash for consistent namespace-to-color mapping
 - Color palette chosen for readability on both light and dark terminals
 - Uses ANSI 256-color codes for better compatibility
+
+<!-- BEGIN SOURCE-VERIFIED EXPORT COVERAGE -->
+## Source-verified export coverage
+
+This appendix is generated from the current non-test Go source files in this package and records any exported top-level symbols that are not already described above.
+
+| Category | Count |
+|----------|------:|
+| Types | 2 |
+| Constants | 0 |
+| Variables | 0 |
+| Functions and methods | 10 |
+| Additional symbols documented in this appendix | 1 |
+
+### Additional functions and methods
+
+| File | Symbol | Declaration | Description |
+|------|--------|-------------|-------------|
+| `slog_adapter.go` | `(*SlogHandler).Handle` | `func (*SlogHandler).Handle(_ context.Context, r slog.Record) error` | Handle handles the Record. |
+
+<!-- END SOURCE-VERIFIED EXPORT COVERAGE -->
 
 ---
 

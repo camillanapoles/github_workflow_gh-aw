@@ -26,6 +26,9 @@ func createTestWorkflowData(t *testing.T, threatConfig *ThreatDetectionConfig) *
 		Name:            "Test Workflow",
 		Description:     "Test Description",
 		MarkdownContent: "Test markdown content",
+		Features: map[string]any{
+			"gh-aw-detection": false,
+		},
 		SafeOutputs: &SafeOutputsConfig{
 			ThreatDetection: threatConfig,
 		},
@@ -172,6 +175,7 @@ func TestThreatDetectionTemplate_IncludesNpmValidationGuidance(t *testing.T) {
 	assert.Contains(t, templateContent, "Confirm `resolved` matches npm's official tarball URL for that exact version", "template should require validating resolved tarball URL")
 	assert.Contains(t, templateContent, "Confirm `integrity` matches npm's official integrity hash for that exact version", "template should require validating integrity hash")
 	assert.Contains(t, templateContent, "Treat stale-version claims as false positives", "template should avoid stale metadata false positives")
+	assert.Contains(t, templateContent, "report the verification as unavailable", "unavailable registry metadata must not be treated as evidence")
 }
 
 // TestBuildThreatDetectionAnalysisStep_ConfiguresEnvironment tests threat analysis step generation
@@ -213,6 +217,24 @@ func TestBuildThreatDetectionAnalysisStep_ConfiguresEnvironment(t *testing.T) {
 			data: createTestWorkflowData(t, &ThreatDetectionConfig{}),
 			checkStep: func(t *testing.T, stepsString string) {
 				assert.Contains(t, stepsString, "HAS_PATCH: ${{ needs.agent.outputs.has_patch }}", "should include HAS_PATCH env var from agent job output")
+			},
+		},
+		{
+			name: "includes GH_AW_DETECTION_CONTINUE_ON_ERROR env var with default (true)",
+			data: createTestWorkflowData(t, &ThreatDetectionConfig{}),
+			checkStep: func(t *testing.T, stepsString string) {
+				assert.Contains(t, stepsString, "GH_AW_DETECTION_CONTINUE_ON_ERROR:", "should include GH_AW_DETECTION_CONTINUE_ON_ERROR env var in setup step")
+				assert.Contains(t, stepsString, `GH_AW_DETECTION_CONTINUE_ON_ERROR: "true"`, "default should be true")
+			},
+		},
+		{
+			name: "includes GH_AW_DETECTION_CONTINUE_ON_ERROR env var when strict mode",
+			data: func() *WorkflowData {
+				f := false
+				return createTestWorkflowData(t, &ThreatDetectionConfig{ContinueOnError: &f})
+			}(),
+			checkStep: func(t *testing.T, stepsString string) {
+				assert.Contains(t, stepsString, `GH_AW_DETECTION_CONTINUE_ON_ERROR: "false"`, "strict mode should emit false")
 			},
 		},
 	}

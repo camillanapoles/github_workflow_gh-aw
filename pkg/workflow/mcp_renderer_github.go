@@ -1,7 +1,6 @@
 package workflow
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
@@ -15,7 +14,7 @@ import (
 
 // RenderGitHubMCP generates the GitHub MCP server configuration
 // Supports both local (Docker) and remote (hosted) modes
-func (r *MCPConfigRendererUnified) RenderGitHubMCP(yaml *strings.Builder, githubTool map[string]any, workflowData *WorkflowData) {
+func (r *MCPConfigRendererUnified) RenderGitHubMCP(yaml *strings.Builder, githubTool map[string]any, workflowData *WorkflowData) { //nolint:largefunc // Existing renderer preserves emitted YAML field ordering.
 	githubType := getGitHubType(githubTool)
 	readOnly := getGitHubReadOnly()
 
@@ -23,9 +22,16 @@ func (r *MCPConfigRendererUnified) RenderGitHubMCP(yaml *strings.Builder, github
 	lockdown := getGitHubLockdown(githubTool)
 
 	// Guard policies from step: automatically applied for public repositories when no explicit
-	// guard policy is configured and no GitHub App token is in use.
+	// guard policy is configured. GitHub App token scope is authentication, not a substitute
+	// for the DIFC source labels enforced by the MCP gateway.
 	// The determine-automatic-lockdown step outputs min_integrity and repos for public repos.
 	explicitGuardPolicies := getGitHubGuardPolicies(githubTool)
+	if len(explicitGuardPolicies) == 0 && githubBackendIsDynamicDelegationOnly(workflowData) {
+		explicitGuardPolicies = dynamicEnclaveGitHubGuardPolicies(workflowData)
+	}
+	if githubBackendIsStaticEnclaveDelegationOnly(workflowData) {
+		explicitGuardPolicies = staticEnclaveGitHubGuardPolicies(workflowData)
+	}
 	// Integrity reaction fields are only supported in proxy mode (DIFC/CLI proxy),
 	// not in gateway mode. The MCP gateway cannot identify reaction authors because
 	// the GitHub MCP server protocol does not expose that information. Warn if the
@@ -38,12 +44,14 @@ func (r *MCPConfigRendererUnified) RenderGitHubMCP(yaml *strings.Builder, github
 					"in proxy mode (DIFC proxy / CLI proxy)."))
 		}
 	}
-	shouldUseStepOutputForGuardPolicy := len(explicitGuardPolicies) == 0 && !hasGitHubApp(githubTool)
+	shouldUseStepOutputForGuardPolicy := githubGuardPoliciesFromStep(workflowData, explicitGuardPolicies)
+	emitRequiredFalse := githubBackendIsDynamicDelegationOnly(workflowData)
 
 	toolsets := getGitHubToolsets(githubTool)
+	features := getGitHubFeatures(githubTool)
 
-	mcpRendererLog.Printf("Rendering GitHub MCP: type=%s, read_only=%t, lockdown=%t (explicit=%t), guard_from_step=%t, toolsets=%v, format=%s",
-		githubType, readOnly, lockdown, hasGitHubLockdownExplicitlySet(githubTool), shouldUseStepOutputForGuardPolicy, toolsets, r.options.Format)
+	mcpRendererLog.Printf("Rendering GitHub MCP: type=%s, read_only=%t, lockdown=%t (explicit=%t), guard_from_step=%t, toolsets=%v, features=%s, format=%s",
+		githubType, readOnly, lockdown, hasGitHubLockdownExplicitlySet(githubTool), shouldUseStepOutputForGuardPolicy, toolsets, features, r.options.Format)
 
 	if r.options.Format == "toml" {
 		mcpRendererLog.Print("GitHub MCP format=toml, dispatching to renderGitHubTOML")
@@ -70,11 +78,13 @@ func (r *MCPConfigRendererUnified) RenderGitHubMCP(yaml *strings.Builder, github
 			LockdownFromStep:      false,
 			GuardPoliciesFromStep: shouldUseStepOutputForGuardPolicy,
 			Toolsets:              toolsets,
+			Features:              features,
 			AuthorizationValue:    authValue,
 			IncludeToolsField:     r.options.IncludeCopilotFields,
 			AllowedTools:          getGitHubAllowedTools(githubTool),
 			IncludeEnvSection:     r.options.IncludeCopilotFields,
 			GuardPolicies:         explicitGuardPolicies,
+			EmitRequiredFalse:     emitRequiredFalse,
 		})
 	} else {
 		// Local mode - use Docker-based GitHub MCP server (default)
@@ -89,12 +99,15 @@ func (r *MCPConfigRendererUnified) RenderGitHubMCP(yaml *strings.Builder, github
 			LockdownFromStep:      false,
 			GuardPoliciesFromStep: shouldUseStepOutputForGuardPolicy,
 			Toolsets:              toolsets,
+			Features:              features,
 			DockerImageVersion:    githubDockerImageVersion,
 			CustomArgs:            customArgs,
 			IncludeTypeField:      r.options.IncludeCopilotFields,
 			AllowedTools:          getGitHubAllowedTools(githubTool),
-			EffectiveToken:        "", // Token passed via env
+			ResolvedToken:         "", // Token passed via env
 			GuardPolicies:         explicitGuardPolicies,
+			EmitRequiredFalse:     emitRequiredFalse,
+			ContainerPinMappings:  r.options.ContainerPinMappings,
 		})
 	}
 
@@ -106,13 +119,14 @@ func (r *MCPConfigRendererUnified) RenderGitHubMCP(yaml *strings.Builder, github
 }
 
 // renderGitHubTOML generates GitHub MCP configuration in TOML format (for Codex engine)
-func (r *MCPConfigRendererUnified) renderGitHubTOML(yaml *strings.Builder, githubTool map[string]any, workflowData *WorkflowData) {
+func (r *MCPConfigRendererUnified) renderGitHubTOML(yaml *strings.Builder, githubTool map[string]any, workflowData *WorkflowData) { //nolint:largefunc // Existing renderer preserves emitted TOML field ordering.
 	githubType := getGitHubType(githubTool)
 	readOnly := getGitHubReadOnly()
 	lockdown := getGitHubLockdown(githubTool)
 	toolsets := getGitHubToolsets(githubTool)
+	features := getGitHubFeatures(githubTool)
 
-	mcpRendererLog.Printf("Rendering GitHub MCP TOML: type=%s, read_only=%t, lockdown=%t, toolsets=%s", githubType, readOnly, lockdown, toolsets)
+	mcpRendererLog.Printf("Rendering GitHub MCP TOML: type=%s, read_only=%t, lockdown=%t, toolsets=%s, features=%s", githubType, readOnly, lockdown, toolsets, features)
 
 	yaml.WriteString("          \n")
 	yaml.WriteString("          [mcp_servers.github]\n")
@@ -168,8 +182,10 @@ func (r *MCPConfigRendererUnified) renderGitHubTOML(yaml *strings.Builder, githu
 		githubDockerImageVersion := getGitHubDockerImageVersion(githubTool)
 		customArgs := getGitHubCustomArgs(githubTool)
 
-		// MCP Gateway spec fields for containerized stdio servers
-		yaml.WriteString("          container = \"ghcr.io/github/github-mcp-server:" + githubDockerImageVersion + "\"\n")
+		// MCP Gateway spec fields for containerized stdio servers.
+		// Apply container_pins mapping so private-cloud runners use the configured mirror.
+		githubMCPImage := resolveGatewayContainerFromMappings("ghcr.io/github/github-mcp-server:"+githubDockerImageVersion, workflowData.getContainerPinMappings())
+		yaml.WriteString("          container = \"" + githubMCPImage + "\"\n")
 
 		// Append custom args if present (these are Docker runtime args, go before container image)
 		if len(customArgs) > 0 {
@@ -187,6 +203,7 @@ func (r *MCPConfigRendererUnified) renderGitHubTOML(yaml *strings.Builder, githu
 			readOnly,
 			lockdown,
 			toolsets,
+			features,
 		)
 
 		// Write environment variables in sorted order for deterministic output
@@ -222,15 +239,17 @@ func RenderGitHubMCPDockerConfig(yaml *strings.Builder, options GitHubMCPDockerO
 		yaml.WriteString("                \"type\": \"stdio\",\n")
 	}
 
-	// MCP Gateway spec fields for containerized stdio servers
-	yaml.WriteString("                \"container\": \"ghcr.io/github/github-mcp-server:" + options.DockerImageVersion + "\",\n")
+	// MCP Gateway spec fields for containerized stdio servers.
+	// Apply container_pins mapping so private-cloud runners use the configured mirror.
+	githubMCPImage := resolveGatewayContainerFromMappings("ghcr.io/github/github-mcp-server:"+options.DockerImageVersion, options.ContainerPinMappings)
+	yaml.WriteString("                \"container\": \"" + githubMCPImage + "\",\n")
 
 	// Append custom args if present (these are Docker runtime args, go before container image)
 	if len(options.CustomArgs) > 0 {
 		yaml.WriteString("                \"args\": [\n")
-		for _, arg := range options.CustomArgs {
-			quotedArg, _ := json.Marshal(arg) //nolint:jsonmarshalignoredeerror // marshaling a string cannot fail
-			yaml.WriteString("                  " + string(quotedArg) + ",\n")
+		for i, arg := range options.CustomArgs {
+			arg, _ = replaceMCPExpressions(arg, false)
+			yaml.WriteString("                  " + marshalMCPHeredocString(normalizeMCPShellReferences(arg)) + renderMCPComma(i == len(options.CustomArgs)-1) + "\n")
 		}
 		yaml.WriteString("                ],\n")
 	}
@@ -251,10 +270,13 @@ func RenderGitHubMCPDockerConfig(yaml *strings.Builder, options GitHubMCPDockerO
 		hostValue = "${GITHUB_SERVER_URL}"
 	}
 
-	envVars := buildGitHubMCPEnvVars(tokenValue, hostValue, options.ReadOnly, options.Lockdown, options.Toolsets)
+	envVars := buildGitHubMCPEnvVars(tokenValue, hostValue, options.ReadOnly, options.Lockdown, options.Toolsets, options.Features)
 	hasGuardPolicies := hasGitHubMCPGuardPolicies(options.GuardPolicies, options.GuardPoliciesFromStep)
-	writeJSONStringMapSection(yaml, "                ", "env", envVars, hasGuardPolicies)
+	writeJSONStringMapSection(yaml, "                ", "env", envVars, hasGuardPolicies || options.EmitRequiredFalse)
 	renderGitHubMCPGuardPolicies(yaml, options.GuardPolicies, options.GuardPoliciesFromStep, "                ")
+	if options.EmitRequiredFalse {
+		appendRequiredFalseField(yaml, hasGuardPolicies, "                ")
+	}
 }
 
 // RenderGitHubMCPRemoteConfig renders the GitHub MCP server configuration for remote (hosted) mode.
@@ -270,12 +292,20 @@ func RenderGitHubMCPRemoteConfig(yaml *strings.Builder, options GitHubMCPRemoteO
 	yaml.WriteString("                \"type\": \"http\",\n")
 	yaml.WriteString("                \"url\": \"https://api.githubcopilot.com/mcp/\",\n")
 	hasGuardPolicies := hasGitHubMCPGuardPolicies(options.GuardPolicies, options.GuardPoliciesFromStep)
-	writeJSONStringMapSection(
+	// Use writeJSONStringMapSectionRaw so that pre-escaped shell placeholders such as
+	// \${GITHUB_PERSONAL_ACCESS_TOKEN} (Copilot passthrough syntax) are written with a
+	// single backslash in the generated lock file.  The compiled config is embedded in an
+	// unquoted bash heredoc; bash collapses \$ → $, delivering the literal ${VAR} string
+	// that the MCP gateway then expands from its own environment at runtime.
+	// Using writeJSONStringMapSection instead would double-escape the backslash to \\${VAR},
+	// which bash expands to \<secret-value> — an invalid JSON escape character that causes
+	// JSON.parse to fail on every run.
+	writeJSONStringMapSectionRaw(
 		yaml,
 		"                ",
 		"headers",
-		buildGitHubMCPRemoteHeaders(options.AuthorizationValue, options.ReadOnly, options.Lockdown, options.Toolsets),
-		(options.IncludeToolsField && len(options.AllowedTools) > 0) || options.IncludeEnvSection || hasGuardPolicies,
+		buildGitHubMCPRemoteHeaders(options.AuthorizationValue, options.ReadOnly, options.Lockdown, options.Toolsets, options.Features),
+		(options.IncludeToolsField && len(options.AllowedTools) > 0) || options.IncludeEnvSection || hasGuardPolicies || options.EmitRequiredFalse,
 	)
 
 	// Add tools field if requested (Copilot needs it, Claude doesn't)
@@ -292,7 +322,7 @@ func RenderGitHubMCPRemoteConfig(yaml *strings.Builder, options GitHubMCPRemoteO
 			}
 			yaml.WriteString("\n")
 		}
-		if options.IncludeEnvSection || hasGuardPolicies {
+		if options.IncludeEnvSection || hasGuardPolicies || options.EmitRequiredFalse {
 			yaml.WriteString("                ],\n")
 		} else {
 			yaml.WriteString("                ]\n")
@@ -305,11 +335,14 @@ func RenderGitHubMCPRemoteConfig(yaml *strings.Builder, options GitHubMCPRemoteO
 			yaml,
 			"                ",
 			"env",
-			buildGitHubMCPEnvVars("${GITHUB_MCP_SERVER_TOKEN}", "${GITHUB_SERVER_URL}", false, false, ""),
-			hasGuardPolicies,
+			buildGitHubMCPEnvVars("${GITHUB_MCP_SERVER_TOKEN}", "${GITHUB_SERVER_URL}", false, false, "", ""),
+			hasGuardPolicies || options.EmitRequiredFalse,
 		)
 	}
 
 	// Add guard-policies if configured or from step
 	renderGitHubMCPGuardPolicies(yaml, options.GuardPolicies, options.GuardPoliciesFromStep, "                ")
+	if options.EmitRequiredFalse {
+		appendRequiredFalseField(yaml, hasGuardPolicies, "                ")
+	}
 }

@@ -10,7 +10,6 @@ This directory contains design specifications and implementation documentation f
 | [Validation Architecture](./validation-architecture.md) | ✅ Documented | `pkg/workflow/validation.go` and domain-specific files |
 | [Go Type Patterns and Best Practices](./go-type-patterns.md) | ✅ Documented | `pkg/constants/constants.go`, `pkg/workflow/permissions_validator.go`, `pkg/parser/frontmatter.go` |
 | [Styles Guide](./styles-guide.md) | ✅ Documented | `pkg/styles/theme.go` - Adaptive color palette and terminal styling |
-| [Campaign Files Architecture](./campaigns-files.md) | 📋 File removed | `pkg/campaign/`, `actions/setup/js/campaign_discovery.cjs` - Campaign discovery, compilation, and execution |
 
 ## Specifications
 
@@ -38,6 +37,7 @@ This directory contains design specifications and implementation documentation f
 |----------|--------|-------------|
 | [mdflow Syntax Comparison](./mdflow-comparison.md) | ✅ Documented | Comparison of mdflow and gh-aw syntax covering 17 aspects: file naming, frontmatter design, templates, imports, security models, execution patterns, and more |
 | [Gastown Multi-Agent Orchestration](./gastown.md) | ✅ Documented | Analysis of Gastown's multi-agent coordination patterns and mapping to gh-aw concepts: persistent state, workflow composition, crash recovery, agent communication, and implementation recommendations |
+| [Git AI Integration Opportunities](./git-ai.md) | 📋 Exploratory | Analysis of Git AI line-level authorship, gh-aw safe-output transport gaps, security constraints, and a staged proof-of-concept |
 
 ## Statistical Analysis & Reports
 
@@ -63,4 +63,4 @@ When adding new specifications:
 
 ---
 
-**Last Updated**: 2026-04-09
+**Last Updated**: 2026-10-31

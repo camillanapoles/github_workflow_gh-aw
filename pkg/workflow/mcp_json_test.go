@@ -580,16 +580,16 @@ func TestValidateMCPConfigs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := ValidateMCPConfigs(tt.tools)
+			_, err := validateMCPConfigsWithWarnings(tt.tools)
 
 			if tt.wantErr != (err != nil) {
-				t.Errorf("ValidateMCPConfigs() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("validateMCPConfigsWithWarnings() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 
 			if tt.wantErr && err != nil && tt.errMsg != "" {
 				if !strings.Contains(err.Error(), tt.errMsg) {
-					t.Errorf("ValidateMCPConfigs() error = %v, expected to contain %v", err, tt.errMsg)
+					t.Errorf("validateMCPConfigsWithWarnings() error = %v, expected to contain %v", err, tt.errMsg)
 				}
 			}
 		})
@@ -619,6 +619,8 @@ func TestValidateToolsSection(t *testing.T) {
 				"github":     map[string]any{"mode": "local"},
 				"playwright": map[string]any{"version": "v1.41.0"},
 				"bash":       []any{"echo", "ls"},
+				"ledger":     map[string]any{"findings": map[string]any{"schema": map[string]any{"type": "object"}}},
+				"work-queue": true,
 				"web-fetch":  nil,
 			},
 			wantErr: false,

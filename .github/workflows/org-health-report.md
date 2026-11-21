@@ -11,13 +11,11 @@ permissions:
   pull-requests: read
   discussions: read
 
-sandbox:
-  agent:
-    sudo: false
 
 engine:
   id: copilot
   copilot-sdk: true
+max-tool-denials: 3
 tools:
   cli-proxy: true
   github:
@@ -48,6 +46,7 @@ network:
     - defaults
     - python
 imports:
+  - shared/mcp-pagination.md
   - shared/github-guard-policy.md
   - shared/python-dataviz.md
   - ../skills/jqschema/SKILL.md

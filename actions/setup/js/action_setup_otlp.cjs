@@ -1,5 +1,6 @@
 // @ts-check
 "use strict";
+require("./shim.cjs");
 
 /**
  * action_setup_otlp.cjs
@@ -17,6 +18,8 @@
  *   GITHUB_OUTPUT   – path to the GitHub Actions output file
  *   GITHUB_ENV      – path to the GitHub Actions env file
  *   INPUT_*         – standard GitHub Actions input env vars (read by sendJobSetupSpan)
+ *   OTLP header credentials are masked, including decoded Basic-auth passwords,
+ *   before span export or subsequent workflow steps can print them.
  *
  * Environment variables written:
  *   GITHUB_AW_OTEL_TRACE_ID        – resolved trace ID (for cross-job correlation)
@@ -28,10 +31,11 @@
 const { appendFileSync } = require("fs");
 const { nowMs } = require("./performance_now.cjs");
 const { getActionInput } = require("./action_input_utils.cjs");
+const { maskSecret, getOTLPRunnerMaskValues } = require("./actions_secret_masking.cjs");
 
 /**
  * Append a key=value line to a GitHub Actions file (GITHUB_OUTPUT or GITHUB_ENV)
- * if the file path is set and the value is truthy.
+ * if the file path is set. Reject line breaks without logging the rejected data.
  * @param {string | undefined} filePath - Path to the output/env file
  * @param {string} key - The variable name
  * @param {string} value - The value to write
@@ -39,9 +43,17 @@ const { getActionInput } = require("./action_input_utils.cjs");
  * @param {string} fileLabel - Human-readable file name for the log (e.g. "GITHUB_OUTPUT")
  */
 function writeEnvLine(filePath, key, value, logLabel, fileLabel) {
-  if (!filePath || !value) return;
-  appendFileSync(filePath, `${key}=${value}\n`);
-  console.log(`[otlp] ${logLabel} written to ${fileLabel}`);
+  if (/[\r\n]/.test(key) || /[\r\n]/.test(value)) {
+    core.warning("[otlp] refusing to write a key or value containing line breaks");
+    return;
+  }
+  if (!filePath) return;
+  try {
+    appendFileSync(filePath, `${key}=${value}\n`);
+    core.info(`[otlp] ${logLabel} written to ${fileLabel}`);
+  } catch {
+    /* ignore */
+  }
 }
 
 /**
@@ -86,6 +98,21 @@ function mergeAuthorizationIntoOTLPEndpoints(endpointsRaw, token) {
 }
 
 /**
+ * @param {string} endpointsRaw
+ * @returns {{ url: string, headers: string } | null}
+ */
+function getPrimaryOTLPEndpoint(endpointsRaw) {
+  try {
+    const endpoints = JSON.parse(endpointsRaw);
+    const primary = Array.isArray(endpoints) ? endpoints[0] : null;
+    if (!primary || typeof primary.url !== "string") return null;
+    return { url: primary.url, headers: typeof primary.headers === "string" ? primary.headers : "" };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Send the OTLP job-setup span and propagate trace context via GITHUB_OUTPUT /
  * GITHUB_ENV.  Non-fatal: all errors are silently swallowed.
  *
@@ -95,9 +122,7 @@ function mergeAuthorizationIntoOTLPEndpoints(endpointsRaw, token) {
  * @returns {Promise<void>}
  */
 async function run() {
-  const endpoints = process.env.GH_AW_OTLP_ENDPOINTS;
-
-  const { sendJobSetupSpan, isValidTraceId, isValidSpanId } = require("./send_otlp_span.cjs");
+  const { sendJobSetupSpan, isValidTraceId, isValidSpanId, parseOTLPEndpoints } = require("./send_otlp_span.cjs");
 
   const rawStartMs = process.env.SETUP_START_MS;
   const parsedMs = /^\d+$/.test(rawStartMs ?? "") ? Number(rawStartMs) : NaN;
@@ -108,13 +133,13 @@ async function run() {
   // through GitHub Actions expression evaluation is unreliable.
   const inputTraceId = getActionInput("TRACE_ID").toLowerCase();
   if (inputTraceId) {
-    console.log(`[otlp] INPUT_TRACE_ID=${inputTraceId} (will reuse activation trace)`);
+    core.info(`[otlp] INPUT_TRACE_ID=${inputTraceId} (will reuse activation trace)`);
   } else {
-    console.log("[otlp] INPUT_TRACE_ID not set, a new trace ID will be generated");
+    core.info("[otlp] INPUT_TRACE_ID not set, a new trace ID will be generated");
   }
   const inputParentSpanId = getActionInput("PARENT_SPAN_ID").toLowerCase();
   if (inputParentSpanId) {
-    console.log(`[otlp] INPUT_PARENT_SPAN_ID=${inputParentSpanId} (will parent setup span)`);
+    core.info(`[otlp] INPUT_PARENT_SPAN_ID=${inputParentSpanId} (will parent setup span)`);
   }
 
   // Normalize to the canonical underscore form so sendJobSetupSpan (which
@@ -128,7 +153,10 @@ async function run() {
   }
 
   const inputOTLPOIDCToken = getActionInput("OTLP_OIDC_TOKEN");
-  if (inputOTLPOIDCToken) {
+  if (/[\r\n]/.test(inputOTLPOIDCToken)) {
+    core.warning("[otlp] ignoring OTLP OIDC token containing line breaks");
+  } else if (inputOTLPOIDCToken) {
+    maskSecret(inputOTLPOIDCToken);
     const existingHeaders = process.env.OTEL_EXPORTER_OTLP_HEADERS || "";
     const mergedHeaders = mergeAuthorizationHeader(existingHeaders, inputOTLPOIDCToken);
 
@@ -143,10 +171,33 @@ async function run() {
     }
   }
 
+  const endpoints = process.env.GH_AW_OTLP_ENDPOINTS;
+  const parsedEndpoints = parseOTLPEndpoints();
+  for (const secret of getOTLPRunnerMaskValues()) maskSecret(secret);
+  if (endpoints) {
+    const primaryEndpoint = getPrimaryOTLPEndpoint(endpoints);
+    const currentEndpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT || "";
+    const currentHeaders = process.env.OTEL_EXPORTER_OTLP_HEADERS || "";
+    if (primaryEndpoint && currentEndpoint === primaryEndpoint.url && currentHeaders === primaryEndpoint.headers) {
+      const endpoint = parsedEndpoints[0]?.url || "";
+      const headers = parsedEndpoints[0]?.headers || "";
+      if (endpoint !== currentEndpoint) {
+        process.env.OTEL_EXPORTER_OTLP_ENDPOINT = endpoint;
+        writeEnvLine(process.env.GITHUB_ENV, "OTEL_EXPORTER_OTLP_ENDPOINT", endpoint, "OTEL_EXPORTER_OTLP_ENDPOINT", "GITHUB_ENV");
+      }
+      if (headers !== currentHeaders) {
+        process.env.OTEL_EXPORTER_OTLP_HEADERS = headers;
+        writeEnvLine(process.env.GITHUB_ENV, "OTEL_EXPORTER_OTLP_HEADERS", headers, "OTEL_EXPORTER_OTLP_HEADERS", "GITHUB_ENV");
+      }
+    }
+  }
+
   if (!endpoints) {
-    console.log("[otlp] GH_AW_OTLP_ENDPOINTS not set, skipping setup span");
+    core.info("[otlp] GH_AW_OTLP_ENDPOINTS not set, skipping setup span");
+  } else if (parsedEndpoints.length === 0) {
+    core.info("[otlp] no OTLP endpoints have usable credentials, skipping setup span");
   } else {
-    console.log(`[otlp] sending setup span to configured endpoints`);
+    core.info(`[otlp] sending setup span to configured endpoints`);
   }
 
   const { traceId, spanId, parentSpanId } = await sendJobSetupSpan({
@@ -155,10 +206,10 @@ async function run() {
     parentSpanId: inputParentSpanId || undefined,
   });
 
-  console.log(`[otlp] resolved trace-id=${traceId}`);
+  core.info(`[otlp] resolved trace-id=${traceId}`);
 
-  if (endpoints) {
-    console.log(`[otlp] setup span sent (traceId=${traceId}, spanId=${spanId})`);
+  if (parsedEndpoints.length > 0) {
+    core.info(`[otlp] setup span sent (traceId=${traceId}, spanId=${spanId})`);
   }
 
   const githubOutput = process.env.GITHUB_OUTPUT;
@@ -173,17 +224,17 @@ async function run() {
 
   // Always propagate trace/span context to subsequent steps in this job so
   // that the conclusion span can find the same trace ID.
+  if (isValidTraceId(traceId)) writeEnvLine(githubEnv, "GITHUB_AW_OTEL_TRACE_ID", traceId, "GITHUB_AW_OTEL_TRACE_ID", "GITHUB_ENV");
+  if (isValidSpanId(spanId)) writeEnvLine(githubEnv, "GITHUB_AW_OTEL_PARENT_SPAN_ID", spanId, "GITHUB_AW_OTEL_PARENT_SPAN_ID", "GITHUB_ENV");
+  // Propagate setup-end timestamp so the conclusion span can measure actual
+  // job execution duration (setup-end → conclusion-start).
   if (githubEnv) {
-    if (isValidTraceId(traceId)) writeEnvLine(githubEnv, "GITHUB_AW_OTEL_TRACE_ID", traceId, "GITHUB_AW_OTEL_TRACE_ID", "GITHUB_ENV");
-    if (isValidSpanId(spanId)) writeEnvLine(githubEnv, "GITHUB_AW_OTEL_PARENT_SPAN_ID", spanId, "GITHUB_AW_OTEL_PARENT_SPAN_ID", "GITHUB_ENV");
-    // Propagate setup-end timestamp so the conclusion span can measure actual
-    // job execution duration (setup-end → conclusion-start).
     const setupEndMs = String(Math.floor(nowMs()));
     writeEnvLine(githubEnv, "GITHUB_AW_OTEL_JOB_START_MS", setupEndMs, "GITHUB_AW_OTEL_JOB_START_MS", "GITHUB_ENV");
   }
 }
 
-module.exports = { run };
+module.exports = { run, writeEnvLine };
 
 // When invoked directly (node action_setup_otlp.cjs) from setup.sh,
 // run immediately.  Non-fatal: errors are silently swallowed.

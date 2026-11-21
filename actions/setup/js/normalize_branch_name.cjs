@@ -4,8 +4,6 @@
 /**
  * Normalizes a branch name to be a valid git branch name.
  *
- * IMPORTANT: Keep this function in sync with the normalizeBranchName function in upload_assets.cjs
- *
  * Valid characters: alphanumeric (a-z, A-Z, 0-9), dash (-), underscore (_), forward slash (/), dot (.)
  * Max length: 128 characters (before salt is appended)
  *
@@ -43,6 +41,8 @@ function normalizeBranchName(branchName, salt = null) {
 
   // Ensure it doesn't end with a dash after truncation
   normalized = normalized.replace(/-+$/, "");
+
+  if (!normalized) return normalized;
 
   // Append a salt suffix when provided
   if (salt) {

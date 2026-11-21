@@ -111,7 +111,7 @@ func TestExpressionExtractor_ExtractExpressions(t *testing.T) {
 			name:            "experiments.name === value strict-equality form gets transformed to step output",
 			markdown:        `{{#if ${{ experiments.prompt_style === "concise" }} }}foo{{/if}}`,
 			wantCount:       1,
-			wantExpressions: []string{`steps.pick-experiment.outputs.prompt_style === 'concise'`},
+			wantExpressions: []string{`steps.pick-experiment.outputs.prompt_style == 'concise'`},
 		},
 		{
 			name:            "experiments.name != value inequality form gets transformed to step output",
@@ -123,7 +123,7 @@ func TestExpressionExtractor_ExtractExpressions(t *testing.T) {
 			name:            "experiments.name !== value strict-inequality form gets transformed to step output",
 			markdown:        `{{#if ${{ experiments.reasoning_depth !== "multi_candidate" }} }}foo{{/if}}`,
 			wantCount:       1,
-			wantExpressions: []string{`steps.pick-experiment.outputs.reasoning_depth !== 'multi_candidate'`},
+			wantExpressions: []string{`steps.pick-experiment.outputs.reasoning_depth != 'multi_candidate'`},
 		},
 		{
 			name:            "experiments.name == value with single quotes gets transformed to step output",
@@ -141,13 +141,37 @@ func TestExpressionExtractor_ExtractExpressions(t *testing.T) {
 			name:            "aw context syntax sugar gets transformed",
 			markdown:        "Issue: ${{ github.event.issue.number || (github.aw.context.item_type == 'issue' && github.aw.context.item_number) }}",
 			wantCount:       1,
-			wantExpressions: []string{"github.event.issue.number || (fromJSON(github.event.inputs.aw_context || github.event.client_payload.aw_context || '{}').item_type == 'issue' && fromJSON(github.event.inputs.aw_context || github.event.client_payload.aw_context || '{}').item_number)"},
+			wantExpressions: []string{"github.event.issue.number || (fromJSON(steps.generate_aw_info.outputs.aw_context || '{}').item_type == 'issue' && fromJSON(steps.generate_aw_info.outputs.aw_context || '{}').item_number)"},
 		},
 		{
-			name:            "aw context syntax sugar with hyphenated field does not transform",
+			name:            "webhook batch items serialize from normalized context",
+			markdown:        "Items: ${{ toJSON(github.aw.context.items) }}",
+			wantCount:       1,
+			wantExpressions: []string{"toJSON(fromJSON(steps.generate_aw_info.outputs.aw_context || '{}').items)"},
+		},
+		{
+			name:            "nested webhook batch event uses normalized context",
+			markdown:        "Event: ${{ github.aw.context.webhook.event }}",
+			wantCount:       1,
+			wantExpressions: []string{"fromJSON(steps.generate_aw_info.outputs.aw_context || '{}').webhook.event"},
+		},
+		{
+			name:            "aw context syntax sugar supports official hyphenated properties",
 			markdown:        "Issue: ${{ github.aw.context.item-number }}",
 			wantCount:       1,
-			wantExpressions: []string{"github.aw.context.item-number"},
+			wantExpressions: []string{"fromJSON(steps.generate_aw_info.outputs.aw_context || '{}').item-number"},
+		},
+		{
+			name:            "gateway events indexed matching literal",
+			markdown:        "${{ gateway.events[0].payload.filters['closed-states'][0] }}",
+			wantCount:       1,
+			wantExpressions: []string{"fromJSON(steps.generate_aw_info.outputs.aw_context || '{}').webhook.deliveries[0].payload.filters['closed-states'][0]"},
+		},
+		{
+			name:            "gateway events transform leaves string literals alone",
+			markdown:        "${{ gateway.events[0].payload.url == 'gateway.events' }}",
+			wantCount:       1,
+			wantExpressions: []string{"fromJSON(steps.generate_aw_info.outputs.aw_context || '{}').webhook.deliveries[0].payload.url == 'gateway.events'"},
 		},
 		// Parenthesised compound expressions
 		{
@@ -243,9 +267,9 @@ func TestExpressionExtractor_GenerateEnvVarName(t *testing.T) {
 			wantName: "GH_AW_GITHUB_EVENT_ISSUE_NUMBER",
 		},
 		{
-			name:     "needs output",
-			content:  "needs.activation.outputs.text",
-			wantName: "GH_AW_NEEDS_ACTIVATION_OUTPUTS_TEXT",
+			name:     "sanitized step outputs",
+			content:  "steps.sanitized.outputs.text",
+			wantName: "GH_AW_STEPS_SANITIZED_OUTPUTS_TEXT",
 		},
 		{
 			name:    "complex expression with operators",
@@ -345,7 +369,7 @@ func TestExpressionExtractor_NoCollisions(t *testing.T) {
 		"github.actor",
 		"github.run_id",
 		"github.event.issue.number",
-		"needs.activation.outputs.text",
+		"steps.sanitized.outputs.text",
 	}
 
 	extractor := NewExpressionExtractor()
@@ -423,8 +447,8 @@ func TestTransformActivationOutputs(t *testing.T) {
 		},
 		{
 			name:     "transform with trailing parenthesis",
-			input:    "func(needs.activation.outputs.text)",
-			expected: "func(steps.sanitized.outputs.text)",
+			input:    "toJSON(needs.activation.outputs.text)",
+			expected: "toJSON(steps.sanitized.outputs.text)",
 		},
 		{
 			name:     "partial match followed by valid match",
@@ -506,6 +530,68 @@ Other: ${{ needs.activation.outputs.comment_id }}
 				if _, found := contentMap[tt.transformed]; !found {
 					t.Errorf("Expected transformed expression %q in mappings", tt.transformed)
 				}
+			}
+		})
+	}
+}
+
+// TestExpressionExtractor_DeprecatedActivationOutputWarning verifies that extracting
+// a deprecated needs.activation.outputs.* expression emits a deprecation warning to
+// stderr while still producing the correct (transformed) mapping.
+func TestExpressionExtractor_DeprecatedActivationOutputWarning(t *testing.T) {
+	tests := []struct {
+		name       string
+		markdown   string
+		deprecated string
+		modern     string
+	}{
+		{
+			name:       "text output emits warning",
+			markdown:   "Content: ${{ needs.activation.outputs.text }}",
+			deprecated: "needs.activation.outputs.text",
+			modern:     "steps.sanitized.outputs.text",
+		},
+		{
+			name:       "title output emits warning",
+			markdown:   "Title: ${{ needs.activation.outputs.title }}",
+			deprecated: "needs.activation.outputs.title",
+			modern:     "steps.sanitized.outputs.title",
+		},
+		{
+			name:       "body output emits warning",
+			markdown:   "Body: ${{ needs.activation.outputs.body }}",
+			deprecated: "needs.activation.outputs.body",
+			modern:     "steps.sanitized.outputs.body",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			extractor := NewExpressionExtractor()
+
+			stderr := captureStderr(func() {
+				mappings, err := extractor.ExtractExpressions(tt.markdown)
+				if err != nil {
+					t.Fatalf("ExtractExpressions() unexpected error: %v", err)
+				}
+				// Verify the mapping was produced with the modern expression.
+				found := false
+				for _, m := range mappings {
+					if m.Content == tt.modern {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("expected mapping for %q but not found", tt.modern)
+				}
+			})
+
+			if !strings.Contains(stderr, tt.deprecated) {
+				t.Errorf("expected deprecation warning mentioning %q in stderr, got: %q", tt.deprecated, stderr)
+			}
+			if !strings.Contains(stderr, tt.modern) {
+				t.Errorf("expected deprecation warning mentioning %q in stderr, got: %q", tt.modern, stderr)
 			}
 		})
 	}

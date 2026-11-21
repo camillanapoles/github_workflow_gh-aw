@@ -19,8 +19,8 @@ Default to `create-issue`. Use `create-discussion` only when the requester expli
 ## Automatic Cleanup
 
 - **`expires`** — auto-close after a window (e.g. `7`, `2w`, `1m`).
-- **`close-older-issues: true`** — close previous issues from the same workflow. Requires `title-prefix` or `labels`.
-- **`close-older-discussions: true`** — close older matching discussions as "OUTDATED". Requires `title-prefix` or `labels`.
+- **`close-older-issues: true`** — close previous open issues from the same workflow, matched via an embedded workflow-id marker (no `title-prefix` or `labels` needed). Use `close-older-key` for an explicit dedup key instead of the default workflow-id match.
+- **`close-older-discussions: true`** — close older matching discussions as "OUTDATED", matched the same way as issues.
 - **`hide-older-comments: true`** — minimize previous comments. Useful for rolling status updates.
 
 **Recommended for recurring reports**: `create-issue` with `close-older-issues: true` and a stable `title-prefix`.
@@ -47,8 +47,22 @@ Window examples:
 
 Strategy: fixed durations for trend comparisons, run-based windows for continuous monitoring, calendar windows for stakeholder reporting.
 
+Whenever a report window is defined, also fix its grouping dimensions and deduplication key up front (see [Recurring Digest Defaults](#recurring-digest-defaults) below) — a window alone is not sufficient to make a recurring report deterministic and non-duplicating.
+
 When the window has no qualifying updates, call `noop` with the evaluated window in the message:
 `noop("No updates in last 24 full hours ({{window_start_utc}} to {{window_end_utc}})")`
+
+## Recurring Digest Defaults
+
+For recurring PM, stakeholder, and information-worker digests, fix all three elements up front — window, grouping dimensions, and deduplication key — before generating the report:
+
+| Element | Default guidance | Examples |
+|---|---|---|
+| Report window | Closed, explicit UTC window or `since previous successful run` (see above) | `last 7 full days ending at run start (UTC)`, `previous calendar month (UTC)` |
+| Grouping dimensions | Group by the dimensions the audience already uses to decide | team, area, milestone, owner, severity, status, repository |
+| Deduplication key | One stable key per scope and window; week-based for weekly, calendar-date for daily/monthly | `pm-digest:platform:2026-W27`, `stakeholder-digest:mobile:2026-07-02` |
+
+Duplicate-suppression: search for an existing open issue by the stable key (title prefix or dedicated label) before creating; if one exists, update it with `add-comment` instead of opening a duplicate. Use `create-issue` with `close-older-issues: true` for recurring issue-style digests.
 
 ## Fallback for Incomplete Metadata
 

@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -21,7 +22,9 @@ var updateOrgSearchLog = logger.New("cli:update_org_search")
 // orgSearchResponse holds the paginated code-search results returned by the
 // GitHub search/code API when discovering repositories in an organization.
 type orgSearchResponse struct {
-	Items []struct {
+	TotalCount        int  `json:"total_count"`
+	IncompleteResults bool `json:"incomplete_results"`
+	Items             []struct {
 		Path       string `json:"path"`
 		Repository struct {
 			FullName string `json:"full_name"`
@@ -30,6 +33,25 @@ type orgSearchResponse struct {
 }
 
 var searchOrgWorkflowReposFn = searchOrgWorkflowRepos
+var orgSearchAPIFn = workflow.RunGHContextWithHost
+
+const orgSlugConstraintDescription = "must be 1-39 characters, contain only alphanumeric characters or single hyphens, and cannot start or end with a hyphen"
+
+// orgSlugRe matches valid GitHub organization names: alphanumeric characters
+// and single hyphens between segments, not starting or ending with a hyphen,
+// length 1–39.
+var orgSlugRe = regexp.MustCompile(`^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$`)
+
+// isValidOrgSlug reports whether s is a valid GitHub organization slug.
+// GitHub org names may only contain alphanumeric characters and hyphens,
+// cannot start or end with a hyphen, and are 1–39 characters long.
+func isValidOrgSlug(s string) bool {
+	return orgSlugRe.MatchString(s) && !strings.Contains(s, "--")
+}
+
+func invalidOrgSlugError(org string) error {
+	return fmt.Errorf("invalid organization name %q: %s", org, orgSlugConstraintDescription)
+}
 
 // searchOrgWorkflowRepos searches an organization's repositories for compiled
 // agentic workflow lock files (.lock.yml) in .github/workflows.
@@ -37,6 +59,9 @@ var searchOrgWorkflowReposFn = searchOrgWorkflowRepos
 // It paginates through all code-search results, deduplicates by repository full
 // name, and returns a deterministically sorted slice of "owner/repo" strings.
 func searchOrgWorkflowRepos(ctx context.Context, org string, workflowNames []string, verbose bool) ([]string, error) {
+	if !isValidOrgSlug(org) {
+		return nil, invalidOrgSlugError(org)
+	}
 	updateOrgSearchLog.Printf("Searching org %q for workflow repos (%d workflow name filters)", org, len(workflowNames))
 	query := buildOrgWorkflowSearchQuery(org, workflowNames)
 	return searchOrgReposByQuery(ctx, query, verbose)
@@ -86,11 +111,11 @@ func searchOrgReposByQuery(ctx context.Context, query string, verbose bool) ([]s
 	var repos []string
 
 	for {
-		if err := waitForOrgRateLimitFn(ctx, "search", verbose); err != nil && verbose {
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Continuing after search rate limit check failure: %v", err)))
+		if err := waitForOrgRateLimitFn(ctx, "search", verbose); err != nil {
+			return nil, fmt.Errorf("checking search API budget: %w", err)
 		}
 		endpoint := fmt.Sprintf("/search/code?q=%s&per_page=%d&page=%d", url.QueryEscape(query), perPage, page)
-		output, err := workflow.RunGHContext(ctx, "Searching repositories...", "api", endpoint)
+		output, err := orgSearchAPIFn(ctx, "Searching repositories...", getHostFromOriginRemote(), "api", endpoint)
 		if err != nil {
 			return nil, fmt.Errorf("failed to search organization repositories: %w", err)
 		}
@@ -98,6 +123,16 @@ func searchOrgReposByQuery(ctx context.Context, query string, verbose bool) ([]s
 		var response orgSearchResponse
 		if err := json.Unmarshal(output, &response); err != nil {
 			return nil, fmt.Errorf("failed to parse organization search results: %w", err)
+		}
+		if response.TotalCount >= 1000 || response.IncompleteResults {
+			// Org queries are constructed locally; never silently truncate a rollout.
+			for token := range strings.FieldsSeq(query) {
+				if org, ok := strings.CutPrefix(token, "org:"); ok && isValidOrgSlug(org) {
+					fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Code search is incomplete; listing all organization repositories and inspecting workflows locally"))
+					return listOrgRolloutRepos(ctx, org)
+				}
+			}
+			return nil, errors.New("code search returned incomplete results; narrow the organization query")
 		}
 		if len(response.Items) == 0 {
 			break

@@ -8,10 +8,14 @@
 /** @type {string} Safe output type handled by this module */
 const HANDLER_TYPE = "call_workflow";
 
+const { ERR_PERMISSION } = require("./error_codes.cjs");
 const { buildAwContext } = require("./aw_context.cjs");
+const { redactWebhookPayloads } = require("./webhook_context.cjs");
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
 const { isStagedMode } = require("./safe_output_helpers.cjs");
+const { currentSafeOutputInvocation } = require("./safe_output_execution.cjs");
+const { handlerAuthorizationRequired, requireAuthorization } = require("./safe_output_authorization_gate.cjs");
 
 /**
  * Main handler factory for call_workflow.
@@ -93,10 +97,11 @@ async function main(config = {}) {
         inputs.aw_context = JSON.stringify(inputs.aw_context);
       }
       const payloadJson = JSON.stringify(inputs);
+      const logPayloadJson = JSON.stringify({ ...inputs, aw_context: redactWebhookPayloads(inputs.aw_context) });
 
       // If in staged mode, preview the workflow call without executing it
       if (isStaged) {
-        logStagedPreviewInfo(`Would call workflow: ${workflowName} with payload: ${payloadJson}`);
+        logStagedPreviewInfo(`Would call workflow: ${workflowName} with payload: ${logPayloadJson}`);
         return {
           success: true,
           staged: true,
@@ -105,15 +110,27 @@ async function main(config = {}) {
         };
       }
 
+      const invocation = currentSafeOutputInvocation();
+      if (handlerAuthorizationRequired(config)) {
+        const implementation = config["workflow-implementations"]?.[workflowName];
+        if (!implementation || typeof implementation !== "object" || ["path", "revision", "repository_id"].some(key => typeof implementation[key] !== "string" || !implementation[key])) {
+          throw new Error(ERR_PERMISSION + ": Safe-output authorization requires a trusted workflow launch implementation");
+        }
+        if (!Number.isSafeInteger(invocation.recordIndex) || invocation.recordIndex < 0) throw new Error(ERR_PERMISSION + ": Safe-output authorization requires a trusted workflow launch source ordinal");
+        await requireAuthorization({ inputs: { workflow: workflowName, implementation, inputs } });
+      }
+
       // Set the step outputs that the conditional `uses:` jobs check
       core.setOutput("call_workflow_name", workflowName);
       core.setOutput("call_workflow_payload", payloadJson);
+      if (Number.isSafeInteger(invocation?.recordIndex) && invocation.recordIndex >= 0) core.setOutput("call_workflow_record_index", String(invocation.recordIndex));
 
       core.info(`✓ Selected workflow: ${workflowName}`);
-      core.info(`  Payload: ${payloadJson}`);
+      core.info(`  Payload: ${logPayloadJson}`);
 
       return {
         success: true,
+        delegated: true,
         workflow_name: workflowName,
         payload: payloadJson,
       };

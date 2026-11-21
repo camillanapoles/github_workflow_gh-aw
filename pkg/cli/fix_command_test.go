@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"context"
 	"io"
 	"os"
 	"os/exec"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/github/gh-aw/pkg/parser"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -56,7 +58,127 @@ timeout_minutes: 30
 	assert.NotContains(t, output, "✓ ✓ test-workflow.md")
 }
 
+func TestProcessWorkflowFileWithInfo_IteratesUntilStable(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "workflow.md")
+	content := "---\ntools:\n  web-fetch: true\n---\nBody\n"
+	require.NoError(t, os.WriteFile(file, []byte(content), 0o600))
+	codemods := []Codemod{
+		{
+			ID: "remove-fetch", Name: "Remove fetch",
+			Apply: func(content string, fm map[string]any) (string, bool, error) {
+				if _, ok := fm["engine"]; !ok {
+					return content, false, nil
+				}
+				updated := strings.Replace(content, "  web-fetch: true\n", "", 1)
+				return updated, updated != content, nil
+			},
+		},
+		{
+			ID: "add-engine", Name: "Add engine",
+			Apply: func(content string, fm map[string]any) (string, bool, error) {
+				if _, ok := fm["engine"]; ok {
+					return content, false, nil
+				}
+				return strings.Replace(content, "---\n", "---\nengine: copilot\n", 1), true, nil
+			},
+		},
+	}
+	fixed, applied, err := processWorkflowFileWithInfo(file, codemods, true, false)
+	require.NoError(t, err)
+	require.True(t, fixed)
+	assert.Equal(t, []string{"Add engine", "Remove fetch"}, applied)
+	updated, err := os.ReadFile(file)
+	require.NoError(t, err)
+	assert.Equal(t, "---\nengine: copilot\ntools:\n---\nBody\n", string(updated))
+
+	fixed, _, err = processWorkflowFileWithInfo(file, codemods, true, false)
+	require.NoError(t, err)
+	assert.False(t, fixed)
+}
+
+func TestProcessWorkflowFileWithInfo_RejectsNonConvergingCodemods(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "workflow.md")
+	content := "---\nengine: copilot\n---\nBody\n"
+	require.NoError(t, os.WriteFile(file, []byte(content), 0o600))
+	codemods := []Codemod{
+		{
+			ID: "toggle", Name: "Toggle",
+			Apply: func(content string, _ map[string]any) (string, bool, error) {
+				if strings.Contains(content, "engine: copilot") {
+					return strings.Replace(content, "engine: copilot", "engine: codex", 1), true, nil
+				}
+				return strings.Replace(content, "engine: codex", "engine: copilot", 1), true, nil
+			},
+		},
+	}
+	_, _, err := processWorkflowFileWithInfo(file, codemods, true, false)
+	require.ErrorContains(t, err, "did not converge")
+	unchanged, err := os.ReadFile(file)
+	require.NoError(t, err)
+	assert.Equal(t, content, string(unchanged))
+}
+
+func TestRunFixDryRunPreservesNestedWorkflowPath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shared", "foo.md")
+	content := `---
+jobs:
+  publish:
+    steps:
+      - uses: actions/create-github-app-token@v3
+---`
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	originalStderr := os.Stderr
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = originalStderr })
+
+	require.NoError(t, RunFix(FixConfig{
+		WorkflowDir:                dir,
+		SkipInstructionFileUpdates: true,
+	}))
+	require.NoError(t, w.Close())
+	outputBytes, err := io.ReadAll(r)
+	require.NoError(t, err)
+	output := string(outputBytes)
+	assert.Contains(t, output, "gh aw fix shared/foo --write")
+	assert.NotContains(t, output, "gh aw fix foo --write")
+}
+
+func TestProcessWorkflowFileWithInfo_StopsAfterThreePasses(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "workflow.md")
+	content := "---\nstage: 0\n---\nBody\n"
+	require.NoError(t, os.WriteFile(file, []byte(content), 0o600))
+	transitions := [][2]string{
+		{"stage: 0", "stage: 1"},
+		{"stage: 1", "stage: 2"},
+		{"stage: 2", "stage: 3"},
+		{"stage: 3", "stage: 4"},
+	}
+	calls := 0
+	codemods := []Codemod{{
+		ID: "advance-stage", Name: "Advance stage",
+		Apply: func(content string, _ map[string]any) (string, bool, error) {
+			from, to := transitions[calls][0], transitions[calls][1]
+			calls++
+			updated := strings.Replace(content, from, to, 1)
+			return updated, updated != content, nil
+		},
+	}}
+
+	_, _, err := processWorkflowFileWithInfo(file, codemods, true, false)
+	require.ErrorContains(t, err, "did not converge")
+	assert.Equal(t, maxCodemodPasses, calls)
+	unchanged, err := os.ReadFile(file)
+	require.NoError(t, err)
+	assert.Equal(t, content, string(unchanged))
+}
+
 func TestFixCommand_TimeoutMinutesMigration(t *testing.T) {
+	t.Parallel()
 	// Create a temporary directory for test files
 	tmpDir := t.TempDir()
 	workflowFile := filepath.Join(tmpDir, "test-workflow.md")
@@ -116,6 +238,7 @@ This is a test workflow.
 }
 
 func TestFixCommand_NoChangesNeeded(t *testing.T) {
+	t.Parallel()
 	// Create a temporary directory for test files
 	tmpDir := t.TempDir()
 	workflowFile := filepath.Join(tmpDir, "test-workflow.md")
@@ -165,6 +288,7 @@ This is a test workflow.
 }
 
 func TestFixCommand_NetworkFirewallMigration(t *testing.T) {
+	t.Parallel()
 	// Create a temporary directory for test files
 	tmpDir := t.TempDir()
 	workflowFile := filepath.Join(tmpDir, "test-workflow.md")
@@ -230,6 +354,7 @@ This is a test workflow.
 }
 
 func TestFixCommand_NetworkFirewallMigrationWithNestedProperties(t *testing.T) {
+	t.Parallel()
 	// Create a temporary directory for test files
 	tmpDir := t.TempDir()
 	workflowFile := filepath.Join(tmpDir, "test-workflow.md")
@@ -294,9 +419,11 @@ This is a test workflow.
 		t.Error("Expected log-level field to be removed, but it still exists")
 	}
 
-	if strings.Contains(updatedStr, "version: v1.0.0") {
-		t.Error("Expected version field to be removed, but it still exists")
-	}
+	parsed, err := parser.ExtractFrontmatterFromContent(updatedStr)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{
+		"allowed": []any{"defaults", "node", "github"},
+	}, parsed.Frontmatter["network"], "Only allowed domains should remain under network")
 
 	if !strings.Contains(updatedStr, "sandbox:") {
 		t.Errorf("Expected sandbox field to be added for nested firewall, got:\n%s", updatedStr)
@@ -304,9 +431,9 @@ This is a test workflow.
 	if !strings.Contains(updatedStr, "agent:") {
 		t.Errorf("Expected sandbox.agent object to be added for nested firewall, got:\n%s", updatedStr)
 	}
-	if !strings.Contains(updatedStr, `version: "v1.0.0"`) {
-		t.Errorf("Expected firewall version to be migrated to sandbox.agent.version, got:\n%s", updatedStr)
-	}
+	assert.Equal(t, map[string]any{
+		"agent": map[string]any{"id": "awf", "version": "v1.0.0"},
+	}, parsed.Frontmatter["sandbox"], "Firewall version should migrate to sandbox.agent as a string")
 
 	// Verify compilation works
 	// This ensures the codemod produces valid YAML
@@ -321,6 +448,7 @@ This is a test workflow.
 }
 
 func TestFixCommand_NetworkFirewallMigrationWithCommentsAndEmptyLines(t *testing.T) {
+	t.Parallel()
 	// Create a temporary directory for test files
 	tmpDir := t.TempDir()
 	workflowFile := filepath.Join(tmpDir, "test-workflow.md")
@@ -387,9 +515,14 @@ This workflow tests comment and empty line handling.
 		t.Error("Expected log-level field to be removed, but it still exists")
 	}
 
-	if strings.Contains(updatedStr, "version: v1.0.0") {
-		t.Error("Expected version field to be removed, but it still exists")
-	}
+	parsed, err := parser.ExtractFrontmatterFromContent(updatedStr)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{
+		"allowed": []any{"defaults", "github"},
+	}, parsed.Frontmatter["network"], "Only allowed domains should remain under network")
+	assert.Equal(t, map[string]any{
+		"agent": map[string]any{"id": "awf", "version": "v1.0.0"},
+	}, parsed.Frontmatter["sandbox"], "Firewall version should migrate to sandbox.agent as a string")
 
 	// Comments within the firewall block should also be removed
 	if strings.Contains(updatedStr, "# Firewall configuration") {
@@ -411,6 +544,7 @@ This workflow tests comment and empty line handling.
 }
 
 func TestFixCommand_PreservesFormatting(t *testing.T) {
+	t.Parallel()
 	// Create a temporary directory for test files
 	tmpDir := t.TempDir()
 	workflowFile := filepath.Join(tmpDir, "test-workflow.md")
@@ -477,6 +611,7 @@ This is a test workflow.
 }
 
 func TestGetAllCodemods(t *testing.T) {
+	t.Parallel()
 	codemods := GetAllCodemods()
 
 	if len(codemods) == 0 {
@@ -517,6 +652,7 @@ func TestGetAllCodemods(t *testing.T) {
 }
 
 func TestNewFixCommand_HasDisableCodemodFlag(t *testing.T) {
+	t.Parallel()
 	cmd := NewFixCommand()
 	require.NotNil(t, cmd)
 
@@ -527,6 +663,7 @@ func TestNewFixCommand_HasDisableCodemodFlag(t *testing.T) {
 }
 
 func TestRunFix_DisabledCodemodSkipsMatchingFix(t *testing.T) {
+	t.Parallel()
 	tmpDir := t.TempDir()
 	workflowFile := filepath.Join(tmpDir, "test.md")
 
@@ -552,6 +689,7 @@ timeout_minutes: 30
 }
 
 func TestFixCommand_CommandToSlashCommandMigration(t *testing.T) {
+	t.Parallel()
 	// Create a temporary directory for test files
 	tmpDir := t.TempDir()
 	workflowFile := filepath.Join(tmpDir, "test-workflow.md")
@@ -621,6 +759,7 @@ This is a test workflow with slash command.
 }
 
 func TestFixCommand_MCPScriptsModeRemoval(t *testing.T) {
+	t.Parallel()
 	// Create a temporary directory for test files
 	tmpDir := t.TempDir()
 	workflowFile := filepath.Join(tmpDir, "test-workflow.md")
@@ -691,15 +830,69 @@ This is a test workflow with mcp-scripts mode field.
 	}
 }
 
-func TestFixCommand_UpdatesPromptAndAgentFiles(t *testing.T) {
+func stubAgenticWorkflowsMarkdownFilesForTest(t *testing.T) {
+	t.Helper()
+
+	original := listAgenticWorkflowsMarkdownFiles
+	listAgenticWorkflowsMarkdownFiles = func(context.Context) ([]string, error) {
+		return []string{
+			"create-agentic-workflow.md",
+			"update-agentic-workflow.md",
+		}, nil
+	}
+	t.Cleanup(func() {
+		listAgenticWorkflowsMarkdownFiles = original
+	})
+}
+
+func TestWriteGeneratedRepositoryInstructionFile_RefusesDryRun(t *testing.T) {
+	t.Parallel()
+	tmpDir := t.TempDir()
+	targetPath := filepath.Join(tmpDir, ".github", "skills", "agentic-workflows", "SKILL.md")
+	originalContent := []byte("existing content\n")
+
+	require.NoError(t, os.MkdirAll(filepath.Dir(targetPath), 0755))
+	require.NoError(t, os.WriteFile(targetPath, originalContent, 0644))
+
+	err := writeGeneratedRepositoryInstructionFile(
+		targetPath,
+		[]byte("new content\n"),
+		false,
+		".github/skills/agentic-workflows directory",
+		"dispatcher skill",
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "refusing to write dispatcher skill without --write")
+
+	content, readErr := os.ReadFile(targetPath)
+	require.NoError(t, readErr)
+	assert.Equal(t, string(originalContent), string(content))
+
+	missingPath := filepath.Join(tmpDir, ".github", "agents", "nested", "agentic-workflows.md")
+	err = writeGeneratedRepositoryInstructionFile(
+		missingPath,
+		[]byte("new content\n"),
+		false,
+		".github/agents directory",
+		"Agentic Workflows custom agent",
+	)
+	require.Error(t, err)
+	assert.NoFileExists(t, missingPath)
+	assert.NoDirExists(t, filepath.Dir(missingPath))
+}
+
+func TestFixCommand_DryRunDoesNotUpdatePromptAndAgentFiles(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		// Skip when git isn't available in the test environment.
 		t.Skip("Git not available")
 	}
+	stubAgenticWorkflowsMarkdownFilesForTest(t)
 
 	// Create a temporary directory for test files
 	tmpDir := t.TempDir()
 	workflowFile := filepath.Join(tmpDir, "test-workflow.md")
+	skillPath := filepath.Join(tmpDir, ".github", "skills", "agentic-workflows", "SKILL.md")
+	agentPath := filepath.Join(tmpDir, ".github", "agents", "agentic-workflows.md")
 
 	// Save and restore original directory
 	originalDir, err := os.Getwd()
@@ -734,6 +927,19 @@ This is a test workflow.
 `
 
 	require.NoError(t, os.WriteFile(workflowFile, []byte(content), 0644), "Failed to create test file")
+	require.NoError(t, os.MkdirAll(filepath.Dir(skillPath), 0755), "Failed to create skill directory")
+	require.NoError(t, os.MkdirAll(filepath.Dir(agentPath), 0755), "Failed to create agent directory")
+
+	originalSkill := "local skill change\n"
+	originalAgent := "local agent change\n"
+	require.NoError(t, os.WriteFile(skillPath, []byte(originalSkill), 0644), "Failed to create skill file")
+	require.NoError(t, os.WriteFile(agentPath, []byte(originalAgent), 0644), "Failed to create agent file")
+
+	originalStderr := os.Stderr
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = originalStderr })
 
 	// Run fix command (which refreshes the generated skill and agent files)
 	config := FixConfig{
@@ -744,17 +950,153 @@ This is a test workflow.
 	}
 
 	require.NoError(t, RunFix(config), "RunFix failed")
+	require.NoError(t, w.Close())
 
-	_, err = os.Stat(filepath.Join(tmpDir, ".github", "skills", "agentic-workflows", "SKILL.md"))
+	outputBytes, err := io.ReadAll(r)
+	require.NoError(t, err)
+	output := string(outputBytes)
+
+	skillContent, err := os.ReadFile(skillPath)
+	require.NoError(t, err, "Expected skill file to remain in place after dry-run")
+	assert.Equal(t, originalSkill, string(skillContent))
+
+	agentContent, err := os.ReadFile(agentPath)
+	require.NoError(t, err, "Expected agent file to remain in place after dry-run")
+	assert.Equal(t, originalAgent, string(agentContent))
+
+	assert.Contains(t, output, "Would update dispatcher skill: "+skillPath)
+	assert.Contains(t, output, "Would update Agentic Workflows custom agent: "+agentPath)
+	assert.Contains(t, output, "No workflow fixes needed")
+}
+
+func TestFixCommand_WriteUpdatesPromptAndAgentFiles(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("Git not available")
+	}
+	stubAgenticWorkflowsMarkdownFilesForTest(t)
+
+	tmpDir := t.TempDir()
+	workflowFile := filepath.Join(tmpDir, "test-workflow.md")
+	skillPath := filepath.Join(tmpDir, ".github", "skills", "agentic-workflows", "SKILL.md")
+	agentPath := filepath.Join(tmpDir, ".github", "agents", "agentic-workflows.md")
+
+	originalDir, err := os.Getwd()
+	require.NoError(t, err, "Failed to get current directory")
+	t.Cleanup(func() {
+		if chdirErr := os.Chdir(originalDir); chdirErr != nil {
+			t.Errorf("Failed to restore current directory: %v", chdirErr)
+		}
+	})
+
+	require.NoError(t, os.Chdir(tmpDir), "Failed to change to temp directory")
+	require.NoError(t, exec.Command("git", "init").Run(), "Failed to initialize git repo")
+	require.NoError(t, exec.Command("git", "config", "user.name", "Test User").Run(), "Failed to configure git user.name")
+	require.NoError(t, exec.Command("git", "config", "user.email", "test@example.com").Run(), "Failed to configure git user.email")
+
+	content := `---
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+---
+
+# Test Workflow
+
+This is a test workflow.
+`
+
+	require.NoError(t, os.WriteFile(workflowFile, []byte(content), 0644), "Failed to create test file")
+	require.NoError(t, os.MkdirAll(filepath.Dir(skillPath), 0755), "Failed to create skill directory")
+	require.NoError(t, os.MkdirAll(filepath.Dir(agentPath), 0755), "Failed to create agent directory")
+	require.NoError(t, os.WriteFile(skillPath, []byte("local skill change\n"), 0644), "Failed to create skill file")
+	require.NoError(t, os.WriteFile(agentPath, []byte("local agent change\n"), 0644), "Failed to create agent file")
+
+	config := FixConfig{
+		WorkflowIDs: []string{"test-workflow"},
+		Write:       true,
+		Verbose:     false,
+		WorkflowDir: tmpDir,
+	}
+
+	require.NoError(t, RunFix(config), "RunFix failed")
+
+	skillContent, err := os.ReadFile(skillPath)
 	require.NoError(t, err, "Expected generated skill file to exist after RunFix")
+	assert.Contains(t, string(skillContent), "# Agentic Workflows Router")
+	assert.NotContains(t, string(skillContent), "local skill change")
 
-	agentContent, err := os.ReadFile(filepath.Join(tmpDir, ".github", "agents", "agentic-workflows.md"))
+	agentContent, err := os.ReadFile(agentPath)
 	require.NoError(t, err, "Expected generated agent file to exist after RunFix")
 	assert.Contains(t, string(agentContent), ".github/aw/create-agentic-workflow.md")
 	assert.NotContains(t, string(agentContent), ".github/skills/agentic-workflows/SKILL.md")
+	assert.NotContains(t, string(agentContent), "local agent change")
+}
+
+func TestFixCommand_DryRunTreatsExistingEmptyDispatcherArtifactsAsUpdates(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("Git not available")
+	}
+	stubAgenticWorkflowsMarkdownFilesForTest(t)
+
+	tmpDir := t.TempDir()
+	workflowFile := filepath.Join(tmpDir, "test-workflow.md")
+	skillPath := filepath.Join(tmpDir, ".github", "skills", "agentic-workflows", "SKILL.md")
+	agentPath := filepath.Join(tmpDir, ".github", "agents", "agentic-workflows.md")
+
+	originalDir, err := os.Getwd()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if chdirErr := os.Chdir(originalDir); chdirErr != nil {
+			t.Errorf("Failed to restore current directory: %v", chdirErr)
+		}
+	})
+
+	require.NoError(t, os.Chdir(tmpDir))
+	require.NoError(t, exec.Command("git", "init").Run())
+	require.NoError(t, exec.Command("git", "config", "user.name", "Test User").Run())
+	require.NoError(t, exec.Command("git", "config", "user.email", "test@example.com").Run())
+
+	content := `---
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+---
+`
+	require.NoError(t, os.WriteFile(workflowFile, []byte(content), 0644))
+	require.NoError(t, os.MkdirAll(filepath.Dir(skillPath), 0755))
+	require.NoError(t, os.MkdirAll(filepath.Dir(agentPath), 0755))
+	require.NoError(t, os.WriteFile(skillPath, []byte{}, 0644))
+	require.NoError(t, os.WriteFile(agentPath, []byte{}, 0644))
+
+	originalStderr := os.Stderr
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	// NOTE: this test redirects os.Stderr and must not run in parallel.
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = originalStderr })
+
+	require.NoError(t, RunFix(FixConfig{
+		WorkflowIDs: []string{"test-workflow"},
+		Write:       false,
+		WorkflowDir: tmpDir,
+	}))
+
+	require.NoError(t, w.Close())
+	outputBytes, err := io.ReadAll(r)
+	require.NoError(t, err)
+	output := string(outputBytes)
+
+	assert.Contains(t, output, "Would update dispatcher skill: "+skillPath)
+	assert.Contains(t, output, "Would update Agentic Workflows custom agent: "+agentPath)
+	assert.NotContains(t, output, "Would create dispatcher skill:")
+	assert.NotContains(t, output, "Would create Agentic Workflows custom agent:")
 }
 
 func TestFixCommand_GrepToolRemoval(t *testing.T) {
+	t.Parallel()
 	// Create a temporary directory for test files
 	tmpDir := t.TempDir()
 	workflowFile := filepath.Join(tmpDir, "test-workflow.md")
@@ -822,6 +1164,7 @@ This workflow uses the deprecated grep tool.
 }
 
 func TestFixCommand_GrepToolRemoval_NoGrep(t *testing.T) {
+	t.Parallel()
 	// Create a temporary directory for test files
 	tmpDir := t.TempDir()
 	workflowFile := filepath.Join(tmpDir, "test-workflow.md")
@@ -866,6 +1209,7 @@ This workflow doesn't have grep.
 }
 
 func TestFixCommand_SandboxFalseToAgentFalseMigration(t *testing.T) {
+	t.Parallel()
 	// Create a temporary directory for test files
 	tmpDir := t.TempDir()
 	workflowFile := filepath.Join(tmpDir, "test-workflow.md")
@@ -943,6 +1287,7 @@ This workflow has sandbox disabled.
 }
 
 func TestFixCommand_AppToGitHubAppMigration(t *testing.T) {
+	t.Parallel()
 	// Create a temporary directory for test files
 	tmpDir := t.TempDir()
 	workflowFile := filepath.Join(tmpDir, "test-workflow.md")
@@ -1007,6 +1352,7 @@ This workflow uses top-level app auth.
 }
 
 func TestFixCommand_AppToGitHubAppMigration_Combined(t *testing.T) {
+	t.Parallel()
 	// Combined scenario: top-level app: and nested app: under tools.github both renamed in one pass.
 	tmpDir := t.TempDir()
 	workflowFile := filepath.Join(tmpDir, "test-workflow.md")
@@ -1078,6 +1424,7 @@ This workflow uses both top-level app auth and nested app auth.
 }
 
 func TestFixCommand_SandboxFalseToAgentFalseMigration_NoSandbox(t *testing.T) {
+	t.Parallel()
 	// Create a temporary directory for test files
 	tmpDir := t.TempDir()
 	workflowFile := filepath.Join(tmpDir, "test-workflow.md")
@@ -1118,6 +1465,7 @@ permissions:
 }
 
 func TestFixCommand_ScaffoldsSerenaSharedWorkflow(t *testing.T) {
+	t.Parallel()
 	tmpDir := t.TempDir()
 	workflowDir := filepath.Join(tmpDir, ".github", "workflows")
 	workflowFile := filepath.Join(workflowDir, "test-workflow.md")
@@ -1178,7 +1526,56 @@ tools:
 	}
 }
 
+func TestRunFix_ScaffoldFailureDoesNotReportSuccessfulCodemods(t *testing.T) {
+	t.Chdir(t.TempDir())
+	workflowDir := filepath.Join(".github", "workflows")
+	require.NoError(t, os.MkdirAll(workflowDir, 0o755))
+	workflowFile := filepath.Join(workflowDir, "test-workflow.md")
+	content := "---\nengine: copilot\ntools:\n  serena: [\"typescript\"]\n---\nTest\n"
+	require.NoError(t, os.WriteFile(workflowFile, []byte(content), 0o600))
+	// A file where the shared directory belongs prevents scaffolding after the workflow is written.
+	require.NoError(t, os.WriteFile(filepath.Join(workflowDir, "shared"), []byte("blocked"), 0o600))
+
+	var disabled []string
+	for _, codemod := range GetAllCodemods() {
+		if codemod.ID != "serena-tools-to-shared-import" {
+			disabled = append(disabled, codemod.ID)
+		}
+	}
+	serenaCodemod := getCodemodByID("serena-tools-to-shared-import")
+	require.NotNil(t, serenaCodemod)
+
+	summary := &updatePRSummary{before: map[string]updatePRFile{}}
+	var runErr error
+	_, stderr := captureOutput(t, func() error {
+		runErr = RunFix(FixConfig{
+			Write:              true,
+			WorkflowDir:        workflowDir,
+			DisabledCodemodIDs: disabled,
+			OnApplied:          summary.recordFix,
+		})
+		return nil
+	})
+	var exitErr *ExitCodeError
+	require.ErrorAs(t, runErr, &exitErr)
+	assert.Equal(t, 1, exitErr.Code)
+	assert.Contains(t, stderr, "Error processing test-workflow.md")
+	assert.Contains(t, stderr, "failed to scaffold shared Serena workflow")
+	assert.NotContains(t, stderr, "Applied fixes to")
+	assert.NotContains(t, stderr, "No fixes needed")
+	assert.Empty(t, summary.applied, "an incomplete migration must not be reported as successfully applied")
+
+	written, err := os.ReadFile(workflowFile)
+	require.NoError(t, err)
+	assert.Contains(t, string(written), "shared/mcp/serena.md", "the workflow was written before scaffolding failed")
+	body := summary.render("upgrade", map[string]updatePRFile{})
+	assert.NotContains(t, body, serenaCodemod.Name)
+	assert.NotContains(t, body, "Codemod step ran")
+	assert.NotContains(t, body, "Execution notes")
+}
+
 func TestRunFix_GuidedErrorReturnsExitCode2(t *testing.T) {
+	t.Parallel()
 	tmpDir := t.TempDir()
 	workflowFile := filepath.Join(tmpDir, "byok-workflow.md")
 
@@ -1290,6 +1687,7 @@ env:
 }
 
 func TestProcessWorkflowFileWithInfo_GuidedErrorWrapped(t *testing.T) {
+	t.Parallel()
 	tmpDir := t.TempDir()
 	workflowFile := filepath.Join(tmpDir, "test.md")
 
@@ -1314,6 +1712,7 @@ env:
 }
 
 func TestRunFix_HardProcessingErrorReturnsExitCode1(t *testing.T) {
+	t.Parallel()
 	tmpDir := t.TempDir()
 
 	// Create a directory where a file is expected — reading it will fail

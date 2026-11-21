@@ -1,6 +1,7 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
+const { getIssueLabel } = require("./issue_label.cjs");
 const { buildMissingIssueHandler } = require("./missing_issue_helpers.cjs");
 const { getPromptPath } = require("./messages_core.cjs");
 
@@ -10,6 +11,7 @@ const { getPromptPath } = require("./messages_core.cjs");
 
 /** @type {string} Safe output type handled by this module */
 const HANDLER_TYPE = "create_report_incomplete_issue";
+const DEFAULT_INCOMPLETE_SIGNAL_REASON = "incomplete_signal_not_provided";
 
 /**
  * Main handler factory for create_report_incomplete_issue
@@ -21,23 +23,19 @@ const HANDLER_TYPE = "create_report_incomplete_issue";
 const main = buildMissingIssueHandler({
   handlerType: HANDLER_TYPE,
   defaultTitlePrefix: "[incomplete]",
-  defaultLabels: ["agentic-workflows"],
+  defaultLabels: [getIssueLabel()],
   itemsField: "incomplete_signals",
+  fallbackItems: () => [
+    {
+      reason: DEFAULT_INCOMPLETE_SIGNAL_REASON,
+      timestamp: new Date().toISOString(),
+    },
+  ],
   templatePath: getPromptPath("missing_tool_issue.md"),
-  templateListKey: "incomplete_signals_list",
+  templateListKey: "missing_tools_list",
   buildCommentHeader: runUrl => [`## Incomplete Run Reported`, ``, `The agent reported that the task could not be completed during [workflow run](${runUrl}):`, ``],
-  renderCommentItem: (item, index) => {
-    const lines = [`### ${index + 1}. Incomplete signal`, `**Reason:** ${item.reason}`];
-    if (item.details) lines.push(`**Details:** ${item.details}`);
-    lines.push(``);
-    return lines;
-  },
-  renderIssueItem: (item, index) => {
-    const lines = [`#### ${index + 1}. Incomplete signal`, `**Reason:** ${item.reason}`];
-    if (item.details) lines.push(`**Details:** ${item.details}`);
-    lines.push(`**Reported at:** ${item.timestamp}`, ``);
-    return lines;
-  },
+  renderCommentItem: (_item, index) => [`### ${index + 1}. Incomplete signal`, "**Task completion:** unconfirmed", ""],
+  renderIssueItem: (_item, index) => [`#### ${index + 1}. Incomplete signal`, "**Task completion:** unconfirmed", ""],
 });
 
 module.exports = { main };

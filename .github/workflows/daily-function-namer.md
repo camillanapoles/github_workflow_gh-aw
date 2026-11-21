@@ -12,13 +12,14 @@ permissions:
   contents: read
   issues: read
   pull-requests: read
+  copilot-requests: write
 
 tracker-id: daily-function-namer
 
+model: router/economy
 engine:
   id: pi
-  model: copilot/gpt-5.4
-
+  model-provider: github
 imports:
   - uses: shared/daily-audit-base.md
     with:
@@ -27,6 +28,7 @@ imports:
   - shared/mcp/serena-go.md
 
   - shared/otlp.md
+  - shared/reporting.md
 safe-outputs:
   create-issue:
     expires: 7d
@@ -37,7 +39,7 @@ safe-outputs:
 
 sandbox:
   agent:
-    sudo: false
+    id: awf
 tools:
   cli-proxy: true
   cache-memory: true
@@ -50,6 +52,11 @@ timeout-minutes: 30
 strict: true
 features:
   gh-aw-detection: true
+evals:
+  - id: package_analyzed
+    question: Did the agent analyze at least one Go package for function naming quality and discoverability?
+  - id: issue_created_or_noop
+    question: Was an issue created with function rename suggestions, or was noop used when no naming improvements were identified?
 ---
 
 # Daily Go Function Namer
@@ -140,7 +147,7 @@ The script outputs:
 
 Use these values directly for the rest of the workflow. Do **not** re-derive or re-compute them manually.
 
-**On cold start** (`/tmp/gh-aw/cache-memory/function-namer-state.json` missing): treat this as expected initialization, not a failure. Do **not** call `missing_data` for a missing state file on first run or cold cache; run the Step 1 script as written, accept `LAST_INDEX=-1`, and continue.
+**On cold start** (`/tmp/gh-aw/cache-memory/function-namer-state.json` missing): treat this as expected initialization, not a failure. Do **not** call `report_missing_data` for a missing state file on first run or cold cache; run the Step 1 script as written, accept `LAST_INDEX=-1`, and continue.
 
 ## Step 2: Enumerate All Functions in the Package
 
@@ -436,4 +443,6 @@ Only include a rename suggestion if you are confident it would measurably improv
 
 ### Output Format
 
-Structure reports as: overview → key metrics/issues → collapsible detail → next actions.
+- Use `###` (h3) or lower for all report headers; never use `#` or `##` inside the report body.
+- Wrap long lists, tables, and detailed findings in `<details><summary><b>...</b></summary>...</details>` blocks to reduce scrolling.
+- Structure reports as: overview → key metrics/issues → collapsible detail → next actions.

@@ -3,6 +3,8 @@
 package cli
 
 import (
+	"context"
+	"encoding/base64"
 	"strings"
 	"testing"
 
@@ -13,7 +15,15 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+func TestMCPInspectIntervalSchedule(t *testing.T) {
+	workflowID := writeGraderRunWorkflow(t, "---\non:\n  schedule: every 2 days\n---\nTest.\n")
+	if err := InspectWorkflowMCP(context.Background(), workflowID, "", "", false, false); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMCPInspectSubcommand_NoArgBehaviorDocumented(t *testing.T) {
+	t.Parallel()
 	cmd := NewMCPInspectSubcommand()
 	if cmd == nil {
 		t.Fatal("Expected mcp inspect subcommand to be created")
@@ -24,6 +34,38 @@ func TestMCPInspectSubcommand_NoArgBehaviorDocumented(t *testing.T) {
 	}
 	if !strings.Contains(cmd.Long, "(equivalent to 'gh aw mcp list')") {
 		t.Errorf("Expected mcp inspect long help to document no-argument behavior, got: %s", cmd.Long)
+	}
+}
+
+func TestMCPInspectClientImplementation_UsesCLIGetVersion(t *testing.T) {
+	t.Parallel()
+	implementation := mcpInspectClientImplementation()
+
+	if implementation.Name != "gh-aw-inspector" {
+		t.Fatalf("expected inspector client name %q, got %q", "gh-aw-inspector", implementation.Name)
+	}
+	if implementation.Version != GetVersion() {
+		t.Fatalf("expected inspector client version %q, got %q", GetVersion(), implementation.Version)
+	}
+}
+
+func TestMCPEmojiIconSource_ReturnsDataURI(t *testing.T) {
+	t.Parallel()
+	source := mcpEmojiIconSource("📊")
+	if !strings.HasPrefix(source, "data:image/svg+xml;base64,") {
+		t.Fatalf("expected base64 data URI source, got %q", source)
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(source, "data:image/svg+xml;base64,"))
+	if err != nil {
+		t.Fatalf("failed to base64-decode icon source: %v", err)
+	}
+
+	if !strings.Contains(string(decoded), "<svg") {
+		t.Fatalf("expected SVG payload, got %q", decoded)
+	}
+	if !strings.Contains(string(decoded), "📊") {
+		t.Fatalf("expected original emoji in SVG payload, got %q", decoded)
 	}
 }
 
@@ -348,5 +390,61 @@ func TestFilterOutSafeOutputs(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDisplayServerCapabilities_WithPrompts(t *testing.T) {
+	info := &parser.MCPServerInfo{
+		Tools: []*mcp.Tool{
+			{Name: "example-tool", Description: "Example tool"},
+		},
+		Resources: []*mcp.Resource{
+			{URI: "file:///repo/workflow.md", Name: "workflow", Description: "Workflow resource"},
+		},
+		Prompts: []*mcp.Prompt{
+			{
+				Name:        "summarize",
+				Title:       "Quick Summary",
+				Description: "Summarize the current workflow",
+				Arguments: []*mcp.PromptArgument{
+					{Name: "topic", Required: true},
+				},
+			},
+		},
+		Roots: []*parser.MCPRootInfo{
+			{URI: "file://", Name: "file"},
+		},
+	}
+
+	stdout, _ := captureOutput(t, func() error {
+		displayServerCapabilities(info, "")
+		return nil
+	})
+
+	if !strings.Contains(stdout, "summarize") {
+		t.Fatalf("expected prompt name in stdout, got %q", stdout)
+	}
+	if !strings.Contains(stdout, "Quick Summary") {
+		t.Fatalf("expected prompt title in stdout, got %q", stdout)
+	}
+	if !strings.Contains(stdout, "Arguments") {
+		t.Fatalf("expected prompts table headers in stdout, got %q", stdout)
+	}
+}
+
+func TestDisplayServerCapabilities_WithoutPrompts(t *testing.T) {
+	info := &parser.MCPServerInfo{
+		Tools: []*mcp.Tool{
+			{Name: "example-tool", Description: "Example tool"},
+		},
+	}
+
+	stdout, _ := captureOutput(t, func() error {
+		displayServerCapabilities(info, "")
+		return nil
+	})
+
+	if strings.Contains(stdout, "Arguments") {
+		t.Fatalf("did not expect prompts table headers in stdout, got %q", stdout)
 	}
 }

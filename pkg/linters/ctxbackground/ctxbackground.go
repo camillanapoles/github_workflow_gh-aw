@@ -5,31 +5,27 @@ package ctxbackground
 
 import (
 	"go/ast"
-	"go/types"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
 )
 
 // Analyzer is the ctx-background analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "ctxbackground",
-	Doc:      "reports calls to context.Background() inside functions that already receive a context.Context parameter",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/ctxbackground",
-	Requires: []*analysis.Analyzer{inspect.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("ctxbackground", "reports calls to context.Background() inside functions that already receive a context.Context parameter", run)
 
 func run(pass *analysis.Pass) (any, error) {
 	insp, err := astutil.Inspector(pass)
 	if err != nil {
 		return nil, err
 	}
-	noLintLinesByFile := nolint.BuildLineIndex(pass, "ctxbackground")
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
+	if err != nil {
+		return nil, err
+	}
 
 	for cur := range insp.Root().Preorder((*ast.CallExpr)(nil)) {
 		call, ok := cur.Node().(*ast.CallExpr)
@@ -38,10 +34,10 @@ func run(pass *analysis.Pass) (any, error) {
 		}
 
 		pos := pass.Fset.PositionFor(call.Pos(), false)
-		if filecheck.IsTestFile(pos.Filename) {
+		if filecheck.ShouldSkipFilename(pos.Filename, generatedFiles) {
 			continue
 		}
-		if nolint.HasDirective(pos, noLintLinesByFile) {
+		if nolint.HasDirectiveForLinter(pos, noLintIndex, "ctxbackground") {
 			continue
 		}
 
@@ -55,11 +51,9 @@ func run(pass *analysis.Pass) (any, error) {
 				break
 			}
 
-			pass.Report(analysis.Diagnostic{
-				Pos:     call.Pos(),
-				End:     call.End(),
-				Message: "use the context.Context parameter instead of context.Background()",
-				SuggestedFixes: []analysis.SuggestedFix{
+			var fixes []analysis.SuggestedFix
+			if !astutil.HasOverlappingComment(pass.Files, call.Pos(), call.End()) {
+				fixes = []analysis.SuggestedFix{
 					{
 						Message: "Replace context.Background() with context parameter",
 						TextEdits: []analysis.TextEdit{
@@ -70,7 +64,13 @@ func run(pass *analysis.Pass) (any, error) {
 							},
 						},
 					},
-				},
+				}
+			}
+			pass.Report(analysis.Diagnostic{
+				Pos:            call.Pos(),
+				End:            call.End(),
+				Message:        "use the context.Context parameter instead of context.Background()",
+				SuggestedFixes: fixes,
 			})
 			break
 		}
@@ -79,22 +79,13 @@ func run(pass *analysis.Pass) (any, error) {
 	return nil, nil
 }
 
+// isContextBackgroundCall reports whether call is a call to
+// context.Background. A parenthesized callee such as
+// (context.Background)() is also recognized.
 func isContextBackgroundCall(pass *analysis.Pass, call *ast.CallExpr) bool {
-	sel, ok := call.Fun.(*ast.SelectorExpr)
+	sel, ok := astutil.UnwrapParenExpr(call.Fun).(*ast.SelectorExpr)
 	if !ok || sel.Sel.Name != "Background" {
 		return false
 	}
-	ident, ok := sel.X.(*ast.Ident)
-	if !ok || pass.TypesInfo == nil {
-		return false
-	}
-	obj := pass.TypesInfo.ObjectOf(ident)
-	if obj == nil {
-		return false
-	}
-	pkgName, ok := obj.(*types.PkgName)
-	if !ok {
-		return false
-	}
-	return pkgName.Imported().Path() == "context"
+	return astutil.IsPkgSelector(pass, sel, "context")
 }

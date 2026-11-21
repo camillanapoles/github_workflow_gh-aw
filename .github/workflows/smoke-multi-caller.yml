@@ -21,7 +21,9 @@ jobs:
       task-description: 'task-a - first invocation'
     secrets: inherit
     permissions:
+      actions: read
       contents: read
+      id-token: write
       issues: write
       pull-requests: write
 
@@ -36,7 +38,9 @@ jobs:
       task-description: 'task-b - second invocation'
     secrets: inherit
     permissions:
+      actions: read
       contents: read
+      id-token: write
       issues: write
       pull-requests: write
 
@@ -48,6 +52,8 @@ jobs:
       task-description: 'task-c - third invocation (after a and b)'
     secrets: inherit
     permissions:
+      actions: read
       contents: read
+      id-token: write
       issues: write
       pull-requests: write

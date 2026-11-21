@@ -1,9 +1,13 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
-const { getErrorMessage, isLockedError } = require("./error_helpers.cjs");
+const { getErrorMessage, isLockedError, isRateLimitError, isConnectTimeoutError } = require("./error_helpers.cjs");
 const { ERR_API, ERR_NOT_FOUND, ERR_VALIDATION } = require("./error_codes.cjs");
 const { resolveInvocationContext } = require("./invocation_context_helpers.cjs");
+const { withRetry } = require("./error_recovery.cjs");
+
+const MAX_CONNECTION_RETRIES = 2;
+const CONNECTION_RETRY_DELAY_MS = 1000;
 
 /** @type {Record<string, string>} Maps REST reaction names to GraphQL ReactionContent enum values */
 const REACTION_MAP = {
@@ -18,19 +22,26 @@ const REACTION_MAP = {
 };
 
 /**
- * Add a reaction to the triggering item (issue, PR, comment, or discussion).
+ * Add or remove a reaction to the triggering item (issue, PR, comment, or discussion).
  * This provides immediate feedback to the user when a workflow is triggered.
- * This script only adds reactions - it does NOT create comments.
+ * GH_AW_REMOVE_REACTION_ID opts into cleanup; an explicitly empty ID is a no-op.
+ * This script only manages reactions - it does NOT create comments.
  * Use add_reaction_and_edit_comment.cjs in the activation job to create the comment with workflow link.
  */
 async function main() {
   // Read inputs from environment variables
   const reaction = process.env.GH_AW_REACTION || "eyes";
+  const removeReactionId = process.env.GH_AW_REMOVE_REACTION_ID;
+  if (removeReactionId !== undefined && !removeReactionId.trim()) {
+    core.info("Skipping reaction cleanup: no reaction ID provided");
+    return;
+  }
+  const removing = Boolean(removeReactionId);
 
-  core.info(`Adding reaction: ${reaction}`);
+  core.info(`${removing ? "Removing" : "Adding"} reaction: ${reaction}`);
 
   // Validate reaction type
-  if (!Object.prototype.hasOwnProperty.call(REACTION_MAP, reaction)) {
+  if (!Object.hasOwn(REACTION_MAP, reaction)) {
     core.setFailed(`${ERR_VALIDATION}: Invalid reaction type: ${reaction}. Valid reactions are: ${Object.keys(REACTION_MAP).join(", ")}`);
     return;
   }
@@ -41,71 +52,74 @@ async function main() {
   const { owner, repo } = invocationContext.eventRepo;
   const payload = invocationContext.eventPayload;
 
-  /** @type {string | null} */
+  /** @type {{ route: string, params: Record<string, unknown> } | null} */
   const reactionEndpoint = resolveRestEndpoint(eventName, owner, repo, payload);
 
   if (reactionEndpoint === null) {
     // GraphQL paths are handled separately; REST validation failures already called setFailed.
     if (!isRestReactionEvent(eventName)) {
-      await handleGraphQLOrUnknownEvent(eventName, owner, repo, payload, reaction);
+      await handleGraphQLOrUnknownEvent(eventName, owner, repo, payload, reaction, removing);
     }
     return;
   }
 
-  core.info(`Adding reaction to: ${reactionEndpoint}`);
+  core.info(`${removing ? "Removing" : "Adding"} reaction to: ${reactionEndpoint.route}`);
   try {
-    await addReaction(reactionEndpoint, reaction);
+    await addReaction(reactionEndpoint.route, reactionEndpoint.params, reaction, removeReactionId);
   } catch (error) {
-    handleReactionError(error);
+    handleReactionError(error, removing);
   }
 }
 
 /**
- * Resolve the REST API endpoint for non-discussion events.
+ * Extract a required field from the event payload, calling setFailed if missing.
+ * @param {unknown} value - The extracted value (already resolved by caller)
+ * @param {string} fieldName - Human-readable field name for error messages
+ * @param {string} errorCode - Error code prefix (ERR_NOT_FOUND or ERR_VALIDATION)
+ * @returns {boolean} true if valid, false if missing (setFailed already called)
+ */
+function requirePayloadField(value, fieldName, errorCode) {
+  if (value == null) {
+    core.setFailed(`${errorCode}: ${fieldName} not found in event payload`);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Resolve the REST API route and params for non-discussion events.
  * Returns null for discussion/discussion_comment/pull_request_review/unsupported events (handled separately).
  * @param {string} eventName
  * @param {string} owner
  * @param {string} repo
  * @param {Record<string, any>} payload
- * @returns {string | null}
+ * @returns {{ route: string, params: Record<string, unknown> } | null}
  */
 function resolveRestEndpoint(eventName, owner, repo, payload) {
   switch (eventName) {
     case "issues": {
       const issueNumber = payload?.issue?.number;
-      if (!issueNumber) {
-        core.setFailed(`${ERR_NOT_FOUND}: Issue number not found in event payload`);
-        return null;
-      }
-      return `/repos/${owner}/${repo}/issues/${issueNumber}/reactions`;
+      if (!requirePayloadField(issueNumber, "Issue number", ERR_NOT_FOUND)) return null;
+      return { route: "POST /repos/{owner}/{repo}/issues/{issue_number}/reactions", params: { owner, repo, issue_number: issueNumber } };
     }
 
     case "issue_comment": {
       const commentId = payload?.comment?.id;
-      if (!commentId) {
-        core.setFailed(`${ERR_VALIDATION}: Comment ID not found in event payload`);
-        return null;
-      }
-      return `/repos/${owner}/${repo}/issues/comments/${commentId}/reactions`;
+      if (!requirePayloadField(commentId, "Comment ID", ERR_VALIDATION)) return null;
+      return { route: "POST /repos/{owner}/{repo}/issues/comments/{comment_id}/reactions", params: { owner, repo, comment_id: commentId } };
     }
 
     case "pull_request": {
       const prNumber = payload?.pull_request?.number;
-      if (!prNumber) {
-        core.setFailed(`${ERR_NOT_FOUND}: Pull request number not found in event payload`);
-        return null;
-      }
+      if (!requirePayloadField(prNumber, "Pull request number", ERR_NOT_FOUND)) return null;
       // PRs are "issues" for the reactions endpoint
-      return `/repos/${owner}/${repo}/issues/${prNumber}/reactions`;
+      return { route: "POST /repos/{owner}/{repo}/issues/{issue_number}/reactions", params: { owner, repo, issue_number: prNumber } };
     }
 
     case "pull_request_review_comment": {
       const reviewCommentId = payload?.comment?.id;
-      if (!reviewCommentId) {
-        core.setFailed(`${ERR_VALIDATION}: Review comment ID not found in event payload`);
-        return null;
-      }
-      return `/repos/${owner}/${repo}/pulls/comments/${reviewCommentId}/reactions`;
+      if (!requirePayloadField(reviewCommentId, "Review comment ID", ERR_VALIDATION)) return null;
+      return { route: "POST /repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions", params: { owner, repo, comment_id: reviewCommentId } };
     }
 
     case "pull_request_review":
@@ -132,70 +146,114 @@ function isRestReactionEvent(eventName) {
  * @param {string} repo
  * @param {Record<string, any>} payload
  * @param {string} reaction
+ * @param {boolean} [removing]
  */
-async function handleGraphQLOrUnknownEvent(eventName, owner, repo, payload, reaction) {
-  switch (eventName) {
-    case "discussion": {
-      const discussionNumber = payload?.discussion?.number;
-      if (!discussionNumber) {
-        core.setFailed(`${ERR_NOT_FOUND}: Discussion number not found in event payload`);
+async function handleGraphQLOrUnknownEvent(eventName, owner, repo, payload, reaction, removing = false) {
+  let subjectId;
+  try {
+    switch (eventName) {
+      case "discussion": {
+        const discussionNumber = payload?.discussion?.number;
+        if (!requirePayloadField(discussionNumber, "Discussion number", ERR_NOT_FOUND)) return;
+        subjectId = await getDiscussionNodeId(owner, repo, discussionNumber);
+        break;
+      }
+
+      case "discussion_comment": {
+        const commentNodeId = payload?.comment?.node_id;
+        if (!requirePayloadField(commentNodeId, "Discussion comment node ID", ERR_NOT_FOUND)) return;
+        subjectId = commentNodeId;
+        break;
+      }
+
+      default:
+        core.setFailed(`${ERR_VALIDATION}: Unsupported event type: ${eventName}`);
         return;
-      }
-      try {
-        const discussionNodeId = await getDiscussionNodeId(owner, repo, discussionNumber);
-        await addDiscussionReaction(discussionNodeId, reaction);
-      } catch (error) {
-        handleReactionError(error);
-      }
+    }
+
+    if (subjectId == null) {
+      core.setFailed(`${ERR_VALIDATION}: subjectId could not be resolved for event: ${eventName}`);
       return;
     }
 
-    case "discussion_comment": {
-      const commentNodeId = payload?.comment?.node_id;
-      if (!commentNodeId) {
-        core.setFailed(`${ERR_NOT_FOUND}: Discussion comment node ID not found in event payload`);
-        return;
-      }
-      try {
-        await addDiscussionReaction(commentNodeId, reaction);
-      } catch (error) {
-        handleReactionError(error);
-      }
-      return;
-    }
-
-    default:
-      core.setFailed(`${ERR_VALIDATION}: Unsupported event type: ${eventName}`);
+    await addDiscussionReaction(subjectId, reaction, removing);
+  } catch (error) {
+    handleReactionError(error, removing);
   }
 }
 
 /**
  * Handle errors from reaction API calls consistently
  * @param {unknown} error - The error to handle
+ * @param {boolean} [removing]
  */
-function handleReactionError(error) {
+function handleReactionError(error, removing = false) {
+  const operation = removing ? "remove" : "add";
+  const status = error && typeof error === "object" && "status" in error ? error.status : undefined;
+  if (removing && status === 404) {
+    core.info("Cannot remove reaction: reaction or resource is already removed (this is expected and not an error)");
+    return;
+  }
   if (isLockedError(error)) {
     // Silently ignore locked resource errors - just log for debugging
-    core.info(`Cannot add reaction: resource is locked (this is expected and not an error)`);
+    core.info(`Cannot ${operation} reaction: resource is locked (this is expected and not an error)`);
     return;
   }
   const errorMessage = getErrorMessage(error);
-  core.error(`Failed to add reaction: ${errorMessage}`);
-  core.setFailed(`${ERR_API}: Failed to add reaction: ${errorMessage}`);
+  if (isRateLimitError(error) || (removing && status === 429)) {
+    core.warning(`Cannot ${operation} reaction due to GitHub API rate limiting: ${errorMessage}`);
+    return;
+  }
+  if (removing) {
+    core.warning(`${ERR_API}: Failed to remove reaction: ${errorMessage}`);
+    return;
+  }
+  core.setFailed(`${ERR_API}: Failed to ${operation} reaction: ${errorMessage}`);
 }
 
 /**
- * Add a reaction to a GitHub issue, PR, or comment using REST API
- * @param {string} endpoint - The GitHub API endpoint to add the reaction to
+ * Add or remove a reaction to a GitHub issue, PR, or comment using REST API
+ * @param {string} route - The typed GitHub API route string (e.g. "POST /repos/{owner}/{repo}/issues/{issue_number}/reactions")
+ * @param {Record<string, unknown>} params - The route parameters (owner, repo, issue_number, etc.)
  * @param {string} reaction - The reaction type to add
+ * @param {string} [removeReactionId] - Exact reaction ID to remove instead of adding
  */
-async function addReaction(endpoint, reaction) {
-  const response = await github.request(`POST ${endpoint}`, {
-    content: reaction,
-    headers: {
-      Accept: "application/vnd.github+json",
-    },
-  });
+async function addReaction(route, params, reaction, removeReactionId = "") {
+  const removing = Boolean(removeReactionId);
+  const requestRoute = removing ? `${route.replace(/^POST /, "DELETE ")}/{reaction_id}` : route;
+  let response;
+  try {
+    response = await withRetry(
+      () =>
+        github.request(requestRoute, {
+          ...params,
+          ...(removing ? { reaction_id: removeReactionId } : { content: reaction }),
+          headers: {
+            Accept: "application/vnd.github+json",
+          },
+        }),
+      {
+        maxRetries: MAX_CONNECTION_RETRIES,
+        initialDelayMs: CONNECTION_RETRY_DELAY_MS,
+        maxDelayMs: CONNECTION_RETRY_DELAY_MS,
+        backoffMultiplier: 1,
+        jitterMs: 0,
+        shouldRetry: isConnectTimeoutError,
+      },
+      removing ? "remove reaction" : "add reaction"
+    );
+  } catch (error) {
+    // Preserve the API error's status for callers handling locked resources.
+    if (error && typeof error === "object" && "originalError" in error) {
+      throw error.originalError;
+    }
+    throw error;
+  }
+
+  if (removing) {
+    core.info(`Successfully removed reaction: ${reaction} (id: ${removeReactionId})`);
+    return;
+  }
 
   const reactionId = response.data?.id;
   core.info(`Successfully added reaction: ${reaction}${reactionId ? ` (id: ${reactionId})` : ""}`);
@@ -203,18 +261,26 @@ async function addReaction(endpoint, reaction) {
 }
 
 /**
- * Add a reaction to a GitHub discussion or discussion comment using GraphQL
+ * Add or remove the authenticated user's reaction to a discussion or comment using GraphQL
  * @param {string} subjectId - The node ID of the discussion or comment
  * @param {string} reaction - The reaction type to add (mapped to GitHub's ReactionContent enum)
+ * @param {boolean} [removing]
  */
-async function addDiscussionReaction(subjectId, reaction) {
+async function addDiscussionReaction(subjectId, reaction, removing = false) {
   const reactionContent = REACTION_MAP[reaction];
   if (!reactionContent) {
     throw new Error(`${ERR_VALIDATION}: Invalid reaction type for GraphQL: ${reaction}`);
   }
 
   const result = await github.graphql(
-    `
+    removing
+      ? `
+    mutation($subjectId: ID!, $content: ReactionContent!) {
+      removeReaction(input: { subjectId: $subjectId, content: $content }) {
+        clientMutationId
+      }
+    }`
+      : `
     mutation($subjectId: ID!, $content: ReactionContent!) {
       addReaction(input: { subjectId: $subjectId, content: $content }) {
         reaction {
@@ -225,6 +291,11 @@ async function addDiscussionReaction(subjectId, reaction) {
     }`,
     { subjectId, content: reactionContent }
   );
+
+  if (removing) {
+    core.info(`Successfully removed reaction: ${reaction}`);
+    return;
+  }
 
   const reactionId = result.addReaction.reaction.id;
   core.info(`Successfully added reaction: ${reaction} (id: ${reactionId})`);

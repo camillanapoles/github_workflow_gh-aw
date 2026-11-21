@@ -25,6 +25,23 @@ function writeModelsFixture(providers) {
 }
 
 describe("model_costs.cjs", () => {
+  it("does not supply default pricing or metadata without an explicit overlay", async () => {
+    const { getModelsPath, loadModelsJson, loadCatalog, findModelPricing, computeInferenceAIC } = await import("./model_costs.cjs");
+    expect(getModelsPath()).toBeNull();
+    expect(loadModelsJson()).toBeNull();
+    expect(loadCatalog()).toEqual([]);
+    expect(findModelPricing("copilot", "gpt-5-mini")).toBeNull();
+    expect(computeInferenceAIC({ provider: "copilot", model: "gpt-5-mini", inputTokens: 1000, outputTokens: 200, cacheReadTokens: 0, cacheWriteTokens: 0 })).toBe(0);
+  });
+
+  it("preserves explicit routing metadata alongside pricing", async () => {
+    const entry = { provider_type: "openai", wire_api: "responses", cost: { input: "0.000002", output: "0.000004" } };
+    writeModelsFixture({ custom: { models: { "custom-model": entry } } });
+    const { loadModelsJson, computeInferenceAIC } = await import("./model_costs.cjs");
+    expect(loadModelsJson().providers.custom.models["custom-model"]).toEqual(entry);
+    expect(computeInferenceAIC({ provider: "custom", model: "custom-model", inputTokens: 1000, outputTokens: 200, cacheReadTokens: 0, cacheWriteTokens: 0 })).toBeCloseTo(0.28);
+  });
+
   it("computes inference AIC using provider-specific pricing", async () => {
     writeModelsFixture({
       anthropic: {
@@ -56,11 +73,29 @@ describe("model_costs.cjs", () => {
     expect(aic).toBeCloseTo(0.54825, 6);
   });
 
-  it("formats AI Credits for footer display", async () => {
+  it("formats AI Credits with their existing precision", async () => {
     const { formatAIC } = await import("./model_costs.cjs");
     expect(formatAIC(0.125)).toBe("0.125");
     expect(formatAIC(1.25)).toBe("1.25");
     expect(formatAIC(12.5)).toBe("12.5");
+  });
+
+  it.each([
+    [0.33 + 0.56 + 0.11, "~1"],
+    [0.66 + 1.12 + 0.22, "~2"],
+    [1.000000000001, "~2"],
+    [Number.MIN_VALUE, "~1"],
+    [0.000000000001, "~1"],
+    [12.4, "~13"],
+    [1000.1, "~1001"],
+    [1000000.1, "~1000001"],
+    [0, ""],
+    [-1, ""],
+    [NaN, ""],
+    [Infinity, ""],
+  ])("formats %s as the whole-credit estimate %s", async (value, formatted) => {
+    const { formatEstimatedAIC } = await import("./model_costs.cjs");
+    expect(formatEstimatedAIC(value)).toBe(formatted);
   });
 
   it("resolves 'copilot' provider alias to 'github-copilot' for AIC lookup", async () => {
@@ -205,5 +240,82 @@ describe("model_costs.cjs", () => {
     // cost = 0×0.000003 + 200×0.000015 + 1200×0.0000003 = 0.00336
     // AIC  = 0.00336 / 0.01 = 0.336
     expect(aic).toBeCloseTo(0.336, 6);
+  });
+
+  it("keeps inclusive input at least as large as cache reads when provider defaults apply", async () => {
+    const { computeInclusiveInputTokens } = await import("./model_costs.cjs");
+    expect(
+      computeInclusiveInputTokens({
+        provider: "anthropic",
+        inputTokens: 38719,
+        cacheReadTokens: 112640,
+        cacheWriteTokens: 0,
+      })
+    ).toBe(112640);
+  });
+
+  it("uses explicit inclusive cache semantics when present", async () => {
+    writeModelsFixture({
+      "github-copilot": {
+        models: {
+          "gpt-4o-mini": {
+            cost: {
+              input: "0.00000015",
+              output: "0.0000006",
+              cache_read: "0.000000075",
+            },
+          },
+        },
+      },
+    });
+
+    const { computeInferenceAIC } = await import("./model_costs.cjs");
+    const aic = computeInferenceAIC({
+      provider: "copilot",
+      model: "gpt-4o-mini",
+      inputTokens: 1000,
+      outputTokens: 100,
+      cacheReadTokens: 400,
+      cacheWriteTokens: 100,
+      inputTokensIncludeCache: true,
+    });
+
+    expect(aic).toBeCloseTo(0.018, 6);
+  });
+
+  it("uses explicit additive cache semantics when present", async () => {
+    writeModelsFixture({
+      "github-copilot": {
+        models: {
+          "gpt-4o-mini": {
+            cost: {
+              input: "0.00000015",
+              output: "0.0000006",
+              cache_read: "0.000000075",
+            },
+          },
+        },
+      },
+    });
+
+    const { computeInferenceAIC } = await import("./model_costs.cjs");
+    const aic = computeInferenceAIC({
+      provider: "copilot",
+      model: "gpt-4o-mini",
+      inputTokens: 1000,
+      outputTokens: 100,
+      cacheReadTokens: 400,
+      cacheWriteTokens: 100,
+      inputTokensIncludeCache: false,
+    });
+
+    expect(aic).toBeCloseTo(0.0255, 6);
+  });
+
+  it.each(["missing-models.json", ""])("does not substitute a catalog for an unavailable override %s", async filename => {
+    process.env.GH_AW_MODELS_JSON_PATH = filename ? path.join(import.meta.dirname, filename) : " ";
+    const { loadModelsJson, loadCatalog } = await import("./model_costs.cjs");
+    expect(loadModelsJson()).toBeNull();
+    expect(loadCatalog()).toEqual([]);
   });
 });

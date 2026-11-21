@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,7 +28,9 @@ func TestNewDeployCommand_RequiresWorkflowArg(t *testing.T) {
 
 	err := cmd.Args(cmd, []string{})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "missing workflow specification")
+	require.ErrorContains(t, err, "missing workflow specification")
+	require.ErrorContains(t, err, "Usage:\n  gh aw deploy")
+	require.ErrorContains(t, err, "Run 'gh aw deploy --help'")
 }
 
 func TestNewDeployCommand_RegistersCoreFlags(t *testing.T) {
@@ -42,6 +45,9 @@ func TestNewDeployCommand_RegistersCoreFlags(t *testing.T) {
 		"name",
 		"engine",
 		"force",
+		"auto-merge",
+		"create-pull-request",
+		"pr",
 		"append",
 		"no-gitattributes",
 		"dir",
@@ -72,21 +78,12 @@ func TestNewDeployCommand_CoolDownFlagUsageMatchesUpdate(t *testing.T) {
 	assert.Equal(t, coolDownFlagUsage, coolDownFlag.Usage)
 }
 
-func TestNewDeployCommand_DeprecatesDisableSecurityScannerFlag(t *testing.T) {
-	cmd := NewDeployCommand(func(string) error { return nil })
-	require.NotNil(t, cmd)
-
-	flag := cmd.Flags().Lookup("disable-security-scanner")
-	require.NotNil(t, flag, "deploy command should keep --disable-security-scanner as a deprecated alias")
-	assert.Equal(t, "use --no-security-scanner instead", flag.Deprecated)
-}
-
 func TestNewDeployCommand_RequiresRepoFlag(t *testing.T) {
 	cmd := NewDeployCommand(func(string) error { return nil })
 	require.NotNil(t, cmd)
 	err := runDeployCommand(cmd, []string{"githubnext/agentics/ci-doctor"}, func(string) error { return nil })
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "either --repo (owner/repo) or --org must be provided")
+	require.ErrorContains(t, err, "either --repo (owner/repo) or --org must be provided")
 }
 
 func TestRunDeployCommand_RejectsRepoAndOrgTogether(t *testing.T) {
@@ -96,7 +93,7 @@ func TestRunDeployCommand_RejectsRepoAndOrgTogether(t *testing.T) {
 	require.NoError(t, cmd.Flags().Set("org", "octo"))
 	err := runDeployCommand(cmd, []string{"githubnext/agentics/ci-doctor"}, func(string) error { return nil })
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "cannot specify both --repo and --org")
+	require.ErrorContains(t, err, "cannot specify both --repo and --org")
 }
 
 func TestRunDeployCommand_RequiresOrgWhenReposProvided(t *testing.T) {
@@ -106,7 +103,7 @@ func TestRunDeployCommand_RequiresOrgWhenReposProvided(t *testing.T) {
 
 	err := runDeployCommand(cmd, []string{"githubnext/agentics/ci-doctor"}, func(string) error { return nil })
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "--repos requires --org")
+	require.ErrorContains(t, err, "--repos requires --org")
 }
 
 func TestRunDeployCommand_RoutesToOrgRunner(t *testing.T) {
@@ -116,6 +113,8 @@ func TestRunDeployCommand_RoutesToOrgRunner(t *testing.T) {
 	require.NoError(t, cmd.Flags().Set("repos", "api-*"))
 	require.NoError(t, cmd.Flags().Set("yes", "true"))
 	require.NoError(t, cmd.Flags().Set("cool-down", "24h"))
+	require.NoError(t, cmd.Flags().Set("auto-merge", "true"))
+	require.NoError(t, cmd.Flags().Set("pr", "true"))
 
 	origRunDeployForOrg := runDeployForOrgFn
 	origRunDeploy := runDeployFn
@@ -132,6 +131,7 @@ func TestRunDeployCommand_RoutesToOrgRunner(t *testing.T) {
 		assert.Equal(t, []string{"githubnext/agentics/ci-doctor"}, workflows)
 		assert.True(t, yes)
 		assert.Equal(t, 24*time.Hour, coolDown)
+		assert.True(t, addOpts.AutoMerge)
 		return nil
 	}
 	runDeployFn = func(context.Context, string, []string, AddOptions, time.Duration) error {
@@ -144,17 +144,142 @@ func TestRunDeployCommand_RoutesToOrgRunner(t *testing.T) {
 	assert.True(t, calledOrg)
 }
 
+func TestRunDeployCommandAutoMergeRequiresPR(t *testing.T) {
+	cmd := NewDeployCommand(validateEngineStub)
+	require.NoError(t, cmd.Flags().Set("auto-merge", "true"))
+	err := cmd.RunE(cmd, []string{"owner/source/workflow"})
+	require.ErrorContains(t, err, "--auto-merge requires --create-pull-request")
+}
+
+func TestRunDeployCommandAutoMergePropagation(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		prFlag    string
+		autoMerge bool
+	}{
+		{name: "default"},
+		{name: "short PR alias", prFlag: "pr", autoMerge: true},
+		{name: "long PR alias", prFlag: "create-pull-request", autoMerge: true},
+		{name: "PR alias without auto-merge", prFlag: "pr"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := NewDeployCommand(validateEngineStub)
+			require.NoError(t, cmd.Flags().Set("repo", "octo/repo"))
+			if tc.prFlag != "" {
+				require.NoError(t, cmd.Flags().Set(tc.prFlag, "true"))
+			}
+			if tc.autoMerge {
+				require.NoError(t, cmd.Flags().Set("auto-merge", "true"))
+			}
+			assert.Contains(t, cmd.Long, "one is required with --auto-merge")
+			flag := cmd.Flags().Lookup("auto-merge")
+			require.NotNil(t, flag)
+			assert.Equal(t, "false", flag.DefValue)
+
+			originalRunDeploy := runDeployFn
+			t.Cleanup(func() { runDeployFn = originalRunDeploy })
+			called := false
+			runDeployFn = func(_ context.Context, repo string, workflows []string, opts AddOptions, _ time.Duration) error {
+				called = true
+				assert.Equal(t, "octo/repo", repo)
+				assert.Equal(t, []string{"owner/source/workflow"}, workflows)
+				assert.Equal(t, tc.autoMerge, opts.AutoMerge)
+				assert.False(t, opts.CreatePR, "the internal add pass must not create a separate PR")
+				return nil
+			}
+			require.NoError(t, cmd.RunE(cmd, []string{"owner/source/workflow"}))
+			assert.True(t, called)
+		})
+	}
+}
+
+func TestCreateDeployPRAutoMergePropagation(t *testing.T) {
+	for _, autoMerge := range []bool{false, true} {
+		t.Run(map[bool]string{false: "default", true: "enabled"}[autoMerge], func(t *testing.T) {
+			repoDir := initPRTransferRepo(t)
+			chdirForTest(t, repoDir)
+			require.NoError(t, os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("deploy change\n"), 0o600))
+
+			originalCreatePR := createPRRunGHContextWithHost
+			originalAutoMerge := autoMergeRunGH
+			t.Cleanup(func() {
+				createPRRunGHContextWithHost = originalCreatePR
+				autoMergeRunGH = originalAutoMerge
+			})
+			created := false
+			createPRRunGHContextWithHost = func(_ context.Context, _, _ string, args ...string) ([]byte, error) {
+				if args[0] == "repo" {
+					return []byte(`{"owner":{"login":"octo"},"name":"repo"}`), nil
+				}
+				assert.Contains(t, args, deployCommitMessage)
+				assert.Contains(t, args, "--body-file")
+				for i, arg := range args {
+					if arg == "--body-file" {
+						require.Less(t, i+1, len(args))
+						body, err := os.ReadFile(args[i+1])
+						require.NoError(t, err)
+						assert.Contains(t, string(body), "Deployment details.\n\nCustom deployment message.")
+					}
+				}
+				created = true
+				return []byte("https://github.com/octo/repo/pull/42"), nil
+			}
+			autoMergeCalls := 0
+			enableErr := errors.New("auto-merge unavailable")
+			autoMergeRunGH = func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+				assert.True(t, created, "auto-merge must happen after PR creation")
+				autoMergeCalls++
+				return nil, enableErr
+			}
+			err := createDeployPR(context.Background(), []string{"owner/source/workflow"}, "octo/repo", false, autoMerge, "Deployment details.", "Custom deployment message.")
+			if autoMerge {
+				require.ErrorIs(t, err, enableErr)
+				require.ErrorContains(t, err, "https://github.com/octo/repo/pull/42")
+				assert.Equal(t, 1, autoMergeCalls)
+			} else {
+				require.NoError(t, err)
+				assert.Zero(t, autoMergeCalls)
+			}
+			assert.True(t, created)
+			assert.Equal(t, "main", strings.TrimSpace(gitOutput(t, repoDir, "branch", "--show-current")))
+		})
+	}
+}
+
 func TestBuildDeployPRMetadata_SingleWorkflow(t *testing.T) {
 	title, body := buildDeployPRMetadata([]string{"githubnext/agentics/ci-doctor"}, "owner/repo")
 	assert.Equal(t, deployCommitMessage, title)
-	assert.Contains(t, body, "Deploy ci-doctor to owner/repo.")
-	assert.Contains(t, body, "compile --purge")
+	assert.Equal(t, "## Summary\n\nDeploy ci-doctor to owner/repo.\n\n## Workflows requested\n\n- `githubnext/agentics/ci-doctor`\n", body)
 }
 
 func TestBuildDeployPRMetadata_MultipleWorkflows(t *testing.T) {
 	title, body := buildDeployPRMetadata([]string{"a", "b", "c"}, "owner/repo")
 	assert.Equal(t, deployCommitMessage, title)
 	assert.Contains(t, body, "Deploy 3 workflows to owner/repo.")
+}
+
+func TestBuildDeployPRMetadata_LocalPathsArePrivate(t *testing.T) {
+	t.Parallel()
+
+	baseDir := filepath.Join(string(filepath.Separator), "Users", "private-user", "private-project")
+	workflows := resolveDeployWorkflowSpecs(
+		[]string{"./my-workflow.md", filepath.Join(baseDir, "absolute-workflow.md"), "./*.md", "owner/source/remote.md@v1", "https://example.com/workflows/remote.md"},
+		baseDir,
+	)
+	_, body := buildDeployPRMetadata(workflows, "owner/repo")
+
+	assert.Contains(t, body, "- `my-workflow.md`\n")
+	assert.Contains(t, body, "- `absolute-workflow.md`\n")
+	assert.Contains(t, body, "- `*.md`\n")
+	assert.Contains(t, body, "- `owner/source/remote.md@v1`\n")
+	assert.Contains(t, body, "- `https://example.com/workflows/remote.md`\n")
+	assert.NotContains(t, body, baseDir)
+	assert.NotContains(t, body, "private-user")
+	assert.NotContains(t, body, "private-project")
+
+	_, singleBody := buildDeployPRMetadata(workflows[:1], "owner/repo")
+	assert.Contains(t, singleBody, "Deploy my-workflow to owner/repo.")
+	assert.NotContains(t, singleBody, baseDir)
 }
 
 func TestExcludeExistingSourcedWorkflows_SkipsExistingSourcedWorkflow(t *testing.T) {
@@ -275,7 +400,7 @@ func TestParseDeployCommandOptions_NameFlagWithMultipleWorkflows(t *testing.T) {
 		return nil
 	})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "--name flag cannot be used when adding multiple workflows at once")
+	require.ErrorContains(t, err, "--name flag cannot be used when adding multiple workflows at once")
 	assert.Equal(t, AddOptions{}, opts)
 	assert.Zero(t, coolDown)
 	assert.False(t, validateEngineCalled)
@@ -290,7 +415,7 @@ func TestParseDeployCommandOptions_InvalidCoolDown(t *testing.T) {
 
 	opts, coolDown, err := parseDeployCommandOptions(cmd, []string{"a"}, func(string) error { return nil })
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "invalid --cool-down value")
+	require.ErrorContains(t, err, "invalid --cool-down value")
 	assert.Equal(t, AddOptions{}, opts)
 	assert.Zero(t, coolDown)
 }

@@ -75,16 +75,18 @@ func TestGenerateNpmInstallSteps_IgnoreScriptsByDefault(t *testing.T) {
 		"latest",
 		"Install Claude Code CLI",
 		"claude",
-		false, // no Node.js setup step
-		false, // runInstallScripts=false (default)
-		true,  // cooldown enabled by default
+		NPMInstallOptions{
+			IncludeNodeSetup:  false,
+			RunInstallScripts: false,
+			CooldownEnabled:   true,
+		},
 	)
 
 	require.Len(t, steps, 1, "Expected 1 install step")
 	installStep := strings.Join(steps[0], "\n")
 
-	assert.Contains(t, installStep, "--ignore-scripts", "Expected --ignore-scripts flag by default")
-	assert.Contains(t, installStep, "npm install --ignore-scripts -g @anthropic-ai/claude-code@latest")
+	assert.Contains(t, installStep, "NPM_CONFIG_IGNORE_SCRIPTS: 'true'", "Expected install scripts disabled by default")
+	assert.Contains(t, installStep, "npm install -g @anthropic-ai/claude-code@latest")
 	assert.Contains(t, installStep, "NPM_CONFIG_MIN_RELEASE_AGE: '3'")
 }
 
@@ -94,15 +96,18 @@ func TestGenerateNpmInstallSteps_RunInstallScriptsEnabled(t *testing.T) {
 		"latest",
 		"Install Claude Code CLI",
 		"claude",
-		false, // no Node.js setup step
-		true,  // runInstallScripts=true
-		true,  // cooldown enabled by default
+		NPMInstallOptions{
+			IncludeNodeSetup:  false,
+			RunInstallScripts: true,
+			CooldownEnabled:   true,
+		},
 	)
 
 	require.Len(t, steps, 1, "Expected 1 install step")
 	installStep := strings.Join(steps[0], "\n")
 
 	assert.NotContains(t, installStep, "--ignore-scripts", "Expected no --ignore-scripts flag when runInstallScripts=true")
+	assert.NotContains(t, installStep, "NPM_CONFIG_IGNORE_SCRIPTS")
 	assert.Contains(t, installStep, "npm install -g @anthropic-ai/claude-code@latest")
 	assert.Contains(t, installStep, "NPM_CONFIG_MIN_RELEASE_AGE: '3'")
 }
@@ -113,10 +118,12 @@ func TestGenerateNpmInstallStepsWithScope_LocalInstall(t *testing.T) {
 		"2.0.1",
 		"Install qmd",
 		"qmd",
-		false, // no Node.js setup
-		false, // local install (not global)
-		false, // runInstallScripts=false
-		false, // cooldown disabled
+		NPMInstallOptions{
+			IncludeNodeSetup:  false,
+			IsGlobal:          false,
+			RunInstallScripts: false,
+			CooldownEnabled:   false,
+		},
 	)
 
 	require.Len(t, steps, 1, "Expected 1 install step")
@@ -125,6 +132,33 @@ func TestGenerateNpmInstallStepsWithScope_LocalInstall(t *testing.T) {
 	assert.Contains(t, installStep, "--ignore-scripts", "Expected --ignore-scripts flag")
 	assert.NotContains(t, installStep, " -g ", "Expected local install (no -g flag)")
 	assert.NotContains(t, installStep, "NPM_CONFIG_MIN_RELEASE_AGE", "Cooldown env should be omitted when disabled")
+}
+
+func TestGenerateNpmInstallSteps_GlobalScriptProtection(t *testing.T) {
+	for _, version := range []string{"1.2.3", "latest", "${{ inputs.version }}"} {
+		for _, cooldown := range []bool{false, true} {
+			t.Run(version+map[bool]string{false: "/no-cooldown", true: "/cooldown"}[cooldown], func(t *testing.T) {
+				steps := GenerateNpmInstallSteps("example-cli", version, "Install", "example", NPMInstallOptions{
+					CooldownEnabled: cooldown,
+				})
+				require.Len(t, steps, 1)
+				step := strings.Join(steps[0], "\n")
+				assert.Contains(t, step, "NPM_CONFIG_IGNORE_SCRIPTS: 'true'")
+				assert.NotContains(t, step, "--ignore-scripts")
+				if ExpressionPattern.MatchString(version) {
+					assert.Contains(t, step, `npm install -g example-cli@"${ENGINE_VERSION}"`)
+					assert.Contains(t, step, "ENGINE_VERSION: "+version)
+				} else {
+					assert.Contains(t, step, "run: npm install -g example-cli@"+version)
+				}
+				if cooldown {
+					assert.Contains(t, step, "NPM_CONFIG_MIN_RELEASE_AGE: '3'")
+				} else {
+					assert.NotContains(t, step, "NPM_CONFIG_MIN_RELEASE_AGE")
+				}
+			})
+		}
+	}
 }
 
 func TestValidateRunInstallScripts_Warning(t *testing.T) {
@@ -145,8 +179,8 @@ func TestValidateRunInstallScripts_StrictModeError(t *testing.T) {
 	err := c.validateRunInstallScripts(workflowData)
 
 	require.Error(t, err, "Should return error in strict mode")
-	assert.Contains(t, err.Error(), "strict mode", "Error should mention strict mode")
-	assert.Contains(t, err.Error(), "supply chain", "Error should mention supply chain risk")
+	require.ErrorContains(t, err, "strict mode", "Error should mention strict mode")
+	require.ErrorContains(t, err, "supply chain", "Error should mention supply chain risk")
 }
 
 func TestValidateRunInstallScripts_NotSet(t *testing.T) {
@@ -178,7 +212,7 @@ func TestFrontmatterConfig_RunInstallScripts_TopLevel_Ignored(t *testing.T) {
 func TestRuntimeConfig_RunInstallScripts(t *testing.T) {
 	runtimes := map[string]any{
 		"node": map[string]any{
-			"version":             "20",
+			"version":             "24",
 			"run-install-scripts": true,
 		},
 	}

@@ -2,8 +2,10 @@ package workflow
 
 import (
 	"reflect"
+	"strings"
 
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/typeutil"
 )
 
 var safeOutputHandlerLog = logger.New("workflow:safe_output_handlers")
@@ -20,6 +22,34 @@ type safeOutputHandlerDescriptor struct {
 
 var safeOutputHandlers = []safeOutputHandlerDescriptor{
 	{
+		Key:         "add-security-advisory-comment",
+		StructField: "AddSecurityAdvisoryComment",
+		ToolName:    "add_security_advisory_comment",
+		NewConfig:   func() any { return &AddSecurityAdvisoryCommentConfig{} },
+		PermissionBuilder: func(safeOutputs *SafeOutputsConfig) *Permissions {
+			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "AddSecurityAdvisoryComment") {
+				return nil
+			}
+			return NewPermissionsFromMap(map[PermissionScope]PermissionLevel{
+				PermissionRepositoryAdvisories: PermissionWrite,
+			})
+		},
+	},
+	{
+		Key:         "create-security-advisory",
+		StructField: "CreateSecurityAdvisory",
+		ToolName:    "create_security_advisory",
+		NewConfig:   func() any { return &CreateSecurityAdvisoryConfig{} },
+		PermissionBuilder: func(safeOutputs *SafeOutputsConfig) *Permissions {
+			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "CreateSecurityAdvisory") {
+				return nil
+			}
+			return NewPermissionsFromMap(map[PermissionScope]PermissionLevel{
+				PermissionRepositoryAdvisories: PermissionWrite,
+			})
+		},
+	},
+	{
 		Key:         "create-issue",
 		StructField: "CreateIssues",
 		ToolName:    "create_issue",
@@ -28,7 +58,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "CreateIssues") {
 				return nil
 			}
-			return NewPermissionsContentsReadIssuesWrite()
+			return NewPermissionsIssuesWrite()
 		},
 	},
 	{
@@ -41,7 +71,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "CreateAgentSessions") {
 				return nil
 			}
-			return NewPermissionsContentsReadIssuesWrite()
+			return NewPermissionsIssuesWrite()
 		},
 	},
 	{
@@ -53,7 +83,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "CreateDiscussions") {
 				return nil
 			}
-			return NewPermissionsContentsReadIssuesWriteDiscussionsWrite()
+			return NewPermissionsIssuesWriteDiscussionsWrite()
 		},
 	},
 	{
@@ -65,7 +95,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "UpdateDiscussions") {
 				return nil
 			}
-			return NewPermissionsContentsReadDiscussionsWrite()
+			return NewPermissionsDiscussionsWrite()
 		},
 	},
 	{
@@ -77,7 +107,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "CloseDiscussions") {
 				return nil
 			}
-			return NewPermissionsContentsReadDiscussionsWrite()
+			return NewPermissionsDiscussionsWrite()
 		},
 	},
 	{
@@ -89,7 +119,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "CloseIssues") {
 				return nil
 			}
-			return NewPermissionsContentsReadIssuesWrite()
+			return NewPermissionsIssuesWrite()
 		},
 	},
 	{
@@ -101,7 +131,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "ClosePullRequests") {
 				return nil
 			}
-			return NewPermissionsContentsReadPRWrite()
+			return NewPermissionsPRWrite()
 		},
 	},
 	{
@@ -113,7 +143,28 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "MarkPullRequestAsReadyForReview") {
 				return nil
 			}
-			return NewPermissionsContentsReadPRWrite()
+			return NewPermissionsPRWrite()
+		},
+	},
+	{
+		Key:         "approve-workflow-run",
+		StructField: "ApproveWorkflowRun",
+		ToolName:    "approve_workflow_run",
+		NewConfig:   func() any { return &ApproveWorkflowRunConfig{} },
+		PermissionBuilder: func(safeOutputs *SafeOutputsConfig) *Permissions {
+			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "ApproveWorkflowRun") {
+				return nil
+			}
+			// pull-requests write is only needed when the handler posts a comment on the
+			// pull request associated with the approved run; otherwise read is sufficient.
+			pullRequestsLevel := PermissionRead
+			if safeOutputs.ApproveWorkflowRun != nil && safeOutputs.ApproveWorkflowRun.Comment {
+				pullRequestsLevel = PermissionWrite
+			}
+			return NewPermissionsFromMap(map[PermissionScope]PermissionLevel{
+				PermissionActions:      PermissionWrite,
+				PermissionPullRequests: pullRequestsLevel,
+			})
 		},
 	},
 	{
@@ -126,7 +177,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "DismissPullRequestReview") {
 				return nil
 			}
-			return NewPermissionsContentsReadPRWrite()
+			return NewPermissionsPRWrite()
 		},
 	},
 	{
@@ -139,17 +190,6 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 				return nil
 			}
 			return buildAddCommentPermissions(safeOutputs.AddComments)
-		},
-	},
-	{
-		Key:         "comment-memory",
-		StructField: "CommentMemory",
-		NewConfig:   func() any { return &CommentMemoryConfig{} },
-		PermissionBuilder: func(safeOutputs *SafeOutputsConfig) *Permissions {
-			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "CommentMemory") {
-				return nil
-			}
-			return NewPermissionsContentsReadIssuesWrite()
 		},
 	},
 	{
@@ -188,7 +228,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "CreatePullRequestReviewComments") {
 				return nil
 			}
-			return NewPermissionsContentsReadPRWrite()
+			return NewPermissionsPRWrite()
 		},
 	},
 	{
@@ -200,7 +240,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "SubmitPullRequestReview") {
 				return nil
 			}
-			return NewPermissionsContentsReadPRWrite()
+			return NewPermissionsPRWrite()
 		},
 	},
 	{
@@ -212,7 +252,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "ReplyToPullRequestReviewComment") {
 				return nil
 			}
-			return NewPermissionsContentsReadPRWrite()
+			return NewPermissionsPRWrite()
 		},
 	},
 	{
@@ -224,7 +264,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "ResolvePullRequestReviewThread") {
 				return nil
 			}
-			return NewPermissionsContentsReadPRWrite()
+			return NewPermissionsPRWrite()
 		},
 	},
 	{
@@ -236,7 +276,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "CreateCodeScanningAlerts") {
 				return nil
 			}
-			return NewPermissionsContentsReadSecurityEventsWrite()
+			return NewPermissionsSecurityEventsWrite()
 		},
 	},
 	{
@@ -248,7 +288,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "AutofixCodeScanningAlert") {
 				return nil
 			}
-			return NewPermissionsContentsReadSecurityEventsWriteActionsRead()
+			return NewPermissionsSecurityEventsWriteActionsRead()
 		},
 	},
 	{
@@ -261,9 +301,9 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 				return nil
 			}
 			if safeOutputs.CreateCheckRun != nil && safeOutputs.CreateCheckRun.Target != "" {
-				return NewPermissionsContentsReadChecksWritePRRead()
+				return NewPermissionsChecksWritePRRead()
 			}
-			return NewPermissionsContentsReadChecksWrite()
+			return NewPermissionsChecksWrite()
 		},
 	},
 	{
@@ -275,7 +315,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "AddLabels") {
 				return nil
 			}
-			return NewPermissionsContentsReadIssuesWritePRWrite()
+			return buildAddLabelsPermissions(safeOutputs.AddLabels)
 		},
 	},
 	{
@@ -287,7 +327,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "RemoveLabels") {
 				return nil
 			}
-			return NewPermissionsContentsReadIssuesWritePRWrite()
+			return buildRemoveLabelsPermissions(safeOutputs.RemoveLabels)
 		},
 	},
 	{
@@ -299,7 +339,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "ReplaceLabel") {
 				return nil
 			}
-			return NewPermissionsContentsReadIssuesWritePRWrite()
+			return NewPermissionsIssuesWritePRWrite()
 		},
 	},
 	{
@@ -311,7 +351,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "AddReviewer") {
 				return nil
 			}
-			return NewPermissionsContentsReadPRWrite()
+			return NewPermissionsPRWrite()
 		},
 	},
 	{
@@ -323,7 +363,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "AssignMilestone") {
 				return nil
 			}
-			return NewPermissionsContentsReadIssuesWrite()
+			return NewPermissionsIssuesWrite()
 		},
 	},
 	{
@@ -335,7 +375,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "AssignToAgent") {
 				return nil
 			}
-			return NewPermissionsContentsReadIssuesWrite()
+			return NewPermissionsIssuesWrite()
 		},
 	},
 	{
@@ -347,7 +387,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "AssignToUser") {
 				return nil
 			}
-			return NewPermissionsContentsReadIssuesWrite()
+			return NewPermissionsIssuesWrite()
 		},
 	},
 	{
@@ -359,7 +399,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "UnassignFromUser") {
 				return nil
 			}
-			return NewPermissionsContentsReadIssuesWrite()
+			return NewPermissionsIssuesWrite()
 		},
 	},
 	{
@@ -371,7 +411,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "UpdateIssues") {
 				return nil
 			}
-			return NewPermissionsContentsReadIssuesWrite()
+			return NewPermissionsIssuesWrite()
 		},
 	},
 	{
@@ -386,7 +426,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if safeOutputs.UpdatePullRequests.UpdateBranch != nil && *safeOutputs.UpdatePullRequests.UpdateBranch {
 				return NewPermissionsContentsWritePRWrite()
 			}
-			return NewPermissionsContentsReadPRWrite()
+			return NewPermissionsPRWrite()
 		},
 	},
 	{
@@ -398,7 +438,10 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "MergePullRequest") {
 				return nil
 			}
-			return NewPermissionsContentsWritePRWrite()
+			permissions := NewPermissionsContentsWritePRWrite()
+			// Branch-policy check requirements are discovered at runtime.
+			permissions.Set(PermissionChecks, PermissionRead)
+			return permissions
 		},
 	},
 	{
@@ -415,12 +458,10 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 				permissions.Merge(NewPermissionsContentsWritePRWrite())
 			} else {
 				permissions.Merge(NewPermissionsContentsWrite())
+				permissions.Set(PermissionPullRequests, PermissionRead)
 			}
 			if safeOutputs.PushToPullRequestBranch.AllowWorkflows {
 				permissions.Set(PermissionWorkflows, PermissionWrite)
-			}
-			if getCheckBranchProtection(safeOutputs.PushToPullRequestBranch) {
-				permissions.Set(PermissionAdministration, PermissionRead)
 			}
 			return permissions
 		},
@@ -430,17 +471,16 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 		StructField: "UploadAssets",
 		ToolName:    "upload_asset",
 		NewConfig:   func() any { return &UploadAssetsConfig{} },
-		PermissionBuilder: func(safeOutputs *SafeOutputsConfig) *Permissions {
-			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "UploadAssets") {
-				return nil
-			}
-			return NewPermissionsContentsRead()
-		},
 	},
 	{
 		Key:         "upload-artifact",
 		StructField: "UploadArtifact",
 		ToolName:    "upload_artifact",
+	},
+	{
+		Key:         "upload-code-coverage",
+		StructField: "UploadCodeCoverage",
+		ToolName:    "upload_code_coverage",
 	},
 	{
 		Key:         "update-release",
@@ -463,9 +503,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "UpdateProjects") {
 				return nil
 			}
-			permissions := NewPermissionsContentsReadProjectsWrite()
-			permissions.Set(PermissionIssues, PermissionRead)
-			return permissions
+			return NewPermissionsOrganizationProjWriteIssuesRead()
 		},
 	},
 	{
@@ -477,9 +515,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "CreateProjects") {
 				return nil
 			}
-			permissions := NewPermissionsContentsReadProjectsWrite()
-			permissions.Set(PermissionIssues, PermissionRead)
-			return permissions
+			return NewPermissionsOrganizationProjWriteIssuesRead()
 		},
 	},
 	{
@@ -491,7 +527,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "CreateProjectStatusUpdates") {
 				return nil
 			}
-			return NewPermissionsContentsReadProjectsWrite()
+			return NewPermissionsOrganizationProjWrite()
 		},
 	},
 	{
@@ -503,7 +539,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "LinkSubIssue") {
 				return nil
 			}
-			return NewPermissionsContentsReadIssuesWrite()
+			return NewPermissionsIssuesWrite()
 		},
 	},
 	{
@@ -515,10 +551,10 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "HideComment") {
 				return nil
 			}
-			if safeOutputs.HideComment.Discussions != nil && !*safeOutputs.HideComment.Discussions {
-				return NewPermissionsContentsReadIssuesWrite()
+			if safeOutputs.HideComment.Discussions != nil && *safeOutputs.HideComment.Discussions {
+				return NewPermissionsIssuesWriteDiscussionsWrite()
 			}
-			return NewPermissionsContentsReadIssuesWriteDiscussionsWrite()
+			return NewPermissionsIssuesWrite()
 		},
 	},
 	{
@@ -546,15 +582,17 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 		NewConfig:   func() any { return &CallWorkflowConfig{} },
 	},
 	{
-		Key:         "missing-tool",
+		Key:         "report-missing-tool",
+		Aliases:     []string{"missing-tool"},
 		StructField: "MissingTool",
-		ToolName:    "missing_tool",
+		ToolName:    "report_missing_tool",
 		Builtin:     true,
 	},
 	{
-		Key:         "missing-data",
+		Key:         "report-missing-data",
+		Aliases:     []string{"missing-data"},
 		StructField: "MissingData",
-		ToolName:    "missing_data",
+		ToolName:    "report_missing_data",
 		Builtin:     true,
 	},
 	{
@@ -566,7 +604,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "SetIssueType") {
 				return nil
 			}
-			return NewPermissionsContentsReadIssuesWrite()
+			return NewPermissionsIssuesWrite()
 		},
 	},
 	{
@@ -578,7 +616,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "SetIssueField") {
 				return nil
 			}
-			return NewPermissionsContentsReadIssuesWrite()
+			return NewPermissionsIssuesWrite()
 		},
 	},
 	{
@@ -590,6 +628,17 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 	{
 		Key:         "report-incomplete",
 		StructField: "ReportIncomplete",
+		ToolName:    "report_incomplete",
+		Builtin:     true,
+		PermissionBuilder: func(safeOutputs *SafeOutputsConfig) *Permissions {
+			if !isSafeOutputHandlerEnabledAndUnstaged(safeOutputs, "ReportIncomplete") || safeOutputs.ReportIncomplete == nil {
+				return nil
+			}
+			if safeOutputs.ReportIncomplete.CreateIssue != nil && strings.EqualFold(strings.TrimSpace(*safeOutputs.ReportIncomplete.CreateIssue), "false") {
+				return nil
+			}
+			return NewPermissionsIssuesWrite()
+		},
 	},
 	{
 		Key:         "threat-detection",
@@ -600,7 +649,7 @@ var safeOutputHandlers = []safeOutputHandlerDescriptor{
 var safeOutputHandlersByKey = buildSafeOutputHandlersByKey()
 
 func buildSafeOutputHandlersByKey() map[string]safeOutputHandlerDescriptor {
-	result := make(map[string]safeOutputHandlerDescriptor, safeAllocationCapacity(len(safeOutputHandlers), 1))
+	result := make(map[string]safeOutputHandlerDescriptor, typeutil.SafeAllocationCapacity(len(safeOutputHandlers), 1))
 	for _, handler := range safeOutputHandlers {
 		if handler.Key != "" {
 			result[handler.Key] = handler
@@ -668,6 +717,66 @@ func setSafeOutputField(config *SafeOutputsConfig, fieldName string, value any) 
 
 	field.Set(newValue)
 	return true
+}
+
+// getHandlerGitHubApp extracts the GitHubApp from the handler config at the given
+// SafeOutputsConfig field using reflection. It first looks for a direct GitHubApp
+// field, then falls back to the embedded BaseSafeOutputConfig.GitHubApp. Returns
+// nil if the field is absent, the handler is not configured, or no GitHubApp is set.
+func getHandlerGitHubApp(config *SafeOutputsConfig, fieldName string) *GitHubAppConfig {
+	field, ok := safeOutputPointerFieldValue(config, fieldName)
+	if !ok || field.IsNil() {
+		return nil
+	}
+	inner := field.Elem()
+	if !inner.IsValid() || inner.Kind() != reflect.Struct {
+		return nil
+	}
+	// Try direct GitHubApp field (for structs with an explicit GitHubApp field)
+	appField := inner.FieldByName("GitHubApp")
+	if !appField.IsValid() {
+		// Fall back to embedded BaseSafeOutputConfig.GitHubApp
+		baseField := inner.FieldByName("BaseSafeOutputConfig")
+		if !baseField.IsValid() || baseField.Kind() != reflect.Struct {
+			return nil
+		}
+		appField = baseField.FieldByName("GitHubApp")
+	}
+	if !appField.IsValid() || appField.IsNil() {
+		return nil
+	}
+	app, ok := appField.Interface().(*GitHubAppConfig)
+	if !ok || app == nil {
+		return nil
+	}
+	return app
+}
+
+// getHandlerGitHubToken extracts the GitHub token from the handler config at the
+// given SafeOutputsConfig field using reflection. It first looks for a direct
+// GitHubToken field, then falls back to the embedded BaseSafeOutputConfig.GitHubToken.
+// Returns an empty string if no handler token is set.
+func getHandlerGitHubToken(config *SafeOutputsConfig, fieldName string) string {
+	field, ok := safeOutputPointerFieldValue(config, fieldName)
+	if !ok || field.IsNil() {
+		return ""
+	}
+	inner := field.Elem()
+	if !inner.IsValid() || inner.Kind() != reflect.Struct {
+		return ""
+	}
+	tokenField := inner.FieldByName("GitHubToken")
+	if !tokenField.IsValid() {
+		baseField := inner.FieldByName("BaseSafeOutputConfig")
+		if !baseField.IsValid() || baseField.Kind() != reflect.Struct {
+			return ""
+		}
+		tokenField = baseField.FieldByName("GitHubToken")
+	}
+	if !tokenField.IsValid() || tokenField.Kind() != reflect.String {
+		return ""
+	}
+	return tokenField.String()
 }
 
 func mergeSafeOutputFieldIfNil(result, imported *SafeOutputsConfig, fieldName string) {

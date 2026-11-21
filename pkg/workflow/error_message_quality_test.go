@@ -66,7 +66,8 @@ func TestErrorMessageQuality(t *testing.T) {
 						// Missing url
 					},
 				}
-				return ValidateMCPConfigs(tools)
+				_, err := validateMCPConfigsWithWarnings(tools)
+				return err
 			},
 			shouldContain: []string{
 				"missing required property",
@@ -84,7 +85,8 @@ func TestErrorMessageQuality(t *testing.T) {
 						"command": "test",
 					},
 				}
-				return ValidateMCPConfigs(tools)
+				_, err := validateMCPConfigsWithWarnings(tools)
+				return err
 			},
 			shouldContain: []string{
 				"must be one of",
@@ -104,7 +106,8 @@ func TestErrorMessageQuality(t *testing.T) {
 						"container": "my-image",
 					},
 				}
-				return ValidateMCPConfigs(tools)
+				_, err := validateMCPConfigsWithWarnings(tools)
+				return err
 			},
 			shouldContain: []string{
 				"cannot specify both",
@@ -162,6 +165,86 @@ func TestErrorMessageQuality(t *testing.T) {
 			shouldNotBeVague: true,
 		},
 		{
+			name: "checkout field type error includes example",
+			testFunc: func() error {
+				_, err := ParseCheckoutConfigs(map[string]any{"lfs": "yes"})
+				return err
+			},
+			shouldContain: []string{
+				"checkout.lfs must be a boolean",
+				"Example:",
+				"lfs: true",
+			},
+			shouldNotBeVague: true,
+		},
+		{
+			name: "safe-outputs data schema error includes example",
+			testFunc: func() error {
+				_, err := simplifyDataSchemaNode(map[string]any{
+					"type":                 "object",
+					"properties":           map[string]any{"verdict": "string"},
+					"additionalProperties": "no",
+				}, "safe-outputs.data", true)
+				return err
+			},
+			shouldContain: []string{
+				"safe-outputs.data.additionalProperties: must be boolean",
+				"Example:",
+				"additionalProperties: false",
+			},
+			shouldNotBeVague: true,
+		},
+		{
+			name: "model identifier error includes example",
+			testFunc: func() error {
+				_, err := ParseModelIdentifier("")
+				return err
+			},
+			shouldContain: []string{
+				"model identifier must not be empty",
+				"Expected",
+				"Example:",
+			},
+			shouldNotBeVague: true,
+		},
+		{
+			name: "skip-if-match query type error includes example",
+			testFunc: func() error {
+				c := NewCompiler()
+				frontmatter := map[string]any{
+					"on": map[string]any{
+						"skip-if-match": map[string]any{
+							"query": 123, // Wrong type: integer instead of string
+						},
+					},
+				}
+				_, err := c.extractSkipIfMatchFromOn(frontmatter)
+				return err
+			},
+			shouldContain: []string{
+				"skip-if-match 'query' field must be a string",
+				"Example:",
+				"query:",
+			},
+			shouldNotBeVague: true,
+		},
+		{
+			name: "engine.driver extension error includes suggestion with example",
+			testFunc: func() error {
+				c := NewCompiler()
+				return c.validateEngineDriver(&WorkflowData{
+					EngineConfig: &EngineConfig{ID: "copilot", Driver: "driver.exe"},
+				})
+			},
+			shouldContain: []string{
+				"engine.driver has unsupported extension",
+				"Suggestion:",
+				"Example:",
+				"driver:",
+			},
+			shouldNotBeVague: true,
+		},
+		{
 			name: "MCP property type error shows actual type with %T",
 			testFunc: func() error {
 				tools := map[string]any{
@@ -170,7 +253,8 @@ func TestErrorMessageQuality(t *testing.T) {
 						"command": 123, // Wrong type: integer instead of string
 					},
 				}
-				return ValidateMCPConfigs(tools)
+				_, err := validateMCPConfigsWithWarnings(tools)
+				return err
 			},
 			shouldContain: []string{
 				"must be a string",
@@ -337,7 +421,7 @@ func TestMCPValidationErrorQuality(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := ValidateMCPConfigs(tt.tools)
+			_, err := validateMCPConfigsWithWarnings(tt.tools)
 			require.Error(t, err)
 
 			errMsg := err.Error()

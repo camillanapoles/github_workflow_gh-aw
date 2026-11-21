@@ -8,11 +8,13 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  issues: read
   pull-requests: read
   actions: read
 tracker-id: weekly-blog-post-writer
 engine:
   id: copilot
+  copilot-sdk: true
   max-continuations: 2
 strict: true
 timeout-minutes: 30
@@ -37,8 +39,6 @@ network:
 sandbox:
   agent:
     id: awf
-    sudo: false
-
 tools:
   cli-proxy: true
   agentic-workflows:
@@ -81,6 +81,8 @@ steps:
       echo "Wrote pre-fetched merged PRs to /tmp/gh-aw/agent/merged-prs.json"
 
 imports:
+  - shared/pr-safe-output-defaults.md
+  - shared/mcp-pagination.md
   - shared/github-guard-policy.md
 
   - shared/otlp.md
@@ -90,7 +92,11 @@ safe-outputs:
     title-prefix: "[blog] "
     labels: [blog]
     reviewers: [copilot]
-    draft: false
+evals:
+  - id: draft-prepared
+    question: Did the workflow analyze recent releases and merged pull requests and prepare a weekly blog post draft?
+  - id: pr-created-or-explained
+    question: Was a blog post pull request created when a draft was ready, or did the agent clearly explain why no pull request was needed?
 
 ---
 

@@ -11,12 +11,21 @@ on:
 
 permissions:
   contents: read
+  issues: read
   pull-requests: read
   actions: read
 
 engine:
   id: copilot
   agent: technical-doc-writer
+
+skip-if-decision:
+  - >-
+    Do @/tmp/gh-aw/agent/recent-commits.txt and
+    @/tmp/gh-aw/agent/doc-changes.txt conclusively establish that this scan has
+    no new, changed, or removed user-facing terminology requiring updates to
+    @docs/src/content/docs/reference/glossary.md? Abstain if the summaries are
+    insufficient or any glossary work remains.
 
 network:
   allowed:
@@ -25,17 +34,17 @@ network:
     - node
 
 imports:
+  - shared/pr-safe-output-defaults.md
   - ../skills/documentation/SKILL.md
   - ../agents/technical-doc-writer.agent.md
+  - shared/ai-coding-dictionary.md
   - shared/mcp/serena-go.md
-
   - shared/otlp.md
+  - shared/reporting.md
 safe-outputs:
   create-pull-request:
-    expires: 2d
     title-prefix: "[docs] "
     labels: [documentation, glossary]
-    draft: false
 
 tools:
   cli-proxy: true
@@ -44,7 +53,7 @@ tools:
     wiki: true
     description: "Project glossary and terminology reference"
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [repos, pull_requests]  # scoped to avoid search_repositories (in default); repos covers commits/files, pull_requests covers PRs
   edit:
   bash: true
@@ -86,14 +95,20 @@ steps:
       echo "$SCOPE" > /tmp/gh-aw/agent/scan-scope.txt
 
 
-sandbox:
-  agent:
-    sudo: false
+evals:
+  - id: glossary_reviewed
+    question: When the agent ran, did it review the glossary and identify gaps or stale entries relative to recent codebase changes? Return UNKNOWN when the output records a skip-if-decision no-op before agent execution.
+  - id: pr_created_or_noop
+    question: Was a pull request created with glossary updates, or was noop used when the glossary required no changes?
 ---
 
 # Glossary Maintainer
 
 You are an AI documentation agent that maintains the project glossary at `docs/src/content/docs/reference/glossary.md`.
+
+Before each eligible invocation, the AWF decision gate checks the prepared
+scan evidence and current glossary. It skips only when the evidence establishes
+that no terminology update is needed; insufficient evidence preserves execution.
 
 ## Your Mission
 
@@ -102,6 +117,7 @@ Keep the glossary up-to-date by:
 2. Performing incremental updates daily (last 24 hours)
 3. Performing comprehensive full scan on Mondays (last 7 days)
 4. Adding new terms and updating definitions based on repository changes
+5. Aligning AI-coding terminology with the shared AI Coding Dictionary reference
 
 ## Available Tools
 
@@ -182,6 +198,7 @@ The current glossary was already read in Step 1 along with the scope files.
 - Terms that need updated definitions
 - Outdated terminology
 - Inconsistent definitions
+- Generic AI terms that should be normalized using the shared AI Coding Dictionary reference
 
 ### 5. Follow Documentation Guidelines
 

@@ -10,8 +10,17 @@ permissions:
   issues: read
   pull-requests: read
   actions: read
-engine: claude
+  copilot-requests: write
+max-ai-credits: 250
+model: router/economy
+engine:
+  id: claude
+  model-provider: github
 timeout-minutes: 30
+tools:
+  github:
+    mode: local
+
 imports:
   - uses: shared/meta-analysis-base.md
     with:
@@ -23,10 +32,10 @@ imports:
 
 
   - shared/otlp.md
-sandbox:
-  agent:
-    sudo: false
+features:
+  gh-aw-detection: true
 ---
+
 # Weekly Workflow Analysis
 
 Analyze GitHub Actions workflow runs from the past week and identify improvement opportunities.

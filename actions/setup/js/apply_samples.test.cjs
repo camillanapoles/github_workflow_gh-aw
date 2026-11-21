@@ -12,7 +12,7 @@
 // Tests intentionally use the simplest safe-output tool (`create_issue`) so we
 // do not need to set up a git working tree for patch sidecars.
 
-import { describe, it, expect, beforeAll, vi } from "vitest";
+import { describe, it, expect, beforeAll, afterEach, vi } from "vitest";
 import { spawnSync } from "child_process";
 import { createRequire } from "module";
 import fs from "fs";
@@ -47,7 +47,70 @@ function initRepo(dir, defaultBranch) {
   git(["commit", "-q", "-m", "seed"], dir);
 }
 
-describe.sequential("apply_samples.cjs", () => {
+describe("apply_samples.cjs runtime value bindings", () => {
+  const { loadSamples } = require("./apply_samples.cjs");
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("binds nested values and authored sidecars once without interpreting runtime text", () => {
+    const text = 'prefix "quotes"\n${{ event.title }} / ${GH_AW_SAMPLE_VALUE_1}';
+    const samples = [
+      {
+        tool: "create_pull_request",
+        arguments: { title: "literal", nested: [{ text: "prefix ${{ inputs.title }} / ${{ inputs.other }}" }], literal: "${GH_AW_SAMPLE_VALUE_0}" },
+        sidecars: { patch: "${{ inputs.patch }}" },
+      },
+    ];
+    vi.stubEnv("GH_AW_SAMPLES", JSON.stringify(samples));
+    vi.stubEnv(
+      "GH_AW_SAMPLE_BINDINGS",
+      JSON.stringify([
+        { entry: 0, path: ["arguments", "nested", "0", "text"], env: "GH_AW_SAMPLE_VALUE_0" },
+        { entry: 0, path: ["sidecars", "patch"], env: "GH_AW_SAMPLE_VALUE_1" },
+      ])
+    );
+    vi.stubEnv("GH_AW_SAMPLE_VALUE_0", text);
+    vi.stubEnv("GH_AW_SAMPLE_VALUE_1", "authored patch\n");
+    expect(loadSamples()).toEqual([
+      {
+        tool: "create_pull_request",
+        arguments: { title: "literal", nested: [{ text }], literal: "${GH_AW_SAMPLE_VALUE_0}" },
+        sidecars: { patch: "authored patch\n" },
+      },
+    ]);
+  });
+
+  for (const binding of [
+    { entry: 0, path: ["tool"], env: "GH_AW_SAMPLE_VALUE_0" },
+    { entry: 0, path: ["arguments"], env: "GH_AW_SAMPLE_VALUE_0" },
+    { entry: 0, path: ["arguments", "nested"], env: "GH_AW_SAMPLE_VALUE_0" },
+    { entry: 0, path: ["sidecars", "patch"], env: "GH_AW_SAMPLE_VALUE_0" },
+    { entry: 0, path: ["arguments", "__proto__", "tool"], env: "GH_AW_SAMPLE_VALUE_0" },
+    { entry: 1, path: ["arguments", "text"], env: "GH_AW_SAMPLE_VALUE_0" },
+    { entry: 0, path: ["arguments", "text"], env: "GITHUB_TOKEN" },
+  ]) {
+    it(`rejects invalid binding ${JSON.stringify(binding)}`, () => {
+      vi.stubEnv("GH_AW_SAMPLES", JSON.stringify([{ tool: "create_issue", arguments: { text: "original", nested: {} } }]));
+      vi.stubEnv("GH_AW_SAMPLE_BINDINGS", JSON.stringify([binding]));
+      vi.stubEnv("GH_AW_SAMPLE_VALUE_0", '{"tool":"create_pull_request","sidecars":{"patch":"injected"}}');
+      expect(() => loadSamples()).toThrow();
+    });
+  }
+
+  it("fails closed when the separately transported value is missing", () => {
+    vi.stubEnv("GH_AW_SAMPLES", JSON.stringify([{ tool: "create_issue", arguments: { text: "${{ inputs.text }}" } }]));
+    vi.stubEnv("GH_AW_SAMPLE_BINDINGS", JSON.stringify([{ entry: 0, path: ["arguments", "text"], env: "GH_AW_SAMPLE_VALUE_0" }]));
+    vi.stubEnv("GH_AW_SAMPLE_VALUE_0", undefined);
+    expect(() => loadSamples()).toThrow("missing runtime sample value GH_AW_SAMPLE_VALUE_0");
+  });
+
+  it("reports malformed runtime binding metadata before replaying samples", () => {
+    vi.stubEnv("GH_AW_SAMPLES", JSON.stringify([{ tool: "create_issue", arguments: { text: "original" } }]));
+    vi.stubEnv("GH_AW_SAMPLE_BINDINGS", "[invalid");
+    expect(() => loadSamples()).toThrow("failed to parse GH_AW_SAMPLE_BINDINGS as JSON");
+  });
+});
+
+describe("apply_samples.cjs", () => {
   let tempDir;
   let configPath;
   let outputsPath;
@@ -156,15 +219,85 @@ describe.sequential("apply_samples.cjs", () => {
     const logText = fs.readFileSync(logPath, "utf8");
     expect(logText).toContain("terminal_reason");
   });
+
+  it("replays dynamic call_workflow samples with workflow_name materialized", () => {
+    const dynamicConfigPath = path.join(tempDir, "call-workflow-config.json");
+    const dynamicToolsPath = path.join(tempDir, "call-workflow-tools.json");
+    const dynamicOutputsPath = path.join(tempDir, "call-workflow-outputs.jsonl");
+    const dynamicLogPath = path.join(tempDir, "call-workflow-agent-stdio.log");
+
+    fs.writeFileSync(
+      dynamicConfigPath,
+      JSON.stringify({
+        "call-workflow": {
+          workflows: ["test-copilot-call-worker"],
+        },
+      })
+    );
+    fs.writeFileSync(
+      dynamicToolsPath,
+      JSON.stringify([
+        {
+          name: "test_copilot_call_worker",
+          _call_workflow_name: "test-copilot-call-worker",
+          description: "Call the test-copilot-call-worker workflow",
+          inputSchema: {
+            type: "object",
+            properties: {
+              sentinel: { type: "string" },
+            },
+            additionalProperties: false,
+          },
+        },
+      ])
+    );
+
+    const samples = [
+      {
+        tool: "test_copilot_call_worker",
+        arguments: {
+          sentinel: "deterministic-sample",
+        },
+      },
+    ];
+
+    const result = spawnSync(process.execPath, [driverPath], {
+      env: {
+        ...process.env,
+        GH_AW_SAMPLES: JSON.stringify(samples),
+        GH_AW_SAFE_OUTPUTS_CONFIG_PATH: dynamicConfigPath,
+        GH_AW_SAFE_OUTPUTS_TOOLS_PATH: dynamicToolsPath,
+        GH_AW_SAFE_OUTPUTS: dynamicOutputsPath,
+        GH_AW_AGENT_STDIO_LOG: dynamicLogPath,
+      },
+      encoding: "utf8",
+      timeout: 15000,
+    });
+
+    if (result.status !== 0) {
+      throw new Error(`driver exited with status ${result.status}\nstderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+    }
+
+    const outputLines = fs
+      .readFileSync(dynamicOutputsPath, "utf8")
+      .split("\n")
+      .filter(line => line.trim().length > 0);
+    expect(outputLines).toHaveLength(1);
+
+    const firstEntry = JSON.parse(outputLines[0]);
+    expect(firstEntry.type).toBe("call_workflow");
+    expect(firstEntry.workflow_name).toBe("test-copilot-call-worker");
+    expect(firstEntry.inputs).toEqual({
+      sentinel: "deterministic-sample",
+    });
+  });
 });
 
 describe("apply_samples.cjs sendJsonRpc", () => {
   const { sendJsonRpc } = require("./apply_samples.cjs");
 
-  async function* fromLines(lines) {
-    for (const line of lines) {
-      yield line;
-    }
+  function fromLines(lines) {
+    return require("./jsonl_helpers.cjs").streamJsonlEvents(lines.map(line => line + "\n"));
   }
 
   it("skips non-JSON stdout lines until a JSON-RPC response arrives", async () => {
@@ -501,6 +634,51 @@ describe("apply_samples.cjs preStagePatch (create_pull_request / push_to_pull_re
       await expect(preStagePatch(entry, 0, workspace)).rejects.toThrow(/cannot derive pull-request head branch/);
     } finally {
       if (prevEvent !== undefined) process.env.GITHUB_EVENT_PATH = prevEvent;
+    }
+  });
+
+  it("derives push_to_pull_request_branch branch from workflow_dispatch inputs.pull_request_number", async () => {
+    const workspace = makeTempDir("gh-aw-prestage-push-dispatch-input-");
+    initRepo(workspace, "main");
+
+    const headRef = "feat/dispatch-pr-number";
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ head: { ref: headRef } }),
+    });
+
+    const eventPath = path.join(workspace, "event.json");
+    fs.writeFileSync(
+      eventPath,
+      JSON.stringify({
+        inputs: { pull_request_number: "123" },
+      })
+    );
+
+    const prevBase = process.env.GH_AW_CUSTOM_BASE_BRANCH;
+    const prevEvent = process.env.GITHUB_EVENT_PATH;
+    const prevRepo = process.env.GITHUB_REPOSITORY;
+    process.env.GH_AW_CUSTOM_BASE_BRANCH = "main";
+    process.env.GITHUB_EVENT_PATH = eventPath;
+    process.env.GITHUB_REPOSITORY = "owner/repo";
+    try {
+      const entry = {
+        tool: "push_to_pull_request_branch",
+        arguments: { message: "Push update" },
+        sidecars: { patch: newFileDiff("dispatch-input.txt", "via workflow_dispatch input\n") },
+      };
+      await preStagePatch(entry, 0, workspace);
+      expect(git(["rev-parse", "--abbrev-ref", "HEAD"], workspace).trim()).toBe(headRef);
+      expect(fetchSpy).toHaveBeenCalledWith(expect.stringContaining("/repos/owner/repo/pulls/123"), expect.anything());
+    } finally {
+      fetchSpy.mockRestore();
+      if (prevBase === undefined) delete process.env.GH_AW_CUSTOM_BASE_BRANCH;
+      else process.env.GH_AW_CUSTOM_BASE_BRANCH = prevBase;
+      if (prevEvent === undefined) delete process.env.GITHUB_EVENT_PATH;
+      else process.env.GITHUB_EVENT_PATH = prevEvent;
+      if (prevRepo === undefined) delete process.env.GITHUB_REPOSITORY;
+      else process.env.GITHUB_REPOSITORY = prevRepo;
     }
   });
 

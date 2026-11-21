@@ -1,7 +1,9 @@
 // This file provides external tool runners for workflow compilation.
 //
 // This file contains functions that invoke external analysis tools
-// (actionlint, zizmor, poutine, runner-guard) on compiled workflow files.
+// (actionlint, zizmor, poutine, runner-guard, syft, grype, grant) on compiled workflow files.
+// (actionlint, zizmor, poutine, runner-guard, syft, grype, grant, yamllint)
+// on compiled workflow files.
 //
 // # Organization Rationale
 //
@@ -18,16 +20,20 @@
 //   - RunZizmorOnFiles() - Run zizmor on multiple lock files
 //   - RunPoutineOnDirectory() - Run poutine security scanner on a directory
 //   - RunRunnerGuardOnDirectory() - Run runner-guard taint analysis on a directory
+//   - RunGrantOnLockFiles() - Run grant license scanning on container images
+//   - RunYamllintOnFiles() - Run yamllint YAML linter on multiple lock files
 
 package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/logger"
+	"github.com/github/gh-aw/pkg/workflow"
 )
 
 var compileExternalToolsLog = logger.New("cli:compile_external_tools")
@@ -36,7 +42,11 @@ var compileExternalToolsLog = logger.New("cli:compile_external_tools")
 // This is more efficient than running actionlint once per file.
 func RunActionlintOnFiles(ctx context.Context, lockFiles []string, verbose bool, strict bool) error {
 	return runBatchLockFileTool("actionlint", lockFiles, verbose, strict, func(files []string, runVerbose bool, runStrict bool) error {
-		return runActionlintOnFiles(ctx, files, runVerbose, runStrict)
+		err := runActionlintOnFiles(ctx, files, runVerbose, runStrict)
+		if err != nil {
+			reportCompileScannerResult(ctx, "actionlint", err)
+		}
+		return err
 	})
 }
 
@@ -58,9 +68,52 @@ func RunRunnerGuardOnDirectory(workflowDir string, verbose bool, strict bool) er
 	return runRunnerGuardOnDirectory(workflowDir, verbose, strict)
 }
 
-// runBatchLockFileTool runs a batch tool on lock files with uniform error handling
+// RunGrypeOnLockFiles runs the grype vulnerability scanner on container images extracted
+// from the gh-aw-manifest headers in the provided lock files.
+// Images are deduplicated by pinned reference, and results are cached per image.
+func RunGrypeOnLockFiles(lockFiles []string, verbose bool, strict bool) error {
+	return runBatchLockFileTool("grype", lockFiles, verbose, strict, runGrypeOnLockFiles)
+}
+
+// RunGrantOnLockFiles runs the grant license scanner on container images extracted
+// from the gh-aw-manifest headers in the provided lock files.
+func RunGrantOnLockFiles(lockFiles []string, verbose bool, strict bool) error {
+	return runBatchLockFileTool("grant", lockFiles, verbose, strict, runGrantOnLockFiles)
+}
+
+// RunYamllintOnFiles runs yamllint on multiple lock files in a single batch.
+// This is more efficient than running yamllint once per file.
+func RunYamllintOnFiles(lockFiles []string, verbose bool, strict bool) error {
+	return runBatchLockFileTool("yamllint", lockFiles, verbose, strict, runYamllintOnFiles)
+}
+
+// RunShellcheckOnLockFilesAndResources runs shellcheck on run steps extracted
+// from lock files and shell script resources defined in workflow frontmatter.
+func RunShellcheckOnLockFilesAndResources(ctx context.Context, lockFiles []string, resources []workflow.ShellScriptResource, verbose bool, strict bool) error {
+	if len(lockFiles) == 0 && len(resources) == 0 {
+		fmt.Fprintf(os.Stderr, "%s\n", console.FormatInfoMessage("Running shellcheck on run steps (0 lock files and 0 frontmatter resources found)"))
+		compileExternalToolsLog.Printf("No shell script resources to process with shellcheck")
+		return nil
+	}
+
+	compileExternalToolsLog.Printf("Running batch shellcheck on %d lock files and %d frontmatter resources", len(lockFiles), len(resources))
+	err := runShellcheckOnLockFilesAndResources(ctx, lockFiles, resources, verbose, strict)
+	return handleBatchToolError("shellcheck", err, strict, verbose)
+}
+
+// RunSyftOnLockFiles runs the syft SBOM scanner on container images extracted
+// from the gh-aw-manifest headers in the provided lock files.
+func RunSyftOnLockFiles(lockFiles []string, verbose bool, strict bool) error {
+	return runBatchLockFileTool("syft", lockFiles, verbose, strict, runSyftOnLockFiles)
+}
+
+// runBatchLockFileTool runs a batch tool on lock files with uniform error handling.
+// Even when there are zero lock files to process, an explicit stderr marker is
+// emitted so downstream completeness checks (e.g. static-analysis-report.md) can
+// distinguish "tool ran with zero input" from "tool was never invoked".
 func runBatchLockFileTool(toolName string, lockFiles []string, verbose bool, strict bool, runner func([]string, bool, bool) error) error {
 	if len(lockFiles) == 0 {
+		fmt.Fprintf(os.Stderr, "%s\n", console.FormatInfoMessage(fmt.Sprintf("Running %s (0 lock files found)", toolName)))
 		compileExternalToolsLog.Printf("No lock files to process with %s", toolName)
 		return nil
 	}
@@ -83,12 +136,13 @@ func handleBatchToolError(toolName string, err error, strict, verbose bool) erro
 	if err == nil {
 		return nil
 	}
-	if strict {
+	var fatal *fatalFindingError
+	if strict || errors.As(err, &fatal) {
 		return fmt.Errorf("%s failed: %w", toolName, err)
 	}
 	// In non-strict mode, errors are warnings
 	if verbose {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("%s warnings: %v", toolName, err)))
+		fmt.Fprintln(os.Stderr, console.FormatWarningMessageStderr(fmt.Sprintf("%s warnings: %v", toolName, err)))
 	}
 	return nil
 }

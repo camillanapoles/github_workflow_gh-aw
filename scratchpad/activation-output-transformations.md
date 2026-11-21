@@ -89,7 +89,7 @@ The transformation uses a search-and-replace loop that:
 4. If valid match, replaces and continues searching after the replacement
 
 This allows handling expressions like:
-```
+```text
 "needs.activation.outputs.text_custom || needs.activation.outputs.text"
 ```
 
@@ -97,7 +97,7 @@ Where only the second occurrence is transformed.
 
 ## Runtime-Import Compatibility
 
-This transformation is crucial for runtime-import functionality:
+This transformation is required for runtime-import functionality:
 
 1. **Runtime-import allows markdown changes without recompilation**
 2. **Users can add new macros referencing activation outputs**
@@ -115,10 +115,10 @@ on: issues
 
 {{#runtime-import instructions.md}}
 
-Analyze: "${{ needs.activation.outputs.text }}"
+Analyze: "${{ steps.sanitized.outputs.text }}"
 ```
 
-Even if `instructions.md` is edited to include new references to `needs.activation.outputs.text`, the transformation ensures these work correctly.
+Even if `instructions.md` is edited at runtime to include new references (using either the modern `steps.sanitized.outputs.text` or the deprecated `needs.activation.outputs.text` form), the compiler-generated substitution table handles both correctly.
 
 ## Testing
 
@@ -146,7 +146,7 @@ DEBUG=workflow:expression_extraction gh aw compile workflow.md
 ```
 
 Output:
-```
+```text
 workflow:expression_extraction Transformed expression: needs.activation.outputs.text -> steps.sanitized.outputs.text
 ```
 

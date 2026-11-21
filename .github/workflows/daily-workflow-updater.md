@@ -17,12 +17,12 @@ permissions:
 
 sandbox:
   agent:
-    sudo: false
-
+    id: awf
 tracker-id: daily-workflow-updater
 engine:
   id: copilot
   copilot-sdk: true
+max-tool-denials: 3
 strict: true
 
 network:
@@ -36,7 +36,6 @@ safe-outputs:
     expires: 1d
     title-prefix: "[actions] "
     labels: [dependencies, automation]
-    draft: false
     protected-files: allowed
 
 tools:
@@ -49,7 +48,15 @@ tools:
 timeout-minutes: 15
 
 imports:
+  - shared/pr-safe-output-defaults.md
   - shared/otlp.md
+evals:
+  - id: action_versions_checked
+    question: Did the agent check GitHub Actions versions for available updates?
+  - id: update_pr_created_or_noop
+    question: Did the agent create a pull request for required updates, or report that no changes were needed?
+features:
+  gh-aw-detection: true
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}

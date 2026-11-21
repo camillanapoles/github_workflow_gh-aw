@@ -16,36 +16,34 @@ import (
 )
 
 func TestRunListWorkflows_JSONOutput(t *testing.T) {
-	// Save current directory
 	originalDir, err := os.Getwd()
 	require.NoError(t, err, "Failed to get current directory")
 
 	// Change to repository root
 	repoRoot := filepath.Join(originalDir, "..", "..")
-	err = os.Chdir(repoRoot)
-	require.NoError(t, err, "Failed to change to repository root")
-	defer os.Chdir(originalDir)
+	t.Chdir(repoRoot)
 
 	// Test JSON output without pattern
 	t.Run("JSON output without pattern", func(t *testing.T) {
-		err := RunListWorkflows(t.Context(), "", ".github/workflows", "", false, true, "")
-		assert.NoError(t, err, "RunListWorkflows with JSON flag should not error")
+		err := RunListWorkflows(t.Context(), "", ".github/workflows", "", false, true, "", false)
+		require.NoError(t, err, "RunListWorkflows with JSON flag should not error")
 	})
 
 	// Test JSON output with pattern
 	t.Run("JSON output with pattern", func(t *testing.T) {
-		err := RunListWorkflows(t.Context(), "", ".github/workflows", "smoke", false, true, "")
-		assert.NoError(t, err, "RunListWorkflows with JSON flag and pattern should not error")
+		err := RunListWorkflows(t.Context(), "", ".github/workflows", "smoke", false, true, "", false)
+		require.NoError(t, err, "RunListWorkflows with JSON flag and pattern should not error")
 	})
 
 	// Test JSON output with label filter
 	t.Run("JSON output with label filter", func(t *testing.T) {
-		err := RunListWorkflows(t.Context(), "", ".github/workflows", "", false, true, "test")
-		assert.NoError(t, err, "RunListWorkflows with JSON flag and label filter should not error")
+		err := RunListWorkflows(t.Context(), "", ".github/workflows", "", false, true, "test", false)
+		require.NoError(t, err, "RunListWorkflows with JSON flag and label filter should not error")
 	})
 }
 
 func TestWorkflowListItem_JSONMarshaling(t *testing.T) {
+	t.Parallel()
 	// Test that WorkflowListItem can be marshaled to JSON
 	item := WorkflowListItem{
 		Workflow: "test-workflow",
@@ -84,30 +82,28 @@ func TestWorkflowListItem_JSONMarshaling(t *testing.T) {
 }
 
 func TestRunListWorkflows_TextOutput(t *testing.T) {
-	// Save current directory
 	originalDir, err := os.Getwd()
 	require.NoError(t, err, "Failed to get current directory")
 
 	// Change to repository root
 	repoRoot := filepath.Join(originalDir, "..", "..")
-	err = os.Chdir(repoRoot)
-	require.NoError(t, err, "Failed to change to repository root")
-	defer os.Chdir(originalDir)
+	t.Chdir(repoRoot)
 
 	// Test text output
 	t.Run("Text output without pattern", func(t *testing.T) {
-		err := RunListWorkflows(t.Context(), "", ".github/workflows", "", false, false, "")
-		assert.NoError(t, err, "RunListWorkflows without JSON flag should not error")
+		err := RunListWorkflows(t.Context(), "", ".github/workflows", "", false, false, "", false)
+		require.NoError(t, err, "RunListWorkflows without JSON flag should not error")
 	})
 
 	// Test text output with pattern
 	t.Run("Text output with pattern", func(t *testing.T) {
-		err := RunListWorkflows(t.Context(), "", ".github/workflows", "ci-", false, false, "")
-		assert.NoError(t, err, "RunListWorkflows with pattern should not error")
+		err := RunListWorkflows(t.Context(), "", ".github/workflows", "ci-", false, false, "", false)
+		require.NoError(t, err, "RunListWorkflows with pattern should not error")
 	})
 }
 
 func TestNewListCommand(t *testing.T) {
+	t.Parallel()
 	cmd := NewListCommand()
 
 	// Verify command properties
@@ -122,6 +118,9 @@ func TestNewListCommand(t *testing.T) {
 
 	labelFlag := cmd.Flags().Lookup("label")
 	assert.NotNil(t, labelFlag, "Command should have --label flag")
+
+	staleFlag := cmd.Flags().Lookup("stale")
+	assert.NotNil(t, staleFlag, "Command should have --stale flag")
 }
 
 // captureListOutput calls RunListWorkflows and returns the captured stdout as a string.
@@ -132,7 +131,7 @@ func captureListOutput(t *testing.T, dir, pattern string) string {
 	require.NoError(t, err, "Should create pipe")
 	os.Stdout = w
 
-	runErr := RunListWorkflows(t.Context(), "", dir, pattern, false, true, "")
+	runErr := RunListWorkflows(t.Context(), "", dir, pattern, false, true, "", false)
 
 	w.Close()
 	os.Stdout = oldStdout
@@ -179,6 +178,9 @@ name: test-workflow
 		require.NoError(t, json.Unmarshal([]byte(output), &items), "Should unmarshal JSON output")
 		require.Len(t, items, 1, "Should have one workflow")
 		assert.Equal(t, "Yes", items[0].Compiled, "Compiled should be Yes when hash matches")
+
+		output = captureStaleListOutput(t, tmpDir)
+		require.Equal(t, "[]\n", output, "Stale output should be empty when the lock file matches")
 	})
 
 	t.Run("compiled No when hash mismatches", func(t *testing.T) {
@@ -194,6 +196,11 @@ name: test-workflow
 		require.NoError(t, json.Unmarshal([]byte(output), &items), "Should unmarshal JSON output")
 		require.Len(t, items, 1, "Should have one workflow")
 		assert.Equal(t, "No", items[0].Compiled, "Compiled should be No when hash mismatches")
+
+		output = captureStaleListOutput(t, tmpDir)
+		require.NoError(t, json.Unmarshal([]byte(output), &items), "Should unmarshal stale JSON output")
+		require.Len(t, items, 1, "Should include workflow with stale lock file")
+		assert.Equal(t, "No", items[0].Compiled, "Stale workflow should retain compilation status")
 	})
 
 	t.Run("compiled NA when no lock file", func(t *testing.T) {
@@ -206,5 +213,89 @@ name: test-workflow
 		require.NoError(t, json.Unmarshal([]byte(output), &items), "Should unmarshal JSON output")
 		require.Len(t, items, 1, "Should have one workflow")
 		assert.Equal(t, "N/A", items[0].Compiled, "Compiled should be N/A when no lock file exists")
+
+		output = captureStaleListOutput(t, tmpDir)
+		require.NoError(t, json.Unmarshal([]byte(output), &items), "Should unmarshal stale JSON output")
+		require.Len(t, items, 1, "Should include workflow with missing lock file")
+		assert.Equal(t, "N/A", items[0].Compiled, "Missing lock file should retain compilation status")
 	})
+}
+
+func TestRunListWorkflows_SourceField(t *testing.T) {
+	tests := []struct {
+		name        string
+		sourceLine  string
+		wantSource  string
+		wantPresent bool
+	}{
+		{name: "string source exported", sourceLine: "source: githubnext/agentic-ops/workflows/audit.md@v1.2.3\n", wantSource: "githubnext/agentic-ops/workflows/audit.md@v1.2.3", wantPresent: true},
+		{name: "empty source omitted", sourceLine: "source: \"\"\n"},
+		{name: "non-string source omitted", sourceLine: "source: 42\n"},
+		{name: "missing source omitted"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			content := "---\non:\n  workflow_dispatch:\n" + tt.sourceLine + "---\n\n# Source Test\n"
+			require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "source-test.md"), []byte(content), 0644), "Should write workflow")
+
+			output := captureListOutput(t, tmpDir, "")
+
+			var items []map[string]any
+			require.NoError(t, json.Unmarshal([]byte(output), &items), "Should unmarshal JSON output")
+			require.Len(t, items, 1, "Should have one workflow")
+			source, ok := items[0]["source"]
+			assert.Equal(t, tt.wantPresent, ok, "Source key presence should match")
+			if tt.wantPresent {
+				assert.Equal(t, tt.wantSource, source, "Source should be exported in JSON")
+			}
+		})
+	}
+}
+
+func TestRunListWorkflows_SourceHiddenInTableOutput(t *testing.T) {
+	tmpDir := t.TempDir()
+	content := "---\non:\n  workflow_dispatch:\nsource: githubnext/agentic-ops/workflows/audit.md@v1.2.3\n---\n\n# With Source\n"
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "with-source.md"), []byte(content), 0644), "Should write workflow with source")
+
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	require.NoError(t, err, "Should create pipe")
+	os.Stderr = w
+
+	runErr := RunListWorkflows(t.Context(), "", tmpDir, "", false, false, "", false)
+
+	w.Close()
+	os.Stderr = oldStderr
+
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	require.NoError(t, runErr, "RunListWorkflows table output should not error")
+	output := buf.String()
+	assert.Contains(t, output, "with-source", "Table output should include the workflow name")
+	assert.NotContains(t, output, "githubnext/agentic-ops", "Table output should not include the source")
+}
+
+func TestRunListWorkflows_StaleOnlyRejectsRemoteRepository(t *testing.T) {
+	err := RunListWorkflows(t.Context(), "owner/repo", ".github/workflows", "", false, false, "", true)
+	require.EqualError(t, err, "--stale cannot be used with --repo because remote workflow compilation status is unavailable")
+}
+
+func captureStaleListOutput(t *testing.T, dir string) string {
+	t.Helper()
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	require.NoError(t, err, "Should create pipe")
+	os.Stdout = w
+
+	runErr := RunListWorkflows(t.Context(), "", dir, "", false, true, "", true)
+
+	w.Close()
+	os.Stdout = oldStdout
+
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	require.NoError(t, runErr, "RunListWorkflows with stale filter should not error")
+	return buf.String()
 }

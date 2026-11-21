@@ -20,6 +20,7 @@ engine:
   id: copilot
   copilot-sdk: true
 
+max-tool-denials: 3
 network:
   allowed:
     - defaults
@@ -29,7 +30,6 @@ network:
 sandbox:
   agent:
     id: awf
-    sudo: false
 imports:
   - uses: shared/daily-audit-base.md
     with:
@@ -54,11 +54,12 @@ steps:
       # Create comments directory
       mkdir -p /tmp/gh-aw/agent/pr-comments
 
-      # Fetch detailed comments for each PR from the pre-fetched data
-      PR_COUNT=$(jq 'length' /tmp/gh-aw/agent/pr-data/copilot-prs.json)
-      echo "Fetching comments for $PR_COUNT PRs..."
+      # Only fetch comments for PRs merged in the last 7 days (not all 30-day data)
+      DATE_7D_AGO=$(date -d '7 days ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -v-7d '+%Y-%m-%dT%H:%M:%SZ')
+      PR_COUNT=$(jq --arg date "$DATE_7D_AGO" '[.[] | select(.mergedAt != null and .mergedAt >= $date)] | length' /tmp/gh-aw/agent/pr-data/copilot-prs.json)
+      echo "Fetching comments for $PR_COUNT PRs merged in the last 7 days..."
 
-      jq -r '.[].number' /tmp/gh-aw/agent/pr-data/copilot-prs.json | while read -r PR_NUM; do
+      jq -r --arg date "$DATE_7D_AGO" '.[] | select(.mergedAt != null and .mergedAt >= $date) | .number' /tmp/gh-aw/agent/pr-data/copilot-prs.json | while read -r PR_NUM; do
         echo "Fetching comments for PR #${PR_NUM}"
         gh pr view "${PR_NUM}" \
           --json comments,reviews,reviewComments \
@@ -74,6 +75,31 @@ tools:
   cli-proxy: true
 features:
   gh-aw-detection: true
+experiments:
+  nlp_prompt_style:
+    variants: [concise, structured]
+    description: "Tests whether concise vs structured prompt wording improves NLP report usefulness and reliability"
+    hypothesis: "H0: no change in eval pass rate. H1: structured improves eval pass rate by >=10pp"
+    metric: eval:insights_report_produced
+    secondary_metrics: [eval:pr_conversations_analyzed, run_duration_ms, output_word_count]
+    guardrail_metrics:
+      - name: run_failure_rate
+        direction: min
+        threshold: 0.05
+      - name: empty_output_rate
+        direction: min
+        threshold: 0.02
+    min_samples: 30
+    weight: [50, 50]
+    start_date: "2026-09-24"
+    issue: 63156
+evals:
+  - id: pr_conversations_analyzed
+    question: Did the agent perform NLP analysis on Copilot PR conversations?
+  - id: insights_report_produced
+    question: Was a report produced with extracted insights and patterns from user interactions?
+  - id: prompt_style_applied
+    question: "Did the output clearly reflect the assigned prompt-style variant (concise or structured)?"
 ---
 
 # Copilot PR Conversation NLP Analysis
@@ -82,12 +108,22 @@ You are an AI analytics agent specialized in Natural Language Processing (NLP) a
 
 ## Mission
 
-Generate a daily NLP-based analysis report of Copilot-created PRs merged within the last 24 hours, focusing on conversation patterns, sentiment trends, and topic clustering. Post the findings with visualizations as a GitHub Discussion in the `audit` category.
+Generate a weekly NLP-based analysis report of Copilot-created PRs merged within the last 7 days, focusing on conversation patterns, sentiment trends, and topic clustering. Post the findings with visualizations as a GitHub Discussion in the `audit` category.
+
+{{#if experiments.nlp_prompt_style == 'concise' }}
+## Prompt Style Variant: concise
+
+Use compact instruction execution. Prioritize brevity, top findings, and direct recommendations. Keep narrative commentary short, highlight the 3-5 highest-signal insights, and avoid exhaustive detail unless it is needed to explain a material result or edge case.
+{{else}}
+## Prompt Style Variant: structured
+
+Use explicit phase-based execution. Work through data loading, preprocessing, NLP analysis, visualization, report construction, and final verification in order. In the final discussion, preserve the required output sections and verify each success criterion with checklist-style constraints before posting.
+{{/if}}
 
 ## Current Context
 
 - **Repository**: ${{ github.repository }}
-- **Analysis Period**: Last 24 hours (merged PRs only)
+- **Analysis Period**: Last 7 days (merged PRs only)
 - **Data Location**: 
   - PR metadata: `/tmp/gh-aw/agent/pr-data/copilot-prs.json`
   - PR comments: `/tmp/gh-aw/agent/pr-comments/pr-*.json`
@@ -99,7 +135,7 @@ Generate a daily NLP-based analysis report of Copilot-created PRs merged within 
 - Python analysis dependencies are already installed by pre-agent workflow steps.
 - **Do NOT run any `pip install` commands in agent turns.**
 - If an import unexpectedly fails, report the missing package in the output and continue with reduced analysis instead of installing dependencies in agent turns.
-- Run Python scripts with `/tmp/gh-aw/agent/venv/bin/python3` to use the preinstalled environment.
+- Run Python scripts with `/tmp/gh-aw/python/venv/bin/python3` to use the preinstalled environment.
 
 ## Task Overview
 
@@ -109,11 +145,11 @@ Generate a daily NLP-based analysis report of Copilot-created PRs merged within 
 - `/tmp/gh-aw/agent/pr-data/copilot-prs.json` - Full PR data in JSON format
 - `/tmp/gh-aw/agent/pr-data/copilot-prs-schema.json` - Schema showing the structure
 
-**Note**: This workflow focuses on merged PRs from the last 24 hours. Use jq to filter:
+**Note**: This workflow focuses on merged PRs from the last 7 days. Use jq to filter:
 ```bash
-# Get PRs merged in the last 24 hours
-DATE_24H_AGO=$(date -d '1 day ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -v-1d '+%Y-%m-%dT%H:%M:%SZ')
-jq --arg date "$DATE_24H_AGO" '[.[] | select(.mergedAt != null and .mergedAt >= $date)]' /tmp/gh-aw/agent/pr-data/copilot-prs.json
+# Get PRs merged in the last 7 days
+DATE_7D_AGO=$(date -d '7 days ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -v-7d '+%Y-%m-%dT%H:%M:%SZ')
+jq --arg date "$DATE_7D_AGO" '[.[] | select(.mergedAt != null and .mergedAt >= $date)]' /tmp/gh-aw/agent/pr-data/copilot-prs.json
 ```
 
 1. **Load PR metadata**:
@@ -277,7 +313,7 @@ Wrap long sections (>5 items, detailed lists, raw data) in `<details><summary><b
 
 ### Executive Summary
 
-**Analysis Period**: Last 24 hours (merged PRs only)  
+**Analysis Period**: Last 7 days (merged PRs only)  
 **Repository**: ${{ github.repository }}  
 **Total PRs Analyzed**: [count]  
 **Total Messages**: [count] comments, [count] reviews, [count] review comments  
@@ -444,10 +480,10 @@ Based on NLP analysis:
 
 ## Edge Cases and Error Handling
 
-### No PRs in Last 24 Hours
-If no Copilot PRs were merged in the last 24 hours:
+### No PRs in Last 7 Days
+If no Copilot PRs were merged in the last 7 days:
 - Create a minimal discussion noting no activity
-- Include message: "No Copilot-authored PRs were merged in the last 24 hours"
+- Include message: "No Copilot-authored PRs were merged in the last 7 days"
 - Still maintain cache memory with zero counts
 - Optionally show historical trends
 
@@ -478,7 +514,7 @@ except json.JSONDecodeError:
 ## Success Criteria
 
 A successful analysis workflow:
-- ✅ Fetches only Copilot-authored PRs merged in last 24 hours
+- ✅ Fetches only Copilot-authored PRs merged in last 7 days
 - ✅ Pre-downloads all PR and comment data as JSON
 - ✅ Uses jq for efficient data filtering and preprocessing
 - ✅ Applies multiple NLP techniques (sentiment, topics, keywords)

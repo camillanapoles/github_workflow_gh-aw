@@ -13,10 +13,10 @@ permissions:
   issues: read
   actions: read
 imports:
+  - shared/mcp-pagination.md
   - shared/otlp.md
-sandbox:
-  agent:
-    sudo: false
+  - shared/reporting.md
+  - shared/graders.md
 tools:
   cli-proxy: true
   github:
@@ -38,7 +38,7 @@ jobs:
       issue_title: ${{ steps.precompute.outputs.issue_title }}
       issue_body: ${{ steps.precompute.outputs.issue_body }}
     steps:
-      - name: Precompute deterministic findings
+      - name: Pre-compute deterministic findings
         id: precompute
         uses: actions/github-script@v9.0.0
         with:
@@ -823,6 +823,7 @@ jobs:
             core.setOutput("issue_body", issueBody);
 safe-outputs:
   create-issue:
+    expires: 2d
     max: 1
     labels: [security, bot-detection]
   update-issue:
@@ -833,7 +834,17 @@ safe-outputs:
     allowed: ["@pelikhan"]
   threat-detection: false
 timeout-minutes: 10
+engine:
+  id: codex
+  model-provider: openai
+model: openai/gpt-5.6-sol
 strict: true
+
+evals:
+  - id: activity_investigated
+    question: Did the agent investigate suspicious repository activity?
+  - id: triage_issue_updated_or_noop
+    question: Was the triage issue updated with findings, or was noop correctly used when no suspicious activity was detected?
 
 ---
 
@@ -876,8 +887,6 @@ Maintain a **single** open triage issue with the exact title:
 - If you found **no meaningful suspicious activity**, emit **no safe outputs**.
 
 ## Report Format (Issue Body)
-
-**Report Formatting**: Use h3 (###) or lower for all headers in the report. Wrap long sections (>10 items) in `<details><summary>Section Name</summary>` tags to improve readability.
 
 Produce a concise, evidence-driven report:
 

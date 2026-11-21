@@ -15,10 +15,17 @@ import (
 	"github.com/github/gh-aw/pkg/parser"
 )
 
-// extractResources extracts file paths from the top-level "resources" frontmatter field.
+type extractedResource struct {
+	path string
+}
+
+type resourceDownloader func(ctx context.Context, owner, repo, filePath, ref string) ([]byte, error)
+
+// extractResourceEntries extracts file paths from the top-level "resources" frontmatter
+// field.
 // Returns an error if any entry contains GitHub Actions expression syntax (e.g. "${{"),
 // since macros are not permitted in resource paths.
-func extractResources(content string) ([]string, error) {
+func extractResourceEntries(content string) ([]extractedResource, error) {
 	result, err := parser.ExtractFrontmatterFromContent(content)
 	if err != nil {
 		remoteWorkflowLog.Printf("Failed to extract frontmatter for resources: %v", err)
@@ -28,31 +35,38 @@ func extractResources(content string) ([]string, error) {
 		return nil, nil
 	}
 
-	resourcesField, exists := result.Frontmatter["resources"]
-	if !exists {
-		return nil, nil
-	}
-
-	var paths []string
-	switch v := resourcesField.(type) {
-	case []any:
-		for _, item := range v {
-			if s, ok := item.(string); ok {
-				paths = append(paths, s)
+	var resources []extractedResource
+	if resourcesField, exists := result.Frontmatter["resources"]; exists {
+		switch v := resourcesField.(type) {
+		case []any:
+			for _, item := range v {
+				if s, ok := item.(string); ok {
+					resources = append(resources, extractedResource{path: s})
+				}
+			}
+		case []string:
+			for _, s := range v {
+				resources = append(resources, extractedResource{path: s})
 			}
 		}
-	case []string:
-		paths = v
 	}
 
 	// Reject entries that contain GitHub Actions expression syntax — macros are not allowed.
-	for _, p := range paths {
+	unique := make([]extractedResource, 0, len(resources))
+	seen := make(map[string]int, len(resources))
+	for _, resource := range resources {
+		p := resource.path
 		if strings.Contains(p, "${{") {
 			return nil, fmt.Errorf("resources entry %q contains GitHub Actions expression syntax (${{) which is not allowed; use static paths only", p)
 		}
+		if _, exists := seen[p]; exists {
+			continue
+		}
+		seen[p] = len(unique)
+		unique = append(unique, resource)
 	}
 
-	return paths, nil
+	return unique, nil
 }
 
 // fetchAndSaveRemoteResources fetches files listed in the top-level "resources" frontmatter
@@ -68,6 +82,10 @@ func extractResources(content string) ([]string, error) {
 // For non-Markdown resource files: if the target already exists and force is false, an error
 // is returned regardless of origin (non-markdown files have no source tracking).
 func fetchAndSaveRemoteResources(ctx context.Context, content string, spec *WorkflowSpec, targetDir string, verbose bool, force bool, tracker *FileTracker) error {
+	return fetchAndSaveRemoteResourcesWithDownloader(ctx, content, spec, targetDir, verbose, force, tracker, parser.DownloadFileFromGitHub)
+}
+
+func fetchAndSaveRemoteResourcesWithDownloader(ctx context.Context, content string, spec *WorkflowSpec, targetDir string, verbose bool, force bool, tracker *FileTracker, download resourceDownloader) error { //nolint:largefunc // Keep resource conflict, download, and tracking behavior together.
 	if spec.RepoSlug == "" {
 		return nil
 	}
@@ -76,7 +94,7 @@ func fetchAndSaveRemoteResources(ctx context.Context, content string, spec *Work
 	if len(parts) != 2 {
 		return nil
 	}
-	owner, repo := parts[0], parts[1]
+	owner, repo := parts[0], parts[1] //nolint:uncheckedsliceindex // len(parts) == 2 was checked above.
 	ref := spec.Version
 	if ref == "" {
 		defaultBranch, err := getRepoDefaultBranch(ctx, spec.RepoSlug)
@@ -89,7 +107,7 @@ func fetchAndSaveRemoteResources(ctx context.Context, content string, spec *Work
 		spec.Version = ref
 	}
 
-	resourcePaths, err := extractResources(content)
+	resourcePaths, err := extractResourceEntries(content)
 	if err != nil {
 		return err
 	}
@@ -100,16 +118,10 @@ func fetchAndSaveRemoteResources(ctx context.Context, content string, spec *Work
 	// Resources are resolved relative to the source workflow's directory in the remote repo.
 	workflowBaseDir := getParentDir(spec.WorkflowPath)
 
-	// Pre-compute the absolute target directory for path-traversal boundary checks.
-	absTargetDir, err := filepath.Abs(targetDir)
-	if err != nil {
-		remoteWorkflowLog.Printf("Failed to resolve absolute path for target directory %s: %v", targetDir, err)
-		return nil
-	}
-
-	for _, resourcePath := range resourcePaths {
+	for _, resource := range resourcePaths {
+		resourcePath := resource.path
 		// Early rejection of path traversal patterns. This is a fast first-pass check;
-		// the filepath.Rel boundary check below is the authoritative security control.
+		// the symlink-aware path validation below is the authoritative security control.
 		if strings.Contains(resourcePath, "..") {
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Skipping resource with unsafe path: %q", resourcePath)))
@@ -117,14 +129,13 @@ func fetchAndSaveRemoteResources(ctx context.Context, content string, spec *Work
 			continue
 		}
 
-		// Resolve the remote file path
 		var remoteFilePath string
 		if rest, ok := strings.CutPrefix(resourcePath, "/"); ok {
 			remoteFilePath = rest
 		} else if workflowBaseDir != "" {
-			remoteFilePath = path.Join(workflowBaseDir, resourcePath)
+			remoteFilePath = path.Join(workflowBaseDir, strings.TrimPrefix(resourcePath, "./"))
 		} else {
-			remoteFilePath = resourcePath
+			remoteFilePath = strings.TrimPrefix(resourcePath, "./")
 		}
 		remoteFilePath = path.Clean(remoteFilePath)
 
@@ -138,15 +149,10 @@ func fetchAndSaveRemoteResources(ctx context.Context, content string, spec *Work
 		if localRelPath == "" || localRelPath == "." {
 			continue
 		}
-		targetPath := filepath.Join(targetDir, localRelPath)
+		targetBaseDir := targetDir
+		targetPath := filepath.Join(targetBaseDir, localRelPath)
 
-		// Belt-and-suspenders: verify the resolved path stays inside targetDir
-		absTargetPath, absErr := filepath.Abs(targetPath)
-		if absErr != nil {
-			remoteWorkflowLog.Printf("Failed to resolve absolute path for resource %s: %v", resourcePath, absErr)
-			continue
-		}
-		if rel, relErr := filepath.Rel(absTargetDir, absTargetPath); relErr != nil || strings.HasPrefix(rel, "..") {
+		if err := fileutil.ValidatePathWithinBase(targetBaseDir, targetPath); err != nil {
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Refusing to write resource outside target directory: %q", resourcePath)))
 			}
@@ -154,9 +160,8 @@ func fetchAndSaveRemoteResources(ctx context.Context, content string, spec *Work
 		}
 
 		// Check whether the target file already exists.
-		fileExists := false
-		if fileutil.FileExists(targetPath) {
-			fileExists = true
+		fileExists := fileutil.FileExists(targetPath)
+		if fileExists {
 			if !force {
 				isMarkdown := strings.HasSuffix(strings.ToLower(targetPath), ".md")
 				if isMarkdown {
@@ -182,17 +187,16 @@ func fetchAndSaveRemoteResources(ctx context.Context, content string, spec *Work
 		}
 
 		// Download from source repository
-		fileContent, err := parser.DownloadFileFromGitHub(ctx, owner, repo, remoteFilePath, ref)
+		fileContent, err := download(ctx, owner, repo, remoteFilePath, ref)
 		if err != nil {
 			if verbose {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to fetch resource %s: %v", remoteFilePath, err)))
 			}
 			continue
 		}
-
 		// For markdown resources, embed the source field for future conflict detection.
 		if strings.HasSuffix(strings.ToLower(remoteFilePath), ".md") {
-			depSourceString := spec.RepoSlug + "/" + remoteFilePath + "@" + ref
+			depSourceString := path.Join(spec.RepoSlug, remoteFilePath) + "@" + ref
 			if updated, srcErr := addSourceToWorkflow(string(fileContent), depSourceString); srcErr == nil {
 				fileContent = []byte(updated)
 			}

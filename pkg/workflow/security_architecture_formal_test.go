@@ -178,7 +178,7 @@ func TestFormal_P2_AgentHasNoWritePermissions(t *testing.T) {
 			perms.Set(scope, PermissionWrite)
 			err := validateDangerousPermissions(&WorkflowData{Permissions: "permissions: {}"}, perms)
 			require.Error(t, err, "agent job scope %s:write must be rejected", scope)
-			assert.Contains(t, err.Error(), "write permissions")
+			require.ErrorContains(t, err, "write permissions")
 		})
 	}
 }
@@ -199,7 +199,7 @@ func TestFormal_P3_NetworkDomainAllowlist(t *testing.T) {
 	// A wildcard-only allowlist must be rejected in strict mode (CTR-011).
 	err := compiler.validateStrictNetwork(&NetworkPermissions{Allowed: []string{"*"}})
 	require.Error(t, err, "wildcard-only allowlist must be rejected in strict mode")
-	assert.Contains(t, err.Error(), "wildcard")
+	require.ErrorContains(t, err, "wildcard")
 
 	// An empty network permission set must not cause a validation error.
 	require.NoError(t, compiler.validateNetworkAllowedDomains(nil),
@@ -291,7 +291,7 @@ Simulate a write-permission violation to verify that emit is blocked.
 	yamlOut, err := compiler.CompileToYAML(wd, "workflow.md")
 	require.Error(t, err, "CompileToYAML must return an error when a write-permission violation is present (P6 FailSecure)")
 	assert.Empty(t, yamlOut, "CompileToYAML must return empty YAML — the lock-file must not be emitted — when a security violation is detected")
-	assert.Contains(t, err.Error(), "write permissions", "error must identify the permission violation")
+	require.ErrorContains(t, err, "write permissions", "error must identify the permission violation")
 }
 
 // TestFormal_P7_ConformanceLevelMonotonicity (P7 Monotonicity)
@@ -411,17 +411,13 @@ Simulate a wildcard network violation.
 	compiler2 := NewCompiler(WithNoEmit(true))
 	_, strictErr := compiler2.ParseWorkflowString(mdNet, "workflow.md")
 	require.Error(t, strictErr, "wildcard-only network allowlist must be rejected before any YAML is generated (P9)")
-	assert.Contains(t, strictErr.Error(), "wildcard", "error must identify the wildcard violation")
+	require.ErrorContains(t, strictErr, "wildcard", "error must identify the wildcard violation")
 }
 
 // TestFormal_P10_WriteTokenIsolatedToSafeOutput (P10 TokenIsolation)
 //
-// Spec Section 5: write tokens must be absent from the agent job's environment
-// and present only in the safe_outputs job.
-//
-// Compiles a real workflow with a safe-outputs github-app configuration and
-// inspects the produced YAML to verify that the private key appears only in
-// the safe_outputs mint step inputs (under with:) and not in the agent job.
+// Spec Section 5: write tokens and app keys must be absent from the agent job.
+// Mention filtering credentials are configured separately from write credentials.
 func TestFormal_P10_WriteTokenIsolatedToSafeOutput(t *testing.T) {
 	md := `---
 name: token-isolation-test
@@ -438,7 +434,7 @@ safe-outputs:
 
 # Mission
 
-Token isolation test: verify the private key is restricted to the safe_outputs job.
+Token isolation test: verify the private key is unavailable during agent execution.
 `
 	tmpDir := t.TempDir()
 	mdPath := filepath.Join(tmpDir, "workflow.md")
@@ -462,9 +458,11 @@ Token isolation test: verify the private key is restricted to the safe_outputs j
 	safeOutputsSection, hasSafeOutputs := sections["safe_outputs"]
 	require.True(t, hasSafeOutputs, "compiled YAML must contain a safe_outputs job")
 
-	// The agent job must not carry the private key material in any form.
 	assert.NotContains(t, agentSection, "APP_PRIVATE_KEY",
-		"agent job must not carry the private key material — token isolation requires it stays in safe_outputs")
+		"the safe-output write app key must not enter the agent job")
+	assert.NotContains(t, agentSection, "safe-outputs-ingestion-app-token")
+	assert.NotContains(t, agentSection, "permission-issues: write",
+		"the ingestion token must not request the safe_outputs job's write permissions")
 
 	// The safe_outputs job must hold the private key in its mint step inputs (with: block).
 	assert.Contains(t, safeOutputsSection, "private-key: ${{ secrets.APP_PRIVATE_KEY }}",
