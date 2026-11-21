@@ -159,10 +159,23 @@ tools:
 }
 
 func TestGitHubTokenValidationInSafeOutputs(t *testing.T) {
+	// A global safe-output token is also consumed by conclusion, where
+	// user-provided token-minting steps are forbidden.
+	const preSteps = `pre-steps:
+  - id: fetch-token
+    run: echo "my-token=x" >> "$GITHUB_OUTPUT"
+jobs:
+  safe_outputs:
+    pre-steps:
+      - id: fetch-token
+        run: echo "my-token=x" >> "$GITHUB_OUTPUT"
+`
 	tests := []struct {
 		name        string
 		token       string
+		preSteps    string
 		expectError bool
+		errorMsg    string
 	}{
 		{
 			name:        "valid token in safe-outputs",
@@ -173,6 +186,13 @@ func TestGitHubTokenValidationInSafeOutputs(t *testing.T) {
 			name:        "valid job output token in safe-outputs",
 			token:       "${{ needs.auth.outputs.token }}",
 			expectError: false,
+		},
+		{
+			name:        "same-job step output token cannot be minted in conclusion",
+			token:       "${{ steps.fetch-token.outputs.my-token }}",
+			preSteps:    preSteps,
+			expectError: true,
+			errorMsg:    "conclusion accepts compiler-generated steps only",
 		},
 		{
 			name:        "invalid token in safe-outputs",
@@ -191,7 +211,7 @@ on:
   issues:
     types: [opened]
 engine: copilot
-safe-outputs:
+` + tt.preSteps + `safe-outputs:
   github-token: ` + tt.token + `
   create-issue:
 ---
@@ -210,6 +230,8 @@ safe-outputs:
 			if tt.expectError {
 				if err == nil {
 					t.Errorf("Expected error for token %q, but got none", tt.token)
+				} else if tt.errorMsg != "" && !strings.Contains(err.Error(), tt.errorMsg) {
+					t.Errorf("Expected error to contain %q, got: %v", tt.errorMsg, err)
 				}
 			} else {
 				if err != nil {
@@ -221,9 +243,22 @@ safe-outputs:
 }
 
 func TestGitHubTokenValidationInIndividualSafeOutput(t *testing.T) {
+	// preSteps mints the "fetch-token" step referenced by the same-job token
+	// expression below in every job that consumes it (agent and safe_outputs),
+	// so the token resolves in each job that produces/consumes it.
+	const preSteps = `pre-steps:
+  - id: fetch-token
+    run: echo "my-token=x" >> "$GITHUB_OUTPUT"
+jobs:
+  safe_outputs:
+    pre-steps:
+      - id: fetch-token
+        run: echo "my-token=x" >> "$GITHUB_OUTPUT"
+`
 	tests := []struct {
 		name        string
 		token       string
+		preSteps    string
 		expectError bool
 	}{
 		{
@@ -234,6 +269,12 @@ func TestGitHubTokenValidationInIndividualSafeOutput(t *testing.T) {
 		{
 			name:        "valid job output token in individual safe-output",
 			token:       "${{ needs.auth.outputs.token }}",
+			expectError: false,
+		},
+		{
+			name:        "valid same-job step output token in individual safe-output",
+			token:       "${{ steps.fetch-token.outputs.my-token }}",
+			preSteps:    preSteps,
 			expectError: false,
 		},
 		{
@@ -253,7 +294,7 @@ on:
   issues:
     types: [opened]
 engine: copilot
-safe-outputs:
+` + tt.preSteps + `safe-outputs:
   create-agent-session:
     github-token: ` + tt.token + `
 ---
@@ -296,6 +337,11 @@ func TestGitHubTokenValidationInGitHubTool(t *testing.T) {
 		{
 			name:        "valid job output token in github tool",
 			token:       "${{ needs.auth.outputs.token }}",
+			expectError: false,
+		},
+		{
+			name:        "valid same-job step output token in github tool",
+			token:       "${{ steps.fetch-token.outputs.my-token }}",
 			expectError: false,
 		},
 		{

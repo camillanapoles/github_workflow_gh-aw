@@ -4,6 +4,7 @@ package workflow
 
 import (
 	"testing"
+	"time"
 
 	"github.com/github/gh-aw/pkg/constants"
 	"github.com/stretchr/testify/assert"
@@ -66,6 +67,17 @@ func TestEnsureDefaultMCPGatewayConfig(t *testing.T) {
 				assert.Equal(t, "custom-container", wd.SandboxConfig.MCP.Container, "Container should be preserved")
 				assert.Equal(t, string(constants.DefaultMCPGatewayVersion), wd.SandboxConfig.MCP.Version, "Version should be filled with default")
 				assert.Equal(t, 8080, wd.SandboxConfig.MCP.Port, "Port should be preserved")
+			},
+		},
+		{
+			name: "dynamic enclave uses default version when it satisfies delegation minimum",
+			workflowData: func() *WorkflowData {
+				wd := dynamicEnclaveWorkflowData()
+				wd.SandboxConfig.MCP.Version = ""
+				return wd
+			}(),
+			validate: func(t *testing.T, wd *WorkflowData) {
+				assert.Equal(t, string(constants.DefaultMCPGatewayVersion), wd.SandboxConfig.MCP.Version, "Version should use the default for dynamic GitHub delegation")
 			},
 		},
 		{
@@ -252,9 +264,10 @@ func TestBuildMCPGatewayConfig(t *testing.T) {
 			expected: &MCPGatewayRuntimeConfig{
 				Port:                 int(DefaultMCPGatewayPort),
 				Domain:               "${MCP_GATEWAY_DOMAIN}",
-				APIKey:               "${MCP_GATEWAY_API_KEY}",
+				AgentID:              "${MCP_GATEWAY_AGENT_ID}",
 				PayloadDir:           "${MCP_GATEWAY_PAYLOAD_DIR}",
 				PayloadSizeThreshold: constants.DefaultMCPGatewayPayloadSizeThreshold,
+				StartupTimeout:       int(constants.DefaultMCPStartupTimeout / time.Second),
 			},
 		},
 		{
@@ -263,9 +276,10 @@ func TestBuildMCPGatewayConfig(t *testing.T) {
 			expected: &MCPGatewayRuntimeConfig{
 				Port:                 int(DefaultMCPGatewayPort),
 				Domain:               "${MCP_GATEWAY_DOMAIN}",
-				APIKey:               "${MCP_GATEWAY_API_KEY}",
+				AgentID:              "${MCP_GATEWAY_AGENT_ID}",
 				PayloadDir:           "${MCP_GATEWAY_PAYLOAD_DIR}",
 				PayloadSizeThreshold: constants.DefaultMCPGatewayPayloadSizeThreshold,
+				StartupTimeout:       int(constants.DefaultMCPStartupTimeout / time.Second),
 			},
 		},
 		{
@@ -280,9 +294,10 @@ func TestBuildMCPGatewayConfig(t *testing.T) {
 			expected: &MCPGatewayRuntimeConfig{
 				Port:                 int(DefaultMCPGatewayPort),
 				Domain:               "${MCP_GATEWAY_DOMAIN}",
-				APIKey:               "${MCP_GATEWAY_API_KEY}",
+				AgentID:              "${MCP_GATEWAY_AGENT_ID}",
 				PayloadDir:           "${MCP_GATEWAY_PAYLOAD_DIR}",
 				PayloadSizeThreshold: constants.DefaultMCPGatewayPayloadSizeThreshold,
+				StartupTimeout:       int(constants.DefaultMCPStartupTimeout / time.Second),
 			},
 		},
 		{
@@ -297,10 +312,11 @@ func TestBuildMCPGatewayConfig(t *testing.T) {
 			expected: &MCPGatewayRuntimeConfig{
 				Port:                 int(DefaultMCPGatewayPort),
 				Domain:               "${MCP_GATEWAY_DOMAIN}",
-				APIKey:               "${MCP_GATEWAY_API_KEY}",
+				AgentID:              "${MCP_GATEWAY_AGENT_ID}",
 				PayloadDir:           "${MCP_GATEWAY_PAYLOAD_DIR}",
 				PayloadPathPrefix:    "/workspace/payloads",
 				PayloadSizeThreshold: constants.DefaultMCPGatewayPayloadSizeThreshold,
+				StartupTimeout:       int(constants.DefaultMCPStartupTimeout / time.Second),
 			},
 		},
 		{
@@ -315,9 +331,10 @@ func TestBuildMCPGatewayConfig(t *testing.T) {
 			expected: &MCPGatewayRuntimeConfig{
 				Port:                 int(DefaultMCPGatewayPort),
 				Domain:               "${MCP_GATEWAY_DOMAIN}",
-				APIKey:               "${MCP_GATEWAY_API_KEY}",
+				AgentID:              "${MCP_GATEWAY_AGENT_ID}",
 				PayloadDir:           "${MCP_GATEWAY_PAYLOAD_DIR}",
 				PayloadSizeThreshold: 1048576,
+				StartupTimeout:       int(constants.DefaultMCPStartupTimeout / time.Second),
 			},
 		},
 		{
@@ -332,9 +349,10 @@ func TestBuildMCPGatewayConfig(t *testing.T) {
 			expected: &MCPGatewayRuntimeConfig{
 				Port:                 int(DefaultMCPGatewayPort),
 				Domain:               "${MCP_GATEWAY_DOMAIN}",
-				APIKey:               "${MCP_GATEWAY_API_KEY}",
+				AgentID:              "${MCP_GATEWAY_AGENT_ID}",
 				PayloadDir:           "${MCP_GATEWAY_PAYLOAD_DIR}",
 				PayloadSizeThreshold: constants.DefaultMCPGatewayPayloadSizeThreshold,
+				StartupTimeout:       int(constants.DefaultMCPStartupTimeout / time.Second),
 			},
 		},
 		{
@@ -349,10 +367,11 @@ func TestBuildMCPGatewayConfig(t *testing.T) {
 			expected: &MCPGatewayRuntimeConfig{
 				Port:                 int(DefaultMCPGatewayPort),
 				Domain:               "${MCP_GATEWAY_DOMAIN}",
-				APIKey:               "${MCP_GATEWAY_API_KEY}",
+				AgentID:              "${MCP_GATEWAY_AGENT_ID}",
 				PayloadDir:           "${MCP_GATEWAY_PAYLOAD_DIR}",
 				PayloadSizeThreshold: constants.DefaultMCPGatewayPayloadSizeThreshold,
 				TrustedBots:          []string{"github-actions[bot]", "copilot-swe-agent[bot]"},
+				StartupTimeout:       int(constants.DefaultMCPStartupTimeout / time.Second),
 			},
 		},
 		{
@@ -367,10 +386,11 @@ func TestBuildMCPGatewayConfig(t *testing.T) {
 			expected: &MCPGatewayRuntimeConfig{
 				Port:                 int(DefaultMCPGatewayPort),
 				Domain:               "${MCP_GATEWAY_DOMAIN}",
-				APIKey:               "${MCP_GATEWAY_API_KEY}",
+				AgentID:              "${MCP_GATEWAY_AGENT_ID}",
 				PayloadDir:           "${MCP_GATEWAY_PAYLOAD_DIR}",
 				PayloadSizeThreshold: constants.DefaultMCPGatewayPayloadSizeThreshold,
 				KeepaliveInterval:    300,
+				StartupTimeout:       int(constants.DefaultMCPStartupTimeout / time.Second),
 			},
 		},
 		{
@@ -385,10 +405,11 @@ func TestBuildMCPGatewayConfig(t *testing.T) {
 			expected: &MCPGatewayRuntimeConfig{
 				Port:                 int(DefaultMCPGatewayPort),
 				Domain:               "${MCP_GATEWAY_DOMAIN}",
-				APIKey:               "${MCP_GATEWAY_API_KEY}",
+				AgentID:              "${MCP_GATEWAY_AGENT_ID}",
 				PayloadDir:           "${MCP_GATEWAY_PAYLOAD_DIR}",
 				PayloadSizeThreshold: constants.DefaultMCPGatewayPayloadSizeThreshold,
 				KeepaliveInterval:    -1,
+				StartupTimeout:       int(constants.DefaultMCPStartupTimeout / time.Second),
 			},
 		},
 		{
@@ -403,10 +424,11 @@ func TestBuildMCPGatewayConfig(t *testing.T) {
 			expected: &MCPGatewayRuntimeConfig{
 				Port:                 int(DefaultMCPGatewayPort),
 				Domain:               "${MCP_GATEWAY_DOMAIN}",
-				APIKey:               "${MCP_GATEWAY_API_KEY}",
+				AgentID:              "${MCP_GATEWAY_AGENT_ID}",
 				PayloadDir:           "${MCP_GATEWAY_PAYLOAD_DIR}",
 				PayloadSizeThreshold: constants.DefaultMCPGatewayPayloadSizeThreshold,
 				SessionTimeout:       "4h",
+				StartupTimeout:       int(constants.DefaultMCPStartupTimeout / time.Second),
 			},
 		},
 		{
@@ -417,10 +439,11 @@ func TestBuildMCPGatewayConfig(t *testing.T) {
 			expected: &MCPGatewayRuntimeConfig{
 				Port:                 int(DefaultMCPGatewayPort),
 				Domain:               "${MCP_GATEWAY_DOMAIN}",
-				APIKey:               "${MCP_GATEWAY_API_KEY}",
+				AgentID:              "${MCP_GATEWAY_AGENT_ID}",
 				PayloadDir:           "${MCP_GATEWAY_PAYLOAD_DIR}",
 				PayloadSizeThreshold: constants.DefaultMCPGatewayPayloadSizeThreshold,
 				SessionTimeout:       "",
+				StartupTimeout:       int(constants.DefaultMCPStartupTimeout / time.Second),
 			},
 		},
 		{
@@ -435,10 +458,11 @@ func TestBuildMCPGatewayConfig(t *testing.T) {
 			expected: &MCPGatewayRuntimeConfig{
 				Port:                 int(DefaultMCPGatewayPort),
 				Domain:               "${MCP_GATEWAY_DOMAIN}",
-				APIKey:               "${MCP_GATEWAY_API_KEY}",
+				AgentID:              "${MCP_GATEWAY_AGENT_ID}",
 				PayloadDir:           "${MCP_GATEWAY_PAYLOAD_DIR}",
 				PayloadSizeThreshold: constants.DefaultMCPGatewayPayloadSizeThreshold,
 				ToolTimeout:          "2m",
+				StartupTimeout:       int(constants.DefaultMCPStartupTimeout / time.Second),
 			},
 		},
 		{
@@ -454,11 +478,42 @@ func TestBuildMCPGatewayConfig(t *testing.T) {
 			expected: &MCPGatewayRuntimeConfig{
 				Port:                 int(DefaultMCPGatewayPort),
 				Domain:               "${MCP_GATEWAY_DOMAIN}",
-				APIKey:               "${MCP_GATEWAY_API_KEY}",
+				AgentID:              "${MCP_GATEWAY_AGENT_ID}",
 				PayloadDir:           "${MCP_GATEWAY_PAYLOAD_DIR}",
 				PayloadSizeThreshold: constants.DefaultMCPGatewayPayloadSizeThreshold,
 				SessionTimeout:       "4h",
 				ToolTimeout:          "5m",
+				StartupTimeout:       int(constants.DefaultMCPStartupTimeout / time.Second),
+			},
+		},
+		{
+			name: "uses tools.startup-timeout when specified as integer",
+			workflowData: &WorkflowData{
+				ToolsStartupTimeout: "180",
+				SandboxConfig:       &SandboxConfig{},
+			},
+			expected: &MCPGatewayRuntimeConfig{
+				Port:                 int(DefaultMCPGatewayPort),
+				Domain:               "${MCP_GATEWAY_DOMAIN}",
+				AgentID:              "${MCP_GATEWAY_AGENT_ID}",
+				PayloadDir:           "${MCP_GATEWAY_PAYLOAD_DIR}",
+				PayloadSizeThreshold: constants.DefaultMCPGatewayPayloadSizeThreshold,
+				StartupTimeout:       180,
+			},
+		},
+		{
+			name: "falls back to default startupTimeout for GitHub Actions expression",
+			workflowData: &WorkflowData{
+				ToolsStartupTimeout: "${{ inputs.startup-timeout }}",
+				SandboxConfig:       &SandboxConfig{},
+			},
+			expected: &MCPGatewayRuntimeConfig{
+				Port:                 int(DefaultMCPGatewayPort),
+				Domain:               "${MCP_GATEWAY_DOMAIN}",
+				AgentID:              "${MCP_GATEWAY_AGENT_ID}",
+				PayloadDir:           "${MCP_GATEWAY_PAYLOAD_DIR}",
+				PayloadSizeThreshold: constants.DefaultMCPGatewayPayloadSizeThreshold,
+				StartupTimeout:       int(constants.DefaultMCPStartupTimeout / time.Second),
 			},
 		},
 	}
@@ -472,7 +527,7 @@ func TestBuildMCPGatewayConfig(t *testing.T) {
 				require.NotNil(t, result, "buildMCPGatewayConfig should return config")
 				assert.Equal(t, tt.expected.Port, result.Port, "Port should match")
 				assert.Equal(t, tt.expected.Domain, result.Domain, "Domain should match")
-				assert.Equal(t, tt.expected.APIKey, result.APIKey, "APIKey should match")
+				assert.Equal(t, tt.expected.AgentID, result.AgentID, "AgentID should match")
 				assert.Equal(t, tt.expected.PayloadDir, result.PayloadDir, "PayloadDir should match")
 				assert.Equal(t, tt.expected.PayloadPathPrefix, result.PayloadPathPrefix, "PayloadPathPrefix should match")
 				assert.Equal(t, tt.expected.PayloadSizeThreshold, result.PayloadSizeThreshold, "PayloadSizeThreshold should match")
@@ -480,6 +535,7 @@ func TestBuildMCPGatewayConfig(t *testing.T) {
 				assert.Equal(t, tt.expected.KeepaliveInterval, result.KeepaliveInterval, "KeepaliveInterval should match")
 				assert.Equal(t, tt.expected.SessionTimeout, result.SessionTimeout, "SessionTimeout should match")
 				assert.Equal(t, tt.expected.ToolTimeout, result.ToolTimeout, "ToolTimeout should match")
+				assert.Equal(t, tt.expected.StartupTimeout, result.StartupTimeout, "StartupTimeout should match")
 			}
 		})
 	}

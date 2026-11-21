@@ -28,7 +28,7 @@ type ForecastWorkflowResult struct {
 	Engines []string `json:"engines,omitempty"`
 	// Period is the projection window ("week" or "month").
 	Period string `json:"period"`
-	// SampledRuns is the number of completed runs used to derive per-run averages.
+	// SampledRuns is the number of runs used to derive per-run averages.
 	SampledRuns int `json:"sampled_runs"`
 	// HistoryDays is the number of calendar days covered by the sampled runs.
 	HistoryDays int `json:"history_days"`
@@ -39,7 +39,7 @@ type ForecastWorkflowResult struct {
 	// SuccessRate is the fraction of sampled runs that completed successfully (0–1).
 	SuccessRate float64 `json:"success_rate"`
 
-	// Average per-run metrics (from completed runs).
+	// Average per-run metrics (from sampled runs).
 	AvgAIC             float64 `json:"avg_aic"`
 	AvgDurationSeconds float64 `json:"avg_duration_seconds"`
 
@@ -84,7 +84,7 @@ type ForecastWorkflowResult struct {
 
 	// RunSamples holds the individual per-run data used in the forecast computation.
 	// Each entry records the run ID, raw AIC, and (when available) the run date.
-	// Zero-AIC runs are treated as missing data and excluded.
+	// Zero-AIC runs are retained as zero-valued observations.
 	RunSamples []ForecastRunSample `json:"run_samples,omitempty"`
 }
 
@@ -144,12 +144,10 @@ type workflowMeta struct {
 // forecastTableRow is a flattened struct used for console table rendering.
 type forecastTableRow struct {
 	Workflow    string `json:"workflow"     console:"header:Workflow"`
-	Engines     string `json:"engines"      console:"header:Engines"`
 	Runs        int    `json:"runs"         console:"header:Runs"`
-	P50PerRun   string `json:"p50_per_run"  console:"header:P50/Run"`
-	P95PerRun   string `json:"p95_per_run"  console:"header:P95/Run"`
-	WeeklyP50   string `json:"weekly_p50"   console:"header:Weekly (P50)"`
-	MonthlyP50  string `json:"monthly_p50"  console:"header:Monthly (P50)"`
+	P50PerRun   string `json:"p50_per_run"  console:"header:P50 AIC/Run"`
+	P95PerRun   string `json:"p95_per_run"  console:"header:P95 AIC/Run"`
+	WeeklyP50   string `json:"weekly_p50"   console:"header:Weekly AIC (P50)"`
+	MonthlyP50  string `json:"monthly_p50"  console:"header:Monthly AIC (P50)"`
 	SuccessRate string `json:"success_rate" console:"header:Success Rate"`
-	Triggers    string `json:"triggers"     console:"header:Triggers"`
 }

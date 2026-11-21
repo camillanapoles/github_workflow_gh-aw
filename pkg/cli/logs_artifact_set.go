@@ -3,7 +3,7 @@
 // for filtering artifact downloads in the logs and audit commands.
 //
 // Key responsibilities:
-//   - Defining known artifact set names (all, agent, mcp, firewall, detection, github-api, activation)
+//   - Defining known artifact set names (all, info, agent, mcp, firewall, detection, github-api, activation, work-queue)
 //   - Mapping sets to concrete artifact name patterns
 //   - Validating artifact set inputs from CLI flags and MCP arguments
 //   - Determining whether a given artifact name matches an active filter
@@ -14,6 +14,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -38,8 +39,14 @@ const (
 	// and github_rate_limits.jsonl from the activation job).
 	ArtifactSetActivation ArtifactSet = "activation"
 
+	// ArtifactSetInfo downloads the compact aw_info.json artifact produced by the
+	// activation job.
+	ArtifactSetInfo ArtifactSet = "info"
+
 	// ArtifactSetAgent downloads the unified agent artifact containing agent logs,
-	// safe outputs, token usage, and agent-side github_rate_limits.jsonl.
+	// safe outputs, token usage, and agent-side github_rate_limits.jsonl, plus the
+	// tiny fallback artifact that carries critical agent-output files when the
+	// unified upload fails.
 	ArtifactSetAgent ArtifactSet = "agent"
 
 	// ArtifactSetMCP downloads the agent artifact which now includes MCP
@@ -62,12 +69,30 @@ const (
 	ArtifactSetGitHubAPI ArtifactSet = "github-api"
 
 	// ArtifactSetExperiment downloads the experiment artifact containing A/B experiment
-	// state (state.json) uploaded by the activation job when experiments are declared.
+	// state (state.jsonl or state.json) uploaded by the activation job when experiments are declared,
+	// plus the usage artifact, which also carries the experiment state and assignments.
 	ArtifactSetExperiment ArtifactSet = "experiment"
 
 	// ArtifactSetUsage downloads the compact usage artifact produced by the
 	// conclusion job (aw-info.jsonl, usage summaries, token usage JSONL).
 	ArtifactSetUsage ArtifactSet = "usage"
+
+	// ArtifactSetOutcomes downloads executed safe-output manifests and compact
+	// agent output used to recover references omitted from handler results.
+	ArtifactSetOutcomes ArtifactSet = "delivery"
+
+	// ArtifactSetGraders downloads the artifacts that carry grader results
+	// (grader_results.json): built-ins in usage, combined custom results from the
+	// separate graders job, and historical agent/fallback layouts.
+	ArtifactSetGraders ArtifactSet = "graders"
+
+	// ArtifactSetEvals downloads the usage artifact, which now includes evals.jsonl
+	// produced by the evals job (copied into usage by the conclusion job).
+	ArtifactSetEvals ArtifactSet = "evals"
+
+	// ArtifactSetWorkQueue downloads queue snapshots, finish intents,
+	// and the workflow logs containing coordinator publication and reconciliation.
+	ArtifactSetWorkQueue ArtifactSet = "work-queue"
 )
 
 // artifactSetArtifacts maps each named set to the list of artifact base names it includes.
@@ -76,20 +101,44 @@ const (
 // ResolveArtifactFilter means no filter is active so the caller downloads all artifacts).
 var artifactSetArtifacts = map[ArtifactSet][]string{
 	ArtifactSetAll:        nil, // no filtering – download all artifacts
-	ArtifactSetActivation: {constants.ActivationArtifactName},
-	ArtifactSetAgent:      {constants.AgentArtifactName},
-	ArtifactSetMCP:        {constants.AgentArtifactName},
-	ArtifactSetFirewall:   {constants.AgentArtifactName},
-	ArtifactSetDetection:  {constants.DetectionArtifactName},
+	ArtifactSetActivation: {constants.ActivationArtifactName.String()},
+	ArtifactSetInfo:       {constants.InfoArtifactName.String()},
+	ArtifactSetAgent:      {constants.AgentArtifactName.String(), constants.AgentOutputFallbackArtifactName.String()},
+	ArtifactSetMCP:        {constants.AgentArtifactName.String()},
+	ArtifactSetFirewall:   {constants.AgentArtifactName.String()},
+	ArtifactSetDetection:  {constants.DetectionArtifactName.String()},
 	// github-api: both jobs upload github_rate_limits.jsonl; fetch both for a complete view.
-	ArtifactSetGitHubAPI: {constants.ActivationArtifactName, constants.AgentArtifactName},
-	// experiment: A/B experiment state uploaded by the activation job.
-	ArtifactSetExperiment: {constants.ExperimentArtifactName},
+	ArtifactSetGitHubAPI: {constants.ActivationArtifactName.String(), constants.AgentArtifactName.String()},
+	// experiment: A/B experiment state uploaded by the activation job; the usage artifact
+	// also carries a copy of the state and assignments staged by the conclusion job.
+	ArtifactSetExperiment: {constants.ExperimentArtifactName.String(), constants.UsageArtifactName.String()},
 	// usage: compact conclusion artifact for lightweight reporting/forecasting.
-	ArtifactSetUsage: {constants.UsageArtifactName},
+	ArtifactSetUsage:    {constants.UsageArtifactName.String()},
+	ArtifactSetOutcomes: {constants.SafeOutputItemsArtifactName.String(), constants.AgentOutputFallbackArtifactName.String(), constants.UsageArtifactName.String()},
+	// evals: evals results are now included in the usage artifact.
+	ArtifactSetEvals: {constants.UsageArtifactName.String()},
+	// graders: conclusion publishes built-ins in usage; the separate graders job
+	// publishes combined custom results. Retain historical agent/fallback support.
+	ArtifactSetGraders:   {constants.UsageArtifactName.String(), constants.GradersArtifactName.String(), constants.AgentArtifactName.String(), constants.AgentOutputFallbackArtifactName.String()},
+	ArtifactSetWorkQueue: {constants.ActivationArtifactName.String(), constants.AgentArtifactName.String()},
 }
 
 const maxArtifactHintExamples = 2
+
+const downloadedArtifactsMarkerDir = ".downloaded-artifacts"
+
+func logsHarborArtifactSets(sets []string, harbor bool) []string {
+	if !harbor || len(sets) == 0 || slices.Contains(sets, string(ArtifactSetAll)) {
+		return sets
+	}
+	sets = slices.Clone(sets)
+	for _, set := range []ArtifactSet{ArtifactSetUsage, ArtifactSetExperiment, ArtifactSetGraders, ArtifactSetAgent} {
+		if !slices.Contains(sets, string(set)) {
+			sets = append(sets, string(set))
+		}
+	}
+	return sets
+}
 
 // ValidArtifactSetNames returns a sorted list of valid artifact set names,
 // derived dynamically from the artifactSetArtifacts map to stay in sync automatically.
@@ -104,15 +153,19 @@ func ValidArtifactSetNames() []string {
 
 func usageOnlyArtifactHintMessage() string {
 	examples := artifactHintExampleSets()
+	firstExample := ""
+	if len(examples) > 0 {
+		firstExample = examples[0]
+	}
 	switch len(examples) {
 	case 0:
 		return "Only the usage artifact was downloaded. Use --artifacts all to download all artifacts."
 	case 1:
-		return fmt.Sprintf("Only the usage artifact was downloaded. Use --artifacts all to download all artifacts, or a specific set such as --artifacts %s.", examples[0])
+		return fmt.Sprintf("Only the usage artifact was downloaded. Use --artifacts all to download all artifacts, or a specific set such as --artifacts %s.", firstExample)
 	default:
 		return fmt.Sprintf(
 			"Only the usage artifact was downloaded. Use --artifacts all to download all artifacts, or a specific set such as --artifacts %s, or combinations such as --artifacts %s.",
-			examples[0],
+			firstExample,
 			strings.Join(examples, ","),
 		)
 	}
@@ -249,6 +302,20 @@ func findMissingFilterEntries(filter []string, outputDir string) []string {
 			dirs = append(dirs, e.Name())
 		}
 	}
+	if markers, markerErr := os.ReadDir(filepath.Join(outputDir, downloadedArtifactsMarkerDir)); markerErr == nil {
+		for _, marker := range markers {
+			if !marker.IsDir() {
+				dirs = append(dirs, marker.Name())
+			}
+		}
+	}
+
+	// A complete-download marker satisfies every filtered request: if it is
+	// present the caller already downloaded all artifacts for this run.
+	if slices.Contains(dirs, string(ArtifactSetAll)) {
+		artifactSetLog.Printf("Complete-download marker present in %s; all filter entries satisfied", outputDir)
+		return nil
+	}
 
 	var missing []string
 	for _, f := range filter {
@@ -260,7 +327,7 @@ func findMissingFilterEntries(filter []string, outputDir string) []string {
 			// hypothetical directory named "super-agent" would satisfy filter entry "agent",
 			// but in practice artifact directories in a run folder only come from GitHub
 			// Actions downloads and follow the "{hash}-{base}" or exact-base patterns.
-			if d == f || strings.HasSuffix(d, "-"+f) {
+			if d == f || strings.HasSuffix(d, "-"+f) || agentOutputTransportAlternates(f, d) {
 				found = true
 				break
 			}
@@ -275,4 +342,78 @@ func findMissingFilterEntries(filter []string, outputDir string) []string {
 		artifactSetLog.Printf("All %d artifact filter entries present in %s", len(filter), outputDir)
 	}
 	return missing
+}
+
+func agentOutputTransportAlternates(filterEntry, downloadedName string) bool {
+	if filterEntry == constants.AgentArtifactName.String() {
+		return artifactNameMatchesBase(downloadedName, constants.AgentOutputFallbackArtifactName.String())
+	}
+	if filterEntry == constants.AgentOutputFallbackArtifactName.String() {
+		return artifactNameMatchesBase(downloadedName, constants.AgentArtifactName.String())
+	}
+	return false
+}
+
+func artifactNameMatchesBase(name, base string) bool {
+	if base == "" {
+		return false
+	}
+	return name == base || strings.HasSuffix(name, "-"+base)
+}
+
+func markArtifactDownloaded(outputDir, artifactName string) error {
+	if err := validateArtifactName(artifactName); err != nil {
+		return err
+	}
+	markerDir := filepath.Join(outputDir, downloadedArtifactsMarkerDir)
+	if err := os.MkdirAll(markerDir, constants.DirPermPublic); err != nil {
+		return fmt.Errorf("failed to create downloaded artifact marker directory: %w", err)
+	}
+	markerPath := filepath.Join(markerDir, artifactName)
+	if err := os.WriteFile(markerPath, nil, constants.FilePermPublic); err != nil {
+		return fmt.Errorf("failed to write downloaded artifact marker: %w", err)
+	}
+	return nil
+}
+
+// applyEvalsArtifact appends the evals artifact set to artifacts when evalsOnly is true
+// and neither ArtifactSetEvals, ArtifactSetUsage, nor ArtifactSetAll is already present.
+// Because evals results are now included in the usage artifact, this ensures evals.jsonl
+// is downloaded without requiring the user to also pass --artifacts evals or --artifacts usage.
+//
+// For callers that treat an empty artifacts slice as "all", the function returns
+// the empty slice unchanged and does not append evals.
+func applyEvalsArtifact(artifacts []string, evalsOnly bool) []string {
+	if len(artifacts) == 0 {
+		return artifacts
+	}
+	if evalsOnly &&
+		!slices.Contains(artifacts, string(ArtifactSetEvals)) &&
+		!slices.Contains(artifacts, string(ArtifactSetUsage)) &&
+		!slices.Contains(artifacts, string(ArtifactSetAll)) {
+		return append(artifacts, string(ArtifactSetEvals))
+	}
+	return artifacts
+}
+
+// applyGradersArtifact appends the graders artifact set to artifacts when gradersOnly is true
+// and neither ArtifactSetGraders nor ArtifactSetAll is already present.
+func applyGradersArtifact(artifacts []string, gradersOnly bool) []string {
+	if len(artifacts) == 0 {
+		return artifacts
+	}
+	if gradersOnly &&
+		!slices.Contains(artifacts, string(ArtifactSetGraders)) &&
+		!slices.Contains(artifacts, string(ArtifactSetAll)) {
+		return append(artifacts, string(ArtifactSetGraders))
+	}
+	return artifacts
+}
+
+// isEvalsArtifactRequested reports whether evals were explicitly requested,
+// either via --evals or by including --artifacts evals. Callers use this to
+// decide whether to bypass stale cache entries and trigger legacy dedicated-evals
+// fallback downloads when evals.jsonl is missing from usage artifacts.
+func isEvalsArtifactRequested(evalsOnly bool, artifactSets []string) bool {
+	return evalsOnly || slices.Contains(artifactSets, string(ArtifactSetEvals))
 }

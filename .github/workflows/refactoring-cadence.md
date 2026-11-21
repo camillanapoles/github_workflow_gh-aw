@@ -12,12 +12,12 @@ permissions:
   actions: read
   copilot-requests: write
 
-sandbox:
-  agent:
-    sudo: false
 
 tracker-id: refactoring-cadence
-engine: copilot
+model: router/economy
+engine:
+  id: pi
+  model-provider: github
 imports:
   - uses: shared/skip-if-issue-open.md
     with:

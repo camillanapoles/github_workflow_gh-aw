@@ -17,9 +17,9 @@ type SubmitPullRequestReviewConfig struct {
 	BaseSafeOutputConfig   `yaml:",inline"`
 	SafeOutputTargetConfig `yaml:",inline"`
 	SafeOutputFilterConfig `yaml:",inline"`
-	Footer                 *string  `yaml:"footer,omitempty"`                  // Controls when to show footer in PR review body: "always" (default), "none", or "if-body" (only when review has body text)
 	AllowedEvents          []string `yaml:"allowed-events,omitempty"`          // Optional list of allowed review event types: APPROVE, COMMENT, REQUEST_CHANGES. If omitted, all event types are allowed.
 	SupersedeOlderReviews  bool     `yaml:"supersede-older-reviews,omitempty"` // When true, dismisses older same-workflow REQUEST_CHANGES reviews after a replacement review is posted.
+	CommitId               string   `yaml:"commit-id,omitempty"`               // When set, pins the review to this commit SHA instead of the current PR head.
 }
 
 // parseSubmitPullRequestReviewConfig handles submit-pull-request-review configuration
@@ -40,10 +40,8 @@ func (c *Compiler) parseSubmitPullRequestReviewConfig(outputMap map[string]any) 
 
 		// Parse target config (target, target-repo, allowed-repos)
 		// Uses parseTargetRepoWithValidation to disallow wildcard "*" for target-repo
-		if target, exists := configMap["target"]; exists {
-			if targetStr, ok := target.(string); ok {
-				config.Target = targetStr
-			}
+		if targetStr := extractTargetFromMap(configMap, submitPRReviewLog); targetStr != "" {
+			config.Target = targetStr
 		}
 
 		targetRepoSlug, isInvalid := parseTargetRepoWithValidation(configMap)
@@ -109,6 +107,12 @@ func (c *Compiler) parseSubmitPullRequestReviewConfig(outputMap map[string]any) 
 				config.SupersedeOlderReviews = supersedeEnabled
 			} else {
 				submitPRReviewLog.Printf("Invalid supersede-older-reviews value: must be a boolean")
+			}
+		}
+
+		if commitId, exists := configMap["commit-id"]; exists {
+			if commitIdStr, ok := commitId.(string); ok {
+				config.CommitId = commitIdStr
 			}
 		}
 

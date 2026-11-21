@@ -1,12 +1,57 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
+const { createReportIssue } = require("./issue_report.cjs");
+const { getIssueLabel, getIssueLabelQuery } = require("./issue_label.cjs");
+
 const fs = require("fs");
 const { getErrorMessage } = require("./error_helpers.cjs");
-const { ERR_API } = require("./error_codes.cjs");
-const { sanitizeContent } = require("./sanitize_content.cjs");
-const { generateFooterWithExpiration } = require("./ephemerals.cjs");
-const { renderTemplateFromFile, getPromptPath } = require("./messages_core.cjs");
+const { ERR_API, ERR_SYSTEM } = require("./error_codes.cjs");
+const { parseReportMarkdown } = require("./report_markdown.cjs");
+const { renderSizedReport } = require("./report_size.cjs");
+const { getPromptPath } = require("./messages_core.cjs");
+const { getDetectionReasonText } = require("./threat_detection_warning.cjs");
+
+/**
+ * Classify the warning/failure reasons emitted by parse_threat_detection_results.
+ * Other detection metadata (such as detection_skipped) is not a problem reason.
+ * @param {string} reason
+ * @returns {{category: string, reason: string, description: string}}
+ */
+function classifyDetectionOutcome(reason) {
+  switch (reason) {
+    case "threat_detected":
+      return {
+        category: "threat_finding",
+        reason,
+        description: `${getDetectionReasonText(reason)} This is a finding, not a detector execution failure.`,
+      };
+    case "agent_failure":
+      return {
+        category: "detector_execution_failure",
+        reason,
+        description: "The detector failed to complete. Security assessment is incomplete; this is not evidence of a threat or a clean result.",
+      };
+    case "parse_error":
+      return {
+        category: "detector_result_invalid",
+        reason,
+        description: "The detector did not produce a valid result. Security assessment is incomplete; this is not evidence of a threat or a clean result.",
+      };
+    case "github_api_quota_exhausted":
+      return {
+        category: "detection_deferred",
+        reason,
+        description: `${getDetectionReasonText(reason)} Safe outputs were not published; completed agent artifacts are retained for a later run.`,
+      };
+    default:
+      return {
+        category: "detection_outcome_unknown",
+        reason: "unknown",
+        description: "Detection produced a warning or failure without a recognized reason. Security assessment remains unconfirmed.",
+      };
+  }
+}
 /**
  * Search for or create the parent issue for all agentic workflow detection runs.
  * @returns {Promise<{number: number, node_id: string}>} Parent issue number and node ID
@@ -14,12 +59,12 @@ const { renderTemplateFromFile, getPromptPath } = require("./messages_core.cjs")
 async function ensureDetectionRunsIssue() {
   const { owner, repo } = context.repo;
   const parentTitle = "[aw] Detection Runs";
-  const parentLabel = "agentic-workflows";
+  const parentLabel = getIssueLabel();
 
   core.info(`Searching for detection runs issue: "${parentTitle}"`);
 
   // Search for existing detection runs issue
-  const searchQuery = `repo:${owner}/${repo} is:issue is:open label:${parentLabel} in:title "${parentTitle}"`;
+  const searchQuery = `repo:${owner}/${repo} is:issue is:open ${getIssueLabelQuery()} in:title "${parentTitle}"`;
 
   try {
     const { data } = await github.rest.search.issuesAndPullRequests({
@@ -37,7 +82,7 @@ async function ensureDetectionRunsIssue() {
       };
     }
   } catch (error) {
-    throw new Error(`${ERR_API}: Failed to search for existing detection runs issue: ${getErrorMessage(error)}`);
+    throw new Error(`${ERR_API}: Failed to search for existing detection runs issue: ${getErrorMessage(error)}`, { cause: error });
   }
 
   // Create detection runs issue if it doesn't exist
@@ -45,20 +90,28 @@ async function ensureDetectionRunsIssue() {
 
   // Load template from file
   const templatePath = getPromptPath("detection_runs_issue.md");
-  const parentBodyContent = fs.readFileSync(templatePath, "utf8");
+  let parentBodyContent;
+  try {
+    parentBodyContent = fs.readFileSync(templatePath, "utf8");
+  } catch (err) {
+    throw new Error(`${ERR_SYSTEM}: Failed to read file ${templatePath}: ${getErrorMessage(err)}`, { cause: err });
+  }
 
-  const parentBody = generateFooterWithExpiration({
-    footerText: parentBodyContent,
-    expiresHours: 24 * 30, // 30 days
-  });
-
-  const { data: newIssue } = await github.rest.issues.create({
-    owner,
-    repo,
-    title: parentTitle,
-    body: parentBody,
-    labels: [parentLabel],
-  });
+  const { data: newIssue } = await createReportIssue(
+    github,
+    {
+      owner,
+      repo,
+      title: parentTitle,
+      labels: [parentLabel],
+    },
+    {
+      type: "report",
+      title: parentTitle,
+      agentTainted: false,
+      children: [...parseReportMarkdown(parentBodyContent, { agentTainted: false }), { type: "expiration", expiresAt: new Date(Date.now() + 24 * 30 * 60 * 60 * 1000).toISOString(), agentTainted: false }],
+    }
+  );
 
   core.info(`✓ Created detection runs issue #${newIssue.number}: ${newIssue.html_url}`);
   return {
@@ -74,19 +127,21 @@ async function ensureDetectionRunsIssue() {
  */
 async function main() {
   try {
-    const detectionConclusion = process.env.GH_AW_DETECTION_CONCLUSION || "";
+    const rawConclusion = process.env.GH_AW_DETECTION_CONCLUSION || "";
+    const detectionConclusion = ["success", "skipped", "cancelled", "warning", "failure"].includes(rawConclusion) ? rawConclusion : "unknown";
     const detectionReason = process.env.GH_AW_DETECTION_REASON || "";
     const workflowName = process.env.GH_AW_WORKFLOW_NAME || "unknown";
     const runUrl = process.env.GH_AW_RUN_URL || "";
+    const outcome = classifyDetectionOutcome(detectionReason);
 
     core.info(`Detection conclusion: ${detectionConclusion}`);
-    core.info(`Detection reason: ${detectionReason}`);
+    core.info(`Detection category: ${outcome.category}`);
     core.info(`Workflow name: ${workflowName}`);
     core.info(`Run URL: ${runUrl}`);
 
     // Only log when detection produced a warning or failure
     if (detectionConclusion !== "warning" && detectionConclusion !== "failure") {
-      core.info(`Detection conclusion is "${detectionConclusion}", no issue comment needed`);
+      core.info("Detection did not produce a warning or failure, no issue comment needed");
       return;
     }
 
@@ -106,15 +161,19 @@ async function main() {
 
     // Load and render comment template from file
     const commentTemplatePath = getPromptPath("detection_runs_comment.md");
-    const commentBody = renderTemplateFromFile(commentTemplatePath, {
-      workflow_name: workflowName,
-      conclusion: detectionConclusion,
-      reason: detectionReason || "unknown",
-      run_url: runUrl,
+    const children = parseReportMarkdown(fs.readFileSync(commentTemplatePath, "utf8"), {
+      context: {
+        workflow_name: workflowName,
+        conclusion: detectionConclusion,
+        reason: outcome.reason,
+        category: outcome.category,
+        description: outcome.description,
+        run_url: runUrl,
+      },
+      minimumHeadingLevel: 2,
+      agentTainted: false,
     });
-
-    // Sanitize the full comment body
-    const fullCommentBody = sanitizeContent(commentBody, { maxLength: 65000 });
+    const fullCommentBody = renderSizedReport({ type: "report", title: "Detection run", children, agentTainted: false }, 65000).body;
 
     try {
       await github.rest.issues.createComment({
@@ -135,4 +194,4 @@ async function main() {
   }
 }
 
-module.exports = { main, ensureDetectionRunsIssue };
+module.exports = { main, ensureDetectionRunsIssue, classifyDetectionOutcome };

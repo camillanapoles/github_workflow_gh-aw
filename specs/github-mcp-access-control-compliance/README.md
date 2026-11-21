@@ -3,6 +3,28 @@
 This directory contains fixture stubs for the Section 11 compliance tests of the
 [GitHub MCP Access Control Specification](../../scratchpad/github-mcp-access-control-specification.md).
 
+**Spec version pinned at commit `3c0818071eacec40f0356b1245a777a8cf9bd54c`.**
+
+## Sync Guard: pinned spec drift check
+
+CI runs the pinned-commit comparison in `.github/workflows/ci.yml` whenever this README or the
+pinned specification changes. After committing an intentional specification update, update the pin
+in this README and the matching pin in `.github/workflows/ci.yml` to the spec-changing commit in a
+follow-up commit.
+
+CI fetches the full history so the comparison uses the latest commit that changed
+`scratchpad/github-mcp-access-control-specification.md` and fails when it differs from the pin:
+
+```bash
+PINNED="3c0818071eacec40f0356b1245a777a8cf9bd54c"
+CURRENT="$(git log -n1 --format=%H -- scratchpad/github-mcp-access-control-specification.md)"
+
+test "$CURRENT" = "$PINNED" || {
+  echo "Spec pin drift: README pin=$PINNED current=$CURRENT"
+  exit 1
+}
+```
+
 Each fixture describes a test scenario with an input tool configuration and the expected
 access-control decision. Fixtures are consumed by the compliance test runner to verify
 that implementations satisfy the normative requirements in §§4–10 of the specification.
@@ -35,7 +57,7 @@ ALLOW(r, c) ≜
 
 Where:
 
-- `P1_ToolAllowed`: if `allowed-tools` is configured, the requested tool name must be present; an empty or absent tool name against a non-empty list also denies
+- `P1_ToolAllowed`: if `allowed-tools` is configured, the requested tool name must be present; an empty or absent tool name against a non-empty list also denies. An explicitly empty `allowed-tools` list (`[]`) is treated as list-omitted (not configured), so it allows all tool names, including an empty tool name.
 - `P2_RepoMatch`: if `repos` is configured, repository matches at least one pattern (`owner/repo`, `owner/*`, `*/repo`, `*/*`); omitted `repos` allows all accessible repositories; empty array is a compile-time validation error (§4.4.1)
 - `P3_RoleAllow`: if `roles` is configured, user role matches one configured role (OR-logic)
 - `P4_PrivateRepoAllow`: private repository access is denied when `private-repos: false`
@@ -43,6 +65,19 @@ Where:
 - `P6_IntegrityMet`: integrity ordering is enforced as `none < unapproved < approved < merged`
 
 The denial code is selected by the first failing guard in the evaluation order above.
+
+## Local implementation status
+
+The local `pkg/workflow/` compiler has no `tools.github.roles` or
+`private-repos` fields. These controls remain normative in the specification but
+are deferred locally and are not enforced. The main workflow schema rejects
+these keys before tool validation; imported configurations that pass relaxed
+import parsing and direct `NewTools` callers are rejected by
+`validateGitHubGuardPolicy()`. The abstract
+`P3_RoleAllow` and `P4_PrivateRepoAllow` fixtures test the specification model
+only and do not establish local Complete Conformance. The status was verified
+on 2026-11-16 in Section 4.8 of the
+[specification](../../scratchpad/github-mcp-access-control-specification.md).
 
 ## Behavioral Coverage Map
 
@@ -62,6 +97,7 @@ The denial code is selected by the first failing guard in the evaluation order a
 | `INV2_ErrorCode` | `TestFormal_ErrorCodeFirstFailingGuard` | Deny error code matches first failing guard; table covers each guard as first failure |
 | `SAFETY_BlockedUserAlwaysDenied` | `TestFormal_BlockedUserSafetyProperty` | Safety: blocked user always produces `-32005` when all earlier guards pass |
 | `SAFETY_NoSpuriousAllow` | `TestFormal_NoSpuriousAllowInvariant` | Safety: no allow decision when any guard fails |
+| `P5_NotBlocked + P6_IntegrityMet` (combined) | `TestFormal_FixtureRunner` | P5 fires before P6; scenario C returns -32005 when both fail, while scenario E returns -32006 when only P6 fails |
 
 ## Fixture Files
 
@@ -72,10 +108,13 @@ The denial code is selected by the first failing guard in the evaluation order a
 | `empty-repos-block.yaml` | Empty `repos` array is rejected at compile time | T-GH-015, T-GH-016 |
 | `role-deny.yaml` | Role filter denies access when user role is insufficient | T-GH-019, T-GH-020 |
 | `tool-name-filter.yaml` | `allowed-tools` filter allows or denies by tool name | T-GH-031, T-GH-032, T-GH-033 |
+| `empty-tool-name-deny.yaml` | Empty tool name is denied against a non-empty `allowed-tools` list (list-configured state) | P1_ToolAllowed |
+| `empty-tool-name-empty-list-allow.yaml` | Empty tool name is allowed when `allowed-tools` is an explicitly empty list (list-empty state, treated the same as list-omitted) | P1_ToolAllowed |
 | `blocked-user-deny.yaml` | `blocked-users` denies listed actors unconditionally | T-GH-071, T-GH-072 |
 | `private-repo-block.yaml` | `private-repos: false` blocks access to private repository | T-GH-024, T-GH-025 |
 | `integrity-level-block.yaml` | `min-integrity: approved` blocks content below the threshold | T-GH-051, T-GH-052 |
 | `combined-filter-allow.yaml` | All access-control conditions must be jointly satisfied | T-GH-081, T-GH-082, T-GH-083 |
+| `combined-blocked-integrity.yaml` | `blocked-users` (P5) and `min-integrity` (P6) evaluated simultaneously; P5 fires first when both fail | T-GH-091, T-GH-092, T-GH-093 |
 
 ## Fixture Schema
 
@@ -121,28 +160,17 @@ and no error is returned.
 4. Update `expected` fields to match the required outcome.
 5. Register the new fixture in the table above and link it from §11.4 of the specification.
 
-## Running Compliance Tests
+## Usage
 
-Compliance tests that consume these fixtures are located in (or will be added to):
-
-```
-pkg/workflow/tools_validation_test.go   — §11.1.1 configuration validation
-pkg/workflow/tools_validation_test.go   — §11.1.8 blocked-user tests
-```
-
-To run all related tests:
+1. Copy or verify the test file at `pkg/workflow/github_mcp_access_control_formal_test.go`.
+2. No stub interfaces are needed — all types and helpers are self-contained in the file.
+3. Run predicate-mapped tests:
 
 ```bash
-go test -v -run "TestValidateGitHubGuardPolicy" ./pkg/workflow/
+go test -v -run "TestFormal_" ./pkg/workflow/
 ```
 
-To run the formal conformance test suite (predicate-mapped tests):
-
-```bash
-go test -v -run "TestFormal_(ExactMatch|WildcardMatch|OmittedRepos|RoleFilter|PrivateRepo|BlockedUser|ToolName|IntegrityLevel|UnknownContent|InvalidMinIntegrity|CombinedFilters|ErrorCode|NoSpurious)" ./pkg/workflow/
-```
-
-To run the YAML fixture runner (drives every scenario from the fixture files above through the formal evaluator):
+4. Run only the fixture runner:
 
 ```bash
 go test -v -run "TestFormal_FixtureRunner" ./pkg/workflow/
@@ -157,3 +185,11 @@ Formal conformance tests are implemented in:
 The test suite includes:
 - **Predicate-mapped tests** (`TestFormal_*`) — each test maps to a specific guard predicate (P1–P6) or invariant documented in the Formal Model section above.
 - **Fixture runner** (`TestFormal_FixtureRunner`) — loads every YAML fixture file from this directory and drives each scenario through the formal evaluator. This ensures the fixture files, error codes, and expected decisions remain consistent with the formal model.
+- **Fixture inventory sync** (`TestFormal_FixtureCountConsistency`) — enforces that the documented fixture list and on-disk YAML set stay in exact sync (currently 12/12 fixtures).
+
+The `combined-blocked-integrity.yaml` fixture verifies that the runner returns P5's `-32005`
+before P6's `-32006` when both guards fail.
+
+Sync note (2026-11-16): the Behavioral Coverage Map and `combined-blocked-integrity.yaml`
+agree that scenario C returns `-32005` because P5 precedes P6 in
+`formalEvaluateAccess` in `pkg/workflow/github_mcp_access_control_formal_test.go`.

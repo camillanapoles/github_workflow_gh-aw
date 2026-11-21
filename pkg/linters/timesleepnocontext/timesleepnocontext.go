@@ -7,31 +7,32 @@ package timesleepnocontext
 import (
 	"fmt"
 	"go/ast"
-	"go/types"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
 
+	"github.com/github/gh-aw/pkg/linters/internal/analyzerutil"
 	"github.com/github/gh-aw/pkg/linters/internal/astutil"
 	"github.com/github/gh-aw/pkg/linters/internal/filecheck"
 	"github.com/github/gh-aw/pkg/linters/internal/nolint"
+	"github.com/github/gh-aw/pkg/logger"
 )
 
+var pkgLog = logger.New("linters:timesleepnocontext")
+
 // Analyzer is the time-sleep-no-context analysis pass.
-var Analyzer = &analysis.Analyzer{
-	Name:     "timesleepnocontext",
-	Doc:      "reports time.Sleep calls inside context-receiving functions where a context-aware select should be used to allow cancellation",
-	URL:      "https://github.com/github/gh-aw/tree/main/pkg/linters/timesleepnocontext",
-	Requires: []*analysis.Analyzer{inspect.Analyzer},
-	Run:      run,
-}
+var Analyzer = analyzerutil.New("timesleepnocontext", "reports time.Sleep calls inside context-receiving functions where a context-aware select should be used to allow cancellation", run)
 
 func run(pass *analysis.Pass) (any, error) {
 	insp, err := astutil.Inspector(pass)
 	if err != nil {
 		return nil, err
 	}
-	noLintLinesByFile := nolint.BuildLineIndex(pass, "timesleepnocontext")
+
+	pkgLog.Printf("analyzing package %s", pass.Pkg.Path())
+	noLintIndex, generatedFiles, err := analyzerutil.Indexes(pass)
+	if err != nil {
+		return nil, err
+	}
 
 	for cur := range insp.Root().Preorder((*ast.CallExpr)(nil)) {
 		call, ok := cur.Node().(*ast.CallExpr)
@@ -43,10 +44,10 @@ func run(pass *analysis.Pass) (any, error) {
 		}
 
 		pos := pass.Fset.PositionFor(call.Pos(), false)
-		if filecheck.IsTestFile(pos.Filename) {
+		if filecheck.ShouldSkipFilename(pos.Filename, generatedFiles) {
 			continue
 		}
-		if nolint.HasDirective(pos, noLintLinesByFile) {
+		if nolint.HasDirectiveForLinter(pos, noLintIndex, "timesleepnocontext") {
 			continue
 		}
 
@@ -63,6 +64,7 @@ func run(pass *analysis.Pass) (any, error) {
 				}
 				continue
 			}
+			pkgLog.Printf("flagging time.Sleep in context-aware function at %s", pos)
 			pass.Report(analysis.Diagnostic{
 				Pos:     call.Pos(),
 				End:     call.End(),
@@ -75,23 +77,12 @@ func run(pass *analysis.Pass) (any, error) {
 	return nil, nil
 }
 
-// isTimeSleepCall reports whether call is a call to time.Sleep.
+// isTimeSleepCall reports whether call is a call to time.Sleep. A
+// parenthesized callee such as (time.Sleep)(d) is also recognized.
 func isTimeSleepCall(pass *analysis.Pass, call *ast.CallExpr) bool {
-	sel, ok := call.Fun.(*ast.SelectorExpr)
+	sel, ok := astutil.UnwrapParenExpr(call.Fun).(*ast.SelectorExpr)
 	if !ok || sel.Sel.Name != "Sleep" {
 		return false
 	}
-	ident, ok := sel.X.(*ast.Ident)
-	if !ok {
-		return false
-	}
-	obj := pass.TypesInfo.ObjectOf(ident)
-	if obj == nil {
-		return false
-	}
-	pkgName, ok := obj.(*types.PkgName)
-	if !ok {
-		return false
-	}
-	return pkgName.Imported().Path() == "time"
+	return astutil.IsPkgSelector(pass, sel, "time")
 }

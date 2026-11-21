@@ -2,14 +2,18 @@
 
 package cli
 
+import "sync"
+
 // ResetDockerPullState resets the internal pull state (for testing)
 func ResetDockerPullState() {
 	pullState.mu.Lock()
 	defer pullState.mu.Unlock()
 	pullState.downloading = make(map[string]bool)
+	pullState.inflight = make(map[string]*inflightDownload)
 	pullState.mockAvailable = make(map[string]bool)
 	pullState.mockAvailableInUse = false
 	pullState.mockDockerAvailable = true
+	dockerMissingNotice = sync.Once{}
 }
 
 // SetDockerImageDownloading sets the downloading state for an image (for testing)

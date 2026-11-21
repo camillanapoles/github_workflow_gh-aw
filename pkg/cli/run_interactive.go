@@ -28,7 +28,7 @@ type WorkflowOption struct {
 }
 
 // RunWorkflowInteractively runs a workflow in interactive mode
-func RunWorkflowInteractively(ctx context.Context, verbose bool, repoOverride string, refOverride string, autoMergePRs bool, push bool, engineOverride string, dryRun bool) error {
+func RunWorkflowInteractively(ctx context.Context, opts RunWorkflowOptions) error {
 	runInteractiveLog.Print("Starting interactive workflow run")
 
 	// Check if running in CI environment
@@ -36,12 +36,12 @@ func RunWorkflowInteractively(ctx context.Context, verbose bool, repoOverride st
 		return errors.New("interactive mode cannot be used in CI environments")
 	}
 
-	if verbose {
+	if opts.Verbose {
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Starting interactive workflow run..."))
 	}
 
 	// Step 1: Find workflows with workflow_dispatch trigger
-	workflows, err := findRunnableWorkflows(verbose)
+	workflows, err := findRunnableWorkflows(opts.Verbose)
 	if err != nil {
 		return fmt.Errorf("failed to find runnable workflows: %w", err)
 	}
@@ -74,22 +74,16 @@ func RunWorkflowInteractively(ctx context.Context, verbose bool, repoOverride st
 	}
 
 	// Step 6: Build command string for display
-	cmdStr := buildCommandString(selectedWorkflow.Name, inputValues, repoOverride, refOverride, autoMergePRs, push, engineOverride)
+	cmdStr := buildCommandString(selectedWorkflow.Name, inputValues, opts.RepoOverride, opts.RefOverride, opts.AutoMergePRs, opts.Push, opts.EngineOverride, opts.Approve)
 	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("\nRunning workflow..."))
 	fmt.Fprintln(os.Stderr, console.FormatCommandMessage("Equivalent command: "+cmdStr))
 	fmt.Fprintln(os.Stderr, "")
 
 	// Step 7: Execute the workflow
 	err = RunWorkflowOnGitHub(ctx, selectedWorkflow.Name, RunOptions{
-		Enable:         false,
-		EngineOverride: engineOverride,
-		RepoOverride:   repoOverride,
-		RefOverride:    refOverride,
-		AutoMergePRs:   autoMergePRs,
-		Push:           push,
-		Inputs:         inputValues,
-		Verbose:        verbose,
-		DryRun:         dryRun,
+		WorkflowRunFlags: opts.WorkflowRunFlags,
+		Enable:           false,
+		Inputs:           inputValues,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to run workflow: %w", err)
@@ -97,7 +91,7 @@ func RunWorkflowInteractively(ctx context.Context, verbose bool, repoOverride st
 
 	// Show success message with command to run again
 	fmt.Fprintln(os.Stderr, "")
-	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("✓ Workflow dispatched successfully!"))
+	fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Workflow dispatched successfully!"))
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("To run this workflow again, use:"))
 	fmt.Fprintln(os.Stderr, console.FormatCommandMessage(cmdStr))
@@ -361,16 +355,11 @@ func confirmExecution(ctx context.Context, wf *WorkflowOption, inputs []string) 
 	return confirm
 }
 
-// RunWorkflowOptions holds parameters for RunSpecificWorkflowInteractively.
+// RunWorkflowOptions holds parameters for interactive workflow runs.
 type RunWorkflowOptions struct {
-	WorkflowName   string
-	Verbose        bool
-	EngineOverride string
-	RepoOverride   string
-	RefOverride    string
-	AutoMergePRs   bool
-	Push           bool
-	DryRun         bool
+	WorkflowRunFlags
+	WorkflowName       string
+	requiredInputsOnly bool
 }
 
 // RunSpecificWorkflowInteractively runs a specific workflow in interactive mode
@@ -395,18 +384,15 @@ func RunSpecificWorkflowInteractively(ctx context.Context, opts RunWorkflowOptio
 		// Continue without inputs - they might not be required
 		inputs = nil
 	}
-
-	// Create workflow option for display
-	wf := &WorkflowOption{
-		Name:        opts.WorkflowName,
-		Description: buildWorkflowDescription(inputs),
-		FilePath:    mdFile,
-		Inputs:      inputs,
+	if opts.requiredInputsOnly {
+		inputs = requiredWorkflowInputs(inputs)
 	}
 
-	// Show workflow info if there are inputs
-	if len(inputs) > 0 {
-		showWorkflowInfo(wf)
+	// Create the workflow option used to collect required inputs.
+	wf := &WorkflowOption{
+		Name:     opts.WorkflowName,
+		FilePath: mdFile,
+		Inputs:   inputs,
 	}
 
 	// Collect workflow inputs if needed
@@ -421,24 +407,12 @@ func RunSpecificWorkflowInteractively(ctx context.Context, opts RunWorkflowOptio
 		return nil
 	}
 
-	// Build command string for display
-	cmdStr := buildCommandString(opts.WorkflowName, inputValues, opts.RepoOverride, opts.RefOverride, opts.AutoMergePRs, opts.Push, opts.EngineOverride)
-	fmt.Fprintln(os.Stderr, console.FormatInfoMessage("\nRunning workflow..."))
-	fmt.Fprintln(os.Stderr, console.FormatCommandMessage("Equivalent command: "+cmdStr))
-	fmt.Fprintln(os.Stderr, "")
-
 	// Execute the workflow
 	err = RunWorkflowOnGitHub(ctx, opts.WorkflowName, RunOptions{
+		WorkflowRunFlags:  opts.WorkflowRunFlags,
 		Enable:            false,
-		EngineOverride:    opts.EngineOverride,
-		RepoOverride:      opts.RepoOverride,
-		RefOverride:       opts.RefOverride,
-		AutoMergePRs:      opts.AutoMergePRs,
-		Push:              opts.Push,
 		WaitForCompletion: true,
 		Inputs:            inputValues,
-		Verbose:           opts.Verbose,
-		DryRun:            opts.DryRun,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to run workflow: %w", err)
@@ -447,8 +421,18 @@ func RunSpecificWorkflowInteractively(ctx context.Context, opts RunWorkflowOptio
 	return nil
 }
 
+func requiredWorkflowInputs(inputs map[string]*workflow.InputDefinition) map[string]*workflow.InputDefinition {
+	requiredInputs := make(map[string]*workflow.InputDefinition)
+	for name, definition := range inputs {
+		if definition != nil && definition.Required {
+			requiredInputs[name] = definition
+		}
+	}
+	return requiredInputs
+}
+
 // buildCommandString builds the equivalent command string for display
-func buildCommandString(workflowName string, inputs []string, repoOverride, refOverride string, autoMergePRs, push bool, engineOverride string) string {
+func buildCommandString(workflowName string, inputs []string, repoOverride, refOverride string, autoMergePRs, push bool, engineOverride string, approve bool) string {
 	parts := []string{string(constants.CLIExtensionPrefix), "run", workflowName}
 
 	// Add inputs
@@ -471,6 +455,9 @@ func buildCommandString(workflowName string, inputs []string, repoOverride, refO
 	}
 	if engineOverride != "" {
 		parts = append(parts, "--engine", engineOverride)
+	}
+	if approve {
+		parts = append(parts, "--approve")
 	}
 
 	return strings.Join(parts, " ")

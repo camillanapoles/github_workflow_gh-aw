@@ -1,11 +1,21 @@
 // @ts-check
 
+const { iterateJsonlEvents } = require("./jsonl_helpers.cjs");
 const fs = require("fs");
 const path = require("path");
 
-const { computeInferenceAIC, formatAIC } = require("./model_costs.cjs");
+const { computeInferenceAIC, findModelPricing, formatAIC } = require("./model_costs.cjs");
 
 const TOKEN_USAGE_FILENAME = "token-usage.jsonl";
+const DAILY_AIC_USAGE_JSONL_FILE = /(?:^|[/\\])(?:agent_usage|detection_usage|evals|token_usage)[^/\\]*\.jsonl$/;
+
+/**
+ * @param {string} filePath
+ * @returns {boolean}
+ */
+function isDailyAICUsageJSONLFile(filePath) {
+  return DAILY_AIC_USAGE_JSONL_FILE.test(filePath);
+}
 
 /**
  * @param {string} root
@@ -45,59 +55,12 @@ function findJSONLFiles(root) {
 }
 
 /**
- * @param {string} filePath
- * @returns {number}
- */
-function sumAICFromTokenUsageFile(filePath) {
-  if (!filePath || !fs.existsSync(filePath)) {
-    return 0;
-  }
-
-  const content = fs.readFileSync(filePath, "utf8");
-  if (!content.trim()) {
-    return 0;
-  }
-
-  let total = 0;
-  for (const rawLine of content.split("\n")) {
-    const line = rawLine.trim();
-    if (!line || !line.startsWith("{")) {
-      continue;
-    }
-
-    try {
-      const parsed = JSON.parse(line);
-      const explicit = Number(parsed?.aic);
-      if (Number.isFinite(explicit) && explicit > 0) {
-        total += explicit;
-        continue;
-      }
-      const computed = computeInferenceAIC({
-        provider: String(parsed?.provider || ""),
-        model: String(parsed?.model || ""),
-        inputTokens: Number(parsed?.input_tokens || 0),
-        outputTokens: Number(parsed?.output_tokens || 0),
-        cacheReadTokens: Number(parsed?.cache_read_tokens || 0),
-        cacheWriteTokens: Number(parsed?.cache_write_tokens || 0),
-        reasoningTokens: Number(parsed?.reasoning_tokens || 0),
-      });
-      if (Number.isFinite(computed) && computed > 0) {
-        total += computed;
-      }
-    } catch {
-      // Ignore malformed lines.
-    }
-  }
-
-  return total;
-}
-
-/**
  * @param {Array<string>} filePaths
  * @returns {number}
  */
-function sumAICFromUsageJSONLFiles(filePaths) {
+function sumAICFromUsageJSONLFiles(filePaths, options = {}) {
   if (!Array.isArray(filePaths) || filePaths.length === 0) {
+    if (options.strict) throw new Error("No daily AIC accounting files");
     return 0;
   }
 
@@ -122,8 +85,36 @@ function sumAICFromUsageJSONLFiles(filePaths) {
     if (typeof value === "string" && !value.trim()) {
       return null;
     }
+
     const num = Number(value);
     return Number.isFinite(num) ? num : null;
+  }
+
+  function validatePresentNumbers(record) {
+    const names = [
+      "ai_credits",
+      "aiCredits",
+      "aic",
+      "ai_credits_this_response",
+      "ai_credits_total",
+      "input_tokens",
+      "inputTokens",
+      "output_tokens",
+      "outputTokens",
+      "cache_read_tokens",
+      "cacheReadTokens",
+      "cache_write_tokens",
+      "cacheWriteTokens",
+      "reasoning_tokens",
+      "reasoningTokens",
+    ];
+    for (const name of names) {
+      if (!Object.hasOwn(record, name)) continue;
+      const value = record[name];
+      if ((typeof value !== "number" && typeof value !== "string") || (typeof value === "string" && !/^\s*(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\s*$/.test(value)) || !Number.isFinite(Number(value)) || Number(value) < 0) {
+        throw new Error(`Invalid numeric daily AIC field: ${name}`);
+      }
+    }
   }
 
   /**
@@ -181,29 +172,61 @@ function sumAICFromUsageJSONLFiles(filePaths) {
   }
 
   let total = 0;
+  let observations = 0;
+  const requestRecords = new Map();
   for (const filePath of filePaths) {
     if (!filePath || !fs.existsSync(filePath)) {
       continue;
     }
 
-    const content = fs.readFileSync(filePath, "utf8");
+    let content;
+    try {
+      content = fs.readFileSync(filePath, "utf8");
+    } catch (err) {
+      throw new Error(`Failed to read file ${filePath}: ${String(err)}`, { cause: err });
+    }
     if (!content.trim()) {
       continue;
     }
 
-    for (const rawLine of content.split("\n")) {
-      const line = rawLine.trim();
+    for (const event of iterateJsonlEvents(content)) {
+      const line = event.rawLine.trim();
       if (!line || !line.startsWith("{")) {
+        if (options.strict && line) throw new Error("Malformed daily AIC accounting record");
         continue;
       }
 
       try {
-        const parsed = JSON.parse(line);
+        if (event.type === "invalid") throw event.error;
+        const parsed = event.value;
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          if (options.strict) throw new Error("Invalid daily AIC accounting record");
           continue;
         }
 
         const usage = normalizeUsageRecord(parsed.usage);
+        if (options.strict) {
+          validatePresentNumbers(parsed);
+          if (usage) validatePresentNumbers(usage);
+          if (typeof parsed.request_id === "string" && parsed.request_id) {
+            const key = `${parsed.event || "token_usage"}:${parsed.request_id}`;
+            if (requestRecords.has(key)) {
+              if (requestRecords.get(key) !== line) throw new Error("Conflicting daily AIC request records");
+              continue;
+            }
+            requestRecords.set(key, line);
+          }
+          if (Object.hasOwn(parsed, "ai_credits_this_response")) {
+            total += Number(parsed.ai_credits_this_response);
+            observations++;
+            continue;
+          }
+        }
+        const explicitValues = ["ai_credits", "aiCredits", "aic"].flatMap(key => [usage?.[key], parsed[key]]).filter(value => value != null && value !== "");
+        if (options.strict && explicitValues.some(value => !Number.isFinite(Number(value)) || Number(value) < 0)) {
+          throw new Error("Invalid explicit daily AIC value");
+        }
+        if (explicitValues.length > 0) observations++;
         const explicitAICredits = getNumericAliasField(usage, parsed, ["ai_credits", "aiCredits"]);
         if (explicitAICredits > 0) {
           total += explicitAICredits;
@@ -215,7 +238,7 @@ function sumAICFromUsageJSONLFiles(filePaths) {
           continue;
         }
 
-        const computed = computeInferenceAIC({
+        const inference = {
           provider: getStringField(usage, parsed, "provider", "provider"),
           model: getStringField(usage, parsed, "model", "model"),
           inputTokens: getNumericField(usage, parsed, "input_tokens", "inputTokens"),
@@ -223,16 +246,39 @@ function sumAICFromUsageJSONLFiles(filePaths) {
           cacheReadTokens: getNumericField(usage, parsed, "cache_read_tokens", "cacheReadTokens"),
           cacheWriteTokens: getNumericField(usage, parsed, "cache_write_tokens", "cacheWriteTokens"),
           reasoningTokens: getNumericField(usage, parsed, "reasoning_tokens", "reasoningTokens"),
-        });
+          ...(options.strict && typeof parsed.input_tokens_include_cache === "boolean" ? { inputTokensIncludeCache: parsed.input_tokens_include_cache } : {}),
+        };
+        const hasTokens = [inference.inputTokens, inference.outputTokens, inference.cacheReadTokens, inference.cacheWriteTokens, inference.reasoningTokens].some(value => value > 0);
+        const unpriced = hasTokens && !findModelPricing(inference.provider, inference.model);
+        if (unpriced) {
+          throw Object.assign(new Error("Daily AIC usage is unpriced because model pricing is unavailable"), { code: "AIC_USAGE_UNPRICED" });
+        }
+        const computed = computeInferenceAIC(inference);
+        if (options.strict && (!Number.isFinite(computed) || computed < 0)) {
+          throw new Error("Computed daily AIC value is not finite and non-negative");
+        }
         if (Number.isFinite(computed) && computed > 0) {
           total += computed;
+          observations++;
         }
-      } catch {
+      } catch (error) {
+        const unpriced = error instanceof Error && "code" in error && error.code === "AIC_USAGE_UNPRICED";
+        if (options.strict || unpriced) {
+          const unresolved = new Error(`Daily AIC accounting record could not be resolved${unpriced ? ": unpriced" : ""}`, { cause: error });
+          if (unpriced) Object.assign(unresolved, { code: "AIC_USAGE_UNPRICED" });
+          throw unresolved;
+        }
         // Ignore malformed lines.
       }
     }
   }
 
+  if (options.strict && observations === 0) {
+    throw Object.assign(new Error("Daily AIC accounting has no complete usage observations"), { code: "AIC_USAGE_UNKNOWN" });
+  }
+  if (options.strict && !Number.isFinite(total)) {
+    throw new Error("Daily AIC accounting total is not finite");
+  }
   return total;
 }
 
@@ -241,16 +287,20 @@ function sumAICFromUsageJSONLFiles(filePaths) {
  * @returns {{count:number,total:number,average:number,min:number,max:number,stddev:number}}
  */
 function calculateDailyAICStats(runs) {
-  const values = runs.map(run => Number(run?.aic || 0)).filter(value => Number.isFinite(value) && value > 0);
+  const values = runs.map(run => {
+    if (!Number.isFinite(run?.aic) || run.aic < 0) throw new Error("Daily AIC run value is not finite and non-negative");
+    return run.aic;
+  });
   if (values.length === 0) {
     return { count: 0, total: 0, average: 0, min: 0, max: 0, stddev: 0 };
   }
 
   const total = values.reduce((sum, value) => sum + value, 0);
+  if (!Number.isFinite(total)) throw new Error("Daily AIC aggregate total is not finite");
   const average = total / values.length;
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const variance = values.length > 1 ? values.reduce((sum, value) => sum + (value - average) ** 2, 0) / (values.length - 1) : 0;
+  const min = values.reduce((smallest, value) => (value < smallest ? value : smallest), values[0]);
+  const max = values.reduce((largest, value) => (value > largest ? value : largest), values[0]);
+  const variance = values.length > 1 && max > 0 ? values.reduce((sum, value) => sum + ((value - average) / max) ** 2, 0) / (values.length - 1) : 0;
 
   return {
     count: values.length,
@@ -258,7 +308,7 @@ function calculateDailyAICStats(runs) {
     average,
     min,
     max,
-    stddev: Math.sqrt(variance),
+    stddev: Math.sqrt(variance) * max,
   };
 }
 
@@ -274,7 +324,7 @@ function formatAICCredits(value) {
 
 module.exports = {
   findJSONLFiles,
-  sumAICFromTokenUsageFile,
+  isDailyAICUsageJSONLFile,
   sumAICFromUsageJSONLFiles,
   calculateDailyAICStats,
   formatAICCredits,

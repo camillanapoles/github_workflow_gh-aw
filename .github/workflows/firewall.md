@@ -13,6 +13,7 @@ engine:
   id: copilot
   copilot-sdk: true
 
+max-tool-denials: 3
 network:
   allowed:
     - defaults
@@ -21,12 +22,11 @@ network:
 sandbox:
   agent:
     id: awf
-    sudo: false
 imports:
   - shared/otlp.md
 tools:
   cli-proxy: true
-  web-fetch:
+  bash: ["curl*"]
 
 timeout-minutes: 5
 
@@ -42,7 +42,7 @@ Attempt to fetch content from example.com to demonstrate network permission enfo
 
 ## Instructions
 
-1. Use the web-fetch tool to fetch content from https://example.com
+1. Use `curl` to fetch content from https://example.com
 2. Report whether the fetch succeeded or failed
 3. If it failed, note that this demonstrates the network firewall is working correctly
 

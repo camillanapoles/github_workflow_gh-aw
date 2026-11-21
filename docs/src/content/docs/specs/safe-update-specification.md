@@ -1,5 +1,6 @@
 ---
 title: Safe Update Specification
+spec: true
 description: Formal specification of safe update enforcement and manifest baselines in gh-aw compilation
 sidebar:
   order: 1366
@@ -18,7 +19,7 @@ sidebar:
 
 ## Abstract
 
-This specification defines safe update behavior in GitHub Agentic Workflows (`gh-aw`) compilation. It standardizes when safe update enforcement is active, how baseline manifests are loaded and trusted, which secret/action/redirect/event changes require review, how warnings are surfaced, and how approval and strict-mode settings affect enforcement.
+This specification defines safe update behavior in GitHub Agentic Workflows compilation. It standardizes when safe update enforcement is active, how baseline manifests are loaded and trusted, which secret/action/redirect/event changes require review, how warnings are surfaced, and how approval and strict-mode settings affect enforcement.
 
 ## Status of This Document
 
@@ -249,6 +250,8 @@ Manifest content used by safe update comparisons SHOULD reflect secrets and acti
 ---
 
 ## 9. References
+
+The [TLA+ baseline lifecycle model](https://github.com/github/gh-aw/blob/main/specs/safe-update/SafeUpdate.tla) and [TLC configuration](https://github.com/github/gh-aw/blob/main/specs/safe-update/SafeUpdate.cfg) cover two compilations in one compiler instance. The model checks baseline precedence, retention of the first trusted manifest, legacy-lock handling, and warning-only publication under effective strict mode and explicit approval. It uses symbolic manifests and one representative restricted change; it does not verify policy matching, manifest parsing, Git or filesystem trust, or who supplies `--approve`.
 
 ### Normative References
 

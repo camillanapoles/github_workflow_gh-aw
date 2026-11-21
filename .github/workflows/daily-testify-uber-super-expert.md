@@ -28,16 +28,13 @@ emoji: 🧪
 engine:
   id: copilot
   copilot-sdk: true
+max-tool-denials: 3
 name: Daily Testify Uber Super Expert
 strict: true
 timeout-minutes: 20
 tools:
   bash:
-  - find . -name "*_test.go" -type f
-  - cat **/*_test.go
-  - grep -r "func Test" . --include="*_test.go"
-  - go test -v ./...
-  - wc -l **/*_test.go
+  - "*"
   cli-proxy: true
   github:
     mode: gh-proxy
@@ -55,7 +52,7 @@ features:
   gh-aw-detection: true
 sandbox:
   agent:
-    sudo: false
+    id: awf
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}

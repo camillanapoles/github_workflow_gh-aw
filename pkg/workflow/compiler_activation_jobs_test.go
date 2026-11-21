@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/goccy/go-yaml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -119,7 +120,7 @@ func TestBuildPreActivationJob_WithReaction(t *testing.T) {
 			workflowData := &WorkflowData{
 				Name:       "Test Workflow",
 				Command:    []string{"test"},
-				AIReaction: tt.reaction,
+				AIReaction: ReactionType(tt.reaction),
 			}
 
 			// Pre-activation job should NOT contain the reaction step any more
@@ -301,6 +302,66 @@ func TestBuildActivationJob_SkipsSecretValidationWithEnvironment(t *testing.T) {
 	assert.NotContains(t, job.Outputs, "secret_verification_result", "Activation job should not expose secret_verification_result output when validate-secret is skipped")
 }
 
+// TestBuildActivationJob_Environment verifies that manual-approval takes precedence over the workflow environment.
+func TestBuildActivationJob_Environment(t *testing.T) {
+	tests := []struct {
+		name        string
+		environment string
+		approval    string
+		want        string
+	}{
+		{
+			name: "no environment",
+		},
+		{
+			name:        "inherits workflow environment",
+			environment: "environment: production",
+			want:        "environment: production",
+		},
+		{
+			name:        "indents workflow environment object",
+			environment: "environment:\n  name: production\n  url: https://example.com",
+			want:        "environment:\n      name: production\n      url: https://example.com",
+		},
+		{
+			name:        "manual approval environment takes precedence",
+			environment: "environment: production",
+			approval:    "approval",
+			want:        "environment: approval",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := &WorkflowData{
+				Environment:    tt.environment,
+				ManualApproval: tt.approval,
+			}
+			job, err := NewCompiler().buildActivationJob(data, false, "", "test.lock.yml")
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, job.Environment)
+		})
+	}
+}
+
+func TestBuildActivationJob_ManualApprovalPreservesEnvironmentDeployment(t *testing.T) {
+	data := &WorkflowData{
+		Environment:    "environment:\n  name: production\n  url: https://example.com\n  deployment: false",
+		ManualApproval: "approval",
+	}
+
+	job, err := NewCompiler().buildActivationJob(data, false, "", "test.lock.yml")
+	require.NoError(t, err)
+
+	var compiled map[string]any
+	require.NoError(t, yaml.Unmarshal([]byte(job.Environment), &compiled))
+	assert.Equal(t, map[string]any{
+		"name":       "approval",
+		"url":        "https://example.com",
+		"deployment": false,
+	}, compiled["environment"])
+}
+
 // TestBuildActivationJob_OAuthTokenCheckStep verifies that the activation job
 // includes a step to check for OAuth tokens in COPILOT_GITHUB_TOKEN, GH_AW_GITHUB_TOKEN,
 // and GH_AW_GITHUB_MCP_SERVER_TOKEN.
@@ -370,6 +431,36 @@ func TestBuildActivationJob_OAuthTokenCheckStep_EngineEnvOverride(t *testing.T) 
 
 	assert.Contains(t, stepsStr, "COPILOT_GITHUB_TOKEN: ${{ secrets.MY_ORG_COPILOT_TOKEN }}", "Overridden COPILOT_GITHUB_TOKEN expression should be used in OAuth check step")
 	assert.NotContains(t, stepsStr, "COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}", "Default COPILOT_GITHUB_TOKEN expression should not appear when overridden")
+}
+
+// TestBuildActivationJob_OAuthTokenCheckStep_EngineEnvOverrideMultiline verifies that
+// multiline engine.env overrides are emitted as a YAML literal block scalar in the OAuth check step.
+func TestBuildActivationJob_OAuthTokenCheckStep_EngineEnvOverrideMultiline(t *testing.T) {
+	compiler := NewCompiler()
+
+	workflowData := &WorkflowData{
+		Name:            "Test Workflow",
+		MarkdownContent: "# Test\n\nContent",
+		EngineConfig: &EngineConfig{
+			ID: "copilot",
+			Env: map[string]string{
+				constants.CopilotGitHubToken: "${{ secrets.EXAMPLE_TOKEN_A != '' && secrets.EXAMPLE_TOKEN_A ||\n    secrets.EXAMPLE_TOKEN_B != '' && secrets.EXAMPLE_TOKEN_B ||\n    secrets.EXAMPLE_TOKEN_C }}",
+			},
+		},
+	}
+
+	job, err := compiler.buildActivationJob(workflowData, false, "", "test.lock.yml")
+	require.NoError(t, err)
+	require.NotNil(t, job)
+
+	stepsStr := strings.Join(job.Steps, "")
+
+	assert.Contains(t, stepsStr, "id: check-oauth-tokens", "Activation job should contain OAuth token check step")
+	assert.Contains(t, stepsStr, "          COPILOT_GITHUB_TOKEN: |\n", "Multiline override should be emitted as a literal block scalar")
+	assert.Contains(t, stepsStr, "            ${{ secrets.EXAMPLE_TOKEN_A != '' && secrets.EXAMPLE_TOKEN_A ||\n", "First line should be indented under the block scalar")
+	assert.Contains(t, stepsStr, "                secrets.EXAMPLE_TOKEN_B != '' && secrets.EXAMPLE_TOKEN_B ||\n", "Continuation indentation should be preserved")
+	assert.Contains(t, stepsStr, "                secrets.EXAMPLE_TOKEN_C }}\n", "Final continuation line should be preserved")
+	assert.NotContains(t, stepsStr, "COPILOT_GITHUB_TOKEN: ${{ secrets.EXAMPLE_TOKEN_A != '' && secrets.EXAMPLE_TOKEN_A ||", "Multiline override should not be emitted inline")
 }
 
 // TestBuildActivationJob_OAuthCheckAfterSecretValidation verifies the step order:
@@ -539,7 +630,7 @@ func TestExtractPreActivationCustomFields_InvalidSteps(t *testing.T) {
 
 	steps, outputs, err := compiler.extractPreActivationCustomFields(jobs)
 	require.Error(t, err, "Should return error for invalid steps format")
-	assert.Contains(t, err.Error(), "must be an array", "Error should mention array requirement")
+	require.ErrorContains(t, err, "must be an array", "Error should mention array requirement")
 	assert.Empty(t, steps, "Should have no steps with invalid format")
 	assert.Empty(t, outputs, "Should have no outputs with invalid format")
 }

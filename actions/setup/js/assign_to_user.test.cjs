@@ -78,6 +78,57 @@ describe("assign_to_user (Handler Factory Architecture)", () => {
     });
   });
 
+  it("should include issue-intent metadata when enabled", async () => {
+    mockGithub.rest.issues.addAssignees.mockResolvedValue({});
+
+    const message = {
+      type: "assign_to_user",
+      assignees: ["user1"],
+      rationale: "Primary maintainer for impacted area",
+      confidence: "low",
+    };
+
+    const result = await handler(message, {});
+
+    expect(result.success).toBe(true);
+    expect(mockGithub.rest.issues.addAssignees).toHaveBeenCalledWith({
+      owner: "test-owner",
+      repo: "test-repo",
+      issue_number: 123,
+      assignees: ["user1"],
+      rationale: "Primary maintainer for impacted area",
+      confidence: "LOW",
+    });
+  });
+
+  it("should omit issue-intent metadata when disabled", async () => {
+    const { main } = require("./assign_to_user.cjs");
+    const noIntentHandler = await main({
+      max: 10,
+      allowed: ["user1", "user2", "user3"],
+      issue_intent: false,
+    });
+    mockGithub.rest.issues.addAssignees.mockResolvedValue({});
+
+    const result = await noIntentHandler(
+      {
+        type: "assign_to_user",
+        assignees: ["user1"],
+        rationale: "Primary maintainer for impacted area",
+        confidence: "high",
+      },
+      {}
+    );
+
+    expect(result.success).toBe(true);
+    expect(mockGithub.rest.issues.addAssignees).toHaveBeenCalledWith({
+      owner: "test-owner",
+      repo: "test-repo",
+      issue_number: 123,
+      assignees: ["user1"],
+    });
+  });
+
   it("should support singular assignee field", async () => {
     mockGithub.rest.issues.addAssignees.mockResolvedValue({});
 
@@ -99,6 +150,8 @@ describe("assign_to_user (Handler Factory Architecture)", () => {
   });
 
   it("should use explicit issue number from message", async () => {
+    const { main } = require("./assign_to_user.cjs");
+    handler = await main({ max: 10, allowed: ["user1"], target: "*" });
     mockGithub.rest.issues.addAssignees.mockResolvedValue({});
 
     const message = {
@@ -183,7 +236,7 @@ describe("assign_to_user (Handler Factory Architecture)", () => {
     const result = await handler(message, {});
 
     expect(result.success).toBe(false);
-    expect(result.error).toContain("No issue number available");
+    expect(result.error).toContain("not running in issue context");
     expect(mockGithub.rest.issues.addAssignees).not.toHaveBeenCalled();
 
     // Restore context
@@ -244,6 +297,7 @@ describe("assign_to_user (Handler Factory Architecture)", () => {
     const { main } = require("./assign_to_user.cjs");
     const targetRepoHandler = await main({
       max: 10,
+      target: "*",
       "target-repo": "external-org/external-repo",
     });
     const addAssigneesCalls = [];
@@ -271,6 +325,7 @@ describe("assign_to_user (Handler Factory Architecture)", () => {
     const { main } = require("./assign_to_user.cjs");
     const crossRepoHandler = await main({
       max: 10,
+      target: "*",
       "target-repo": "default-org/default-repo",
       allowed_repos: ["cross-org/cross-repo"],
     });
@@ -322,6 +377,7 @@ describe("assign_to_user (Handler Factory Architecture)", () => {
     const { main } = require("./assign_to_user.cjs");
     const handler = await main({
       max: 10,
+      target: "*",
       "target-repo": "github/default-repo",
       allowed_repos: ["github/gh-aw"],
     });

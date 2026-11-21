@@ -3,11 +3,13 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
@@ -22,23 +24,37 @@ import (
 var envCmdLog = logger.New("cli:env_command")
 
 const (
-	defaultsScopeRepo = "repo"
-	defaultsScopeOrg  = "org"
-	defaultsScopeEnt  = "ent"
+	defaultsScopeRepo      = "repo"
+	defaultsScopeOrg       = "org"
+	defaultsScopeEnt       = "ent"
+	defaultsVisibilityAll  = "all"
+	defaultsVisibilityPriv = "private"
+	defaultsVisibilitySel  = "selected"
 )
 
 type defaultsFile struct {
-	DefaultMaxAICredits          *string `yaml:"default_max_ai_credits"`
-	DefaultMaxTurnCacheMisses    *string `yaml:"default_max_turn_cache_misses"`
-	DefaultDetectionMaxAICredits *string `yaml:"default_detection_max_ai_credits"`
-	DefaultMaxDailyAICredits     *string `yaml:"default_max_daily_ai_credits"`
-	DefaultMaxTurns              *string `yaml:"default_max_turns"`
-	DefaultTimeoutMinutes        *string `yaml:"default_timeout_minutes"`
-	DefaultDetectionModel        *string `yaml:"default_detection_model"`
-	DefaultUTC                   *string `yaml:"default_utc"`
-	DefaultModelCopilot          *string `yaml:"default_model_copilot"`
-	DefaultModelClaude           *string `yaml:"default_model_claude"`
-	DefaultModelCodex            *string `yaml:"default_model_codex"`
+	DefaultAdmissionURL                    *string `yaml:"default_admission_url"`
+	DefaultAdmissionAudience               *string `yaml:"default_admission_audience"`
+	DefaultAdmissionOnOutage               *string `yaml:"default_admission_on_outage"`
+	DefaultSafeOutputAuthorizationURL      *string `yaml:"default_safe_output_authorization_url"`
+	DefaultSafeOutputAuthorizationAudience *string `yaml:"default_safe_output_authorization_audience"`
+	DefaultArtifactRetentionDays           *string `yaml:"default_artifact_retention_days"`
+	DefaultMaxAICredits                    *string `yaml:"default_max_ai_credits"`
+	DefaultMaxTurnCacheMisses              *string `yaml:"default_max_turn_cache_misses"`
+	DefaultDetectionMaxAICredits           *string `yaml:"default_detection_max_ai_credits"`
+	DefaultMaxDailyAICredits               *string `yaml:"default_max_daily_ai_credits"`
+	DefaultMaxTurns                        *string `yaml:"default_max_turns"`
+	DefaultTimeoutMinutes                  *string `yaml:"default_timeout_minutes"`
+	DefaultAgentJobTimeoutMinutes          *string `yaml:"default_agent_job_timeout_minutes"`
+	DefaultDetectionJobTimeoutMinutes      *string `yaml:"default_detection_job_timeout_minutes"`
+	DefaultDetectionModel                  *string `yaml:"default_detection_model"`
+	DefaultOTLPEndpoint                    *string `yaml:"default_otlp_endpoint"`
+	DefaultOTLPProtocol                    *string `yaml:"default_otlp_protocol"`
+	DefaultOTLPMetrics                     *string `yaml:"default_otel_metrics"`
+	DefaultUTC                             *string `yaml:"default_utc"`
+	DefaultModelCopilot                    *string `yaml:"default_model_copilot"`
+	DefaultModelClaude                     *string `yaml:"default_model_claude"`
+	DefaultModelCodex                      *string `yaml:"default_model_codex"`
 }
 
 type defaultsBinding struct {
@@ -53,6 +69,7 @@ type defaultsTarget struct {
 	repoName   string
 	org        string
 	enterprise string
+	visibility string
 }
 
 type defaultsUpdateChange struct {
@@ -94,13 +111,24 @@ func (e *defaultsGHError) Unwrap() error {
 }
 
 var defaultsBindings = []defaultsBinding{
+	{envName: compilerenv.DefaultAdmissionURL, fieldName: "default_admission_url", get: func(f *defaultsFile) **string { return &f.DefaultAdmissionURL }},
+	{envName: compilerenv.DefaultAdmissionAudience, fieldName: "default_admission_audience", get: func(f *defaultsFile) **string { return &f.DefaultAdmissionAudience }},
+	{envName: compilerenv.DefaultAdmissionOnOutage, fieldName: "default_admission_on_outage", get: func(f *defaultsFile) **string { return &f.DefaultAdmissionOnOutage }},
+	{envName: compilerenv.DefaultSafeOutputAuthorizationURL, fieldName: "default_safe_output_authorization_url", get: func(f *defaultsFile) **string { return &f.DefaultSafeOutputAuthorizationURL }},
+	{envName: compilerenv.DefaultSafeOutputAuthorizationAudience, fieldName: "default_safe_output_authorization_audience", get: func(f *defaultsFile) **string { return &f.DefaultSafeOutputAuthorizationAudience }},
+	{envName: compilerenv.DefaultArtifactRetentionDays, fieldName: "default_artifact_retention_days", get: func(f *defaultsFile) **string { return &f.DefaultArtifactRetentionDays }},
 	{envName: compilerenv.DefaultMaxAICredits, fieldName: "default_max_ai_credits", get: func(f *defaultsFile) **string { return &f.DefaultMaxAICredits }},
 	{envName: compilerenv.DefaultMaxTurnCacheMisses, fieldName: "default_max_turn_cache_misses", get: func(f *defaultsFile) **string { return &f.DefaultMaxTurnCacheMisses }},
 	{envName: compilerenv.DefaultDetectionMaxAICredits, fieldName: "default_detection_max_ai_credits", get: func(f *defaultsFile) **string { return &f.DefaultDetectionMaxAICredits }},
 	{envName: compilerenv.DefaultMaxDailyAICredits, fieldName: "default_max_daily_ai_credits", get: func(f *defaultsFile) **string { return &f.DefaultMaxDailyAICredits }},
 	{envName: compilerenv.DefaultMaxTurns, fieldName: "default_max_turns", get: func(f *defaultsFile) **string { return &f.DefaultMaxTurns }},
 	{envName: compilerenv.DefaultTimeoutMinutes, fieldName: "default_timeout_minutes", get: func(f *defaultsFile) **string { return &f.DefaultTimeoutMinutes }},
+	{envName: compilerenv.DefaultAgentJobTimeoutMinutes, fieldName: "default_agent_job_timeout_minutes", get: func(f *defaultsFile) **string { return &f.DefaultAgentJobTimeoutMinutes }},
+	{envName: compilerenv.DefaultDetectionJobTimeoutMinutes, fieldName: "default_detection_job_timeout_minutes", get: func(f *defaultsFile) **string { return &f.DefaultDetectionJobTimeoutMinutes }},
 	{envName: compilerenv.DefaultDetectionModel, fieldName: "default_detection_model", get: func(f *defaultsFile) **string { return &f.DefaultDetectionModel }},
+	{envName: compilerenv.DefaultOTLPEndpoint, fieldName: "default_otlp_endpoint", get: func(f *defaultsFile) **string { return &f.DefaultOTLPEndpoint }},
+	{envName: compilerenv.OTLPProtocol, fieldName: "default_otlp_protocol", get: func(f *defaultsFile) **string { return &f.DefaultOTLPProtocol }},
+	{envName: compilerenv.OTLPMetrics, fieldName: "default_otel_metrics", get: func(f *defaultsFile) **string { return &f.DefaultOTLPMetrics }},
 	{envName: compilerenv.DefaultUTC, fieldName: "default_utc", get: func(f *defaultsFile) **string { return &f.DefaultUTC }},
 	{envName: compilerenv.DefaultModelCopilot, fieldName: "default_model_copilot", get: func(f *defaultsFile) **string { return &f.DefaultModelCopilot }},
 	{envName: compilerenv.DefaultModelClaude, fieldName: "default_model_claude", get: func(f *defaultsFile) **string { return &f.DefaultModelClaude }},
@@ -113,10 +141,12 @@ var defaultsGetCurrentRepoSlug = GetCurrentRepoSlug
 func NewEnvCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "env",
-		Short: "Manage compiler defaults as GitHub variables",
-		Long: `Manage compiler default variables in batch for repository, organization, or enterprise scope.
+		Short: "Manage compiler defaults as GitHub Actions variables",
+		Long: `Manage compiler default variables in bulk for a repository, organization, or enterprise scope.
 
 The YAML file is flat and uses default_-prefixed lowercase keys (e.g., default_max_turns).
+The default_otlp_protocol field manages the standard OTEL_EXPORTER_OTLP_PROTOCOL variable.
+The default_otel_metrics field manages GH_AW_OTEL_METRICS; when unset, workflows enable metrics by default.
 Set a field to null (or omit it) in update mode to delete the variable from the selected scope.
 Any field with a non-null string value will be set or updated.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -126,6 +156,8 @@ Any field with a non-null string value will be set or updated.`,
 
 	cmd.AddCommand(newDefaultsGetCommand())
 	cmd.AddCommand(newDefaultsUpdateCommand())
+	cmd.AddCommand(newEnvOTELCommand())
+	cmd.AddCommand(newLegacyGHGuardSubcommand())
 	return cmd
 }
 
@@ -134,7 +166,7 @@ func newDefaultsGetCommand() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "get [file]",
-		Short: "Download defaults into a YAML file",
+		Short: "Download default compiler variables into a YAML file",
 		Long: `Download compiler defaults into a YAML file.
 
 When [file] is omitted, the command writes to file.yml in the current directory.
@@ -147,10 +179,10 @@ Scope resolution:
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			outputFile := "file.yml"
-			if len(args) == 1 {
+			if len(args) > 0 {
 				outputFile = args[0]
 			}
-			target, err := resolveDefaultsTarget(scope, repo, org, enterprise, false)
+			target, err := resolveDefaultsTarget(scope, repo, org, enterprise, "", false)
 			if err != nil {
 				return err
 			}
@@ -159,19 +191,19 @@ Scope resolution:
 	}
 
 	cmd.Flags().StringVar(&scope, "scope", "", "Variable scope (repo|org|ent). Defaults to repo")
-	cmd.Flags().StringVarP(&repo, "repo", "r", "", "Target repository in owner/repo format. When omitted, defaults to current repository")
+	cmd.Flags().StringVarP(&repo, "repo", "r", "", "Target repository (owner/repo format only; GHES host prefixes are not supported). Defaults to current repository")
 	cmd.Flags().StringVar(&org, "org", "", "Target organization (required for --scope org unless inferable from --repo/current repo)")
 	cmd.Flags().StringVar(&enterprise, "enterprise", "", "Target enterprise slug (required for --scope ent)")
 	return cmd
 }
 
 func newDefaultsUpdateCommand() *cobra.Command {
-	var scope, repo, org, enterprise string
+	var scope, repo, org, enterprise, visibility string
 	var yes, dryRun bool
 
 	cmd := &cobra.Command{
 		Use:   "update [file]",
-		Short: "Upload defaults from a YAML file",
+		Short: "Upload default compiler variables from a YAML file",
 		Long: `Upload compiler defaults from a YAML file.
 
 When [file] is omitted, the command reads from file.yml in the current directory.
@@ -181,15 +213,19 @@ Scope and flag behavior:
 - repo scope uses --repo owner/repo, or the current repository when --repo is omitted.
 - org scope uses --org when provided; otherwise it infers the organization from --repo (or the current repository).
 - ent scope requires --enterprise <slug>.
+- --visibility controls access when creating org or ent variables (all|private|selected). Existing variables keep their visibility.
 - --dry-run previews planned changes and exits without applying updates.
 - --yes skips the confirmation prompt for real updates; it has no effect with --dry-run.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			inputFile := "file.yml"
-			if len(args) == 1 {
+			if len(args) > 0 {
 				inputFile = args[0]
 			}
-			target, err := resolveDefaultsTarget(scope, repo, org, enterprise, true)
+			if err := validateDefaultsVisibility(scope, visibility, cmd.Flags().Changed("visibility")); err != nil {
+				return errors.New(console.FormatErrorMessage(err.Error()))
+			}
+			target, err := resolveDefaultsTarget(scope, repo, org, enterprise, visibility, true)
 			if err != nil {
 				return err
 			}
@@ -198,9 +234,10 @@ Scope and flag behavior:
 	}
 
 	cmd.Flags().StringVar(&scope, "scope", "", "Variable scope (repo|org|ent)")
-	cmd.Flags().StringVarP(&repo, "repo", "r", "", "Target repository in owner/repo format. When omitted, defaults to current repository")
+	cmd.Flags().StringVarP(&repo, "repo", "r", "", "Target repository (owner/repo format only; GHES host prefixes are not supported). Defaults to current repository")
 	cmd.Flags().StringVar(&org, "org", "", "Target organization (required for --scope org unless inferable from --repo/current repo)")
 	cmd.Flags().StringVar(&enterprise, "enterprise", "", "Target enterprise slug (required for --scope ent)")
+	cmd.Flags().StringVar(&visibility, "visibility", defaultsVisibilityAll, "Visibility for newly created org or ent variables (all|private|selected)")
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "Skip confirmation prompt")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Preview updates without applying any changes")
 	_ = cmd.MarkFlagRequired("scope")
@@ -287,6 +324,15 @@ func defaultsParseFile(inputFile string, data []byte) (defaultsFile, error) {
 func defaultsValidateFile(file *defaultsFile) error {
 	var validationErrors []string
 
+	if err := validateAdmissionDefaults(file); err != nil {
+		validationErrors = append(validationErrors, err.Error())
+	}
+	if err := validateSafeOutputAuthorizationDefaults(file); err != nil {
+		validationErrors = append(validationErrors, err.Error())
+	}
+	if err := validateDefaultArtifactRetentionDays(file.DefaultArtifactRetentionDays); err != nil {
+		validationErrors = append(validationErrors, err.Error())
+	}
 	validateNonZeroInt := func(field string, value *string) {
 		if value == nil {
 			return
@@ -315,29 +361,91 @@ func defaultsValidateFile(file *defaultsFile) error {
 			validationErrors = append(validationErrors, field+" cannot be empty when set")
 		}
 	}
-	validateUTCOffset := func(field string, value *string) {
-		if value == nil {
-			return
-		}
-		if _, err := workflow.NormalizeUTCOffset(*value); err != nil {
-			validationErrors = append(validationErrors, field+" "+err.Error())
-		}
-	}
-
 	validateNonZeroInt("default_max_ai_credits", file.DefaultMaxAICredits)
 	validatePositiveInt("default_max_turn_cache_misses", file.DefaultMaxTurnCacheMisses)
 	validateNonZeroInt("default_detection_max_ai_credits", file.DefaultDetectionMaxAICredits)
 	validateNonZeroInt("default_max_daily_ai_credits", file.DefaultMaxDailyAICredits)
 	validatePositiveInt("default_max_turns", file.DefaultMaxTurns)
 	validatePositiveInt("default_timeout_minutes", file.DefaultTimeoutMinutes)
+	validatePositiveInt("default_agent_job_timeout_minutes", file.DefaultAgentJobTimeoutMinutes)
+	validatePositiveInt("default_detection_job_timeout_minutes", file.DefaultDetectionJobTimeoutMinutes)
 	validateNonEmpty("default_detection_model", file.DefaultDetectionModel)
-	validateUTCOffset("default_utc", file.DefaultUTC)
+	validationErrors = append(validationErrors, validateDefaultOTLP(file)...)
+	if err := validateDefaultUTCOffset(file.DefaultUTC); err != nil {
+		validationErrors = append(validationErrors, err.Error())
+	}
 	validateNonEmpty("default_model_copilot", file.DefaultModelCopilot)
 	validateNonEmpty("default_model_claude", file.DefaultModelClaude)
 	validateNonEmpty("default_model_codex", file.DefaultModelCodex)
 
 	if len(validationErrors) > 0 {
 		return fmt.Errorf("invalid defaults file: %s", strings.Join(validationErrors, "; "))
+	}
+	return nil
+}
+
+func validateDefaultOTLP(file *defaultsFile) []string {
+	var validationErrors []string
+	if protocol := file.DefaultOTLPProtocol; protocol != nil && *protocol != "http/json" && *protocol != "http/protobuf" {
+		validationErrors = append(validationErrors, `default_otlp_protocol must be http/json or http/protobuf when set, for example: "http/protobuf"`)
+	}
+	if metrics := file.DefaultOTLPMetrics; metrics != nil && *metrics != "true" && *metrics != "false" {
+		validationErrors = append(validationErrors, `default_otel_metrics must be "true" or "false" when set`)
+	}
+	return validationErrors
+}
+
+func validateDefaultUTCOffset(value *string) error {
+	if value == nil {
+		return nil
+	}
+	if _, err := workflow.NormalizeUTCOffset(*value); err != nil {
+		return fmt.Errorf("default_utc %w", err)
+	}
+	return nil
+}
+
+func validateAdmissionDefaults(file *defaultsFile) error {
+	invalidLiteral := func(value string) bool {
+		return strings.Contains(value, "${{") || strings.ContainsFunc(value, unicode.IsControl)
+	}
+	if value := file.DefaultAdmissionURL; value != nil && *value != "" {
+		u, err := url.Parse(*value)
+		validAuthority := true
+		if err == nil {
+			if port := u.Port(); port != "" {
+				number, portErr := strconv.Atoi(port)
+				validAuthority = portErr == nil && number >= 0 && number <= 65535
+			}
+			if strings.HasPrefix(u.Host, "[") && net.ParseIP(u.Hostname()) == nil {
+				validAuthority = false
+			}
+		}
+		if err != nil || invalidLiteral(*value) || strings.TrimSpace(*value) != *value ||
+			!validAuthority ||
+			u.Scheme != "https" || u.Hostname() == "" || u.User != nil ||
+			u.Path != "/api/admission" || u.RawPath != "" || u.RawQuery != "" || u.ForceQuery ||
+			u.Fragment != "" || strings.ContainsAny(*value, "\\#") ||
+			!strings.HasSuffix(*value, "/api/admission") {
+			return errors.New("default_admission_url must be an absolute HTTPS /api/admission URL without credentials, query, fragment, or expressions")
+		}
+	}
+	if value := file.DefaultAdmissionAudience; value != nil && invalidLiteral(*value) {
+		return errors.New("default_admission_audience must be a literal value without control characters or expressions")
+	}
+	if value := file.DefaultAdmissionOnOutage; value != nil && *value != "" && *value != "ignore" && *value != "block" {
+		return errors.New("default_admission_on_outage must be ignore or block")
+	}
+	return nil
+}
+
+func validateDefaultArtifactRetentionDays(value *string) error {
+	if value == nil {
+		return nil
+	}
+	days, err := strconv.Atoi(strings.TrimSpace(*value))
+	if err != nil || days < 1 || days > 400 {
+		return errors.New("default_artifact_retention_days must be an integer between 1 and 400 when set, for example: \"7\"")
 	}
 	return nil
 }
@@ -422,7 +530,19 @@ func defaultsUpdateRows(changes []defaultsUpdateChange) []defaultsUpdateRow {
 	return rows
 }
 
-func resolveDefaultsTarget(scope, repo, org, enterprise string, scopeRequired bool) (defaultsTarget, error) {
+func validateDefaultsVisibility(scope, visibility string, visibilitySet bool) error {
+	switch visibility {
+	case defaultsVisibilityAll, defaultsVisibilityPriv, defaultsVisibilitySel:
+	default:
+		return fmt.Errorf("invalid --visibility value %q. Expected one of all, private, selected. Example: gh aw env update defaults.yml --scope org --org my-org --visibility all", visibility)
+	}
+	if strings.TrimSpace(scope) == defaultsScopeRepo && visibilitySet {
+		return errors.New("--visibility is not valid for repo scope. Expected --scope org or --scope ent. Example: gh aw env update defaults.yml --scope org --org my-org --visibility all")
+	}
+	return nil
+}
+
+func resolveDefaultsTarget(scope, repo, org, enterprise, visibility string, scopeRequired bool) (defaultsTarget, error) {
 	normalizedScope := strings.TrimSpace(scope)
 	if normalizedScope == "" {
 		if scopeRequired {
@@ -463,13 +583,13 @@ func resolveDefaultsTarget(scope, repo, org, enterprise string, scopeRequired bo
 			}
 			targetOrg = owner
 		}
-		return defaultsTarget{scope: defaultsScopeOrg, org: targetOrg}, nil
+		return defaultsTarget{scope: defaultsScopeOrg, org: targetOrg, visibility: visibility}, nil
 	case defaultsScopeEnt:
 		targetEnt := strings.TrimSpace(enterprise)
 		if targetEnt == "" {
 			return defaultsTarget{}, errors.New("enterprise scope requires --enterprise <slug>")
 		}
-		return defaultsTarget{scope: defaultsScopeEnt, enterprise: targetEnt}, nil
+		return defaultsTarget{scope: defaultsScopeEnt, enterprise: targetEnt, visibility: visibility}, nil
 	default:
 		return defaultsTarget{}, fmt.Errorf("invalid scope %q; expected repo, org, or ent", scope)
 	}
@@ -493,7 +613,7 @@ func (t defaultsTarget) variableEndpoint(name string) string {
 func (t defaultsTarget) displayName() string {
 	switch t.scope {
 	case defaultsScopeRepo:
-		return t.repoOwner + "/" + t.repoName
+		return t.repoOwner + "/" + t.repoName //nolint:manualpathconcat // repository slug for display, not a filesystem path
 	case defaultsScopeOrg:
 		return t.org
 	default:
@@ -533,6 +653,9 @@ func fetchDefaultsVariable(target defaultsTarget, name string) (string, error) {
 }
 
 func upsertDefaultsVariable(target defaultsTarget, name, value string) error {
+	if err := validateActionsStorageValue(value); err != nil {
+		return err
+	}
 	patchOut, patchErr := runDefaultsGH("api", "-X", "PATCH", target.variableEndpoint(name), "-f", "name="+name, "-f", "value="+value)
 	if patchErr == nil {
 		return nil
@@ -542,9 +665,23 @@ func upsertDefaultsVariable(target defaultsTarget, name, value string) error {
 	}
 
 	envCmdLog.Printf("Variable %s not found via PATCH, creating via POST", name)
-	out, err := runDefaultsGH("api", "-X", "POST", target.variablesEndpoint(), "-f", "name="+name, "-f", "value="+value)
+	args := []string{"api", "-X", "POST", target.variablesEndpoint(), "-f", "name=" + name, "-f", "value=" + value}
+	if target.scope == defaultsScopeOrg || target.scope == defaultsScopeEnt {
+		args = append(args, "-f", "visibility="+target.visibility)
+	}
+	out, err := runDefaultsGH(args...)
 	if err != nil {
-		return fmt.Errorf("failed to set %s: %w", name, errWithOutput(err, out))
+		if (target.scope == defaultsScopeOrg || target.scope == defaultsScopeEnt) && isDefaultsMissingVisibilityError(err, out) {
+			scopeName := "organization"
+			example := "gh aw env update defaults.yml --scope org --org my-org --visibility all"
+			if target.scope == defaultsScopeEnt {
+				scopeName = "enterprise"
+				example = "gh aw env update defaults.yml --scope ent --enterprise my-ent --visibility all"
+			}
+			message := fmt.Sprintf("failed to create %s at %s scope: %s variables require a visibility. Expected one of all, private, selected. Example: %s", name, target.scope, scopeName, example)
+			return fmt.Errorf("%s: %w", message, errWithOutput(err, out))
+		}
+		return fmt.Errorf("failed to create %s at %s scope: %w", name, target.scope, errWithOutput(err, out))
 	}
 	return nil
 }
@@ -566,6 +703,17 @@ func isDefaultsNotFoundError(err error, out []byte) bool {
 		return strings.Contains(strings.ToLower(ghErr.output), "http 404")
 	}
 	return strings.Contains(strings.ToLower(string(out)), "http 404")
+}
+
+func isDefaultsMissingVisibilityError(err error, out []byte) bool {
+	if err == nil {
+		return false
+	}
+	response := strings.ToLower(string(out))
+	return strings.Contains(response, "http 422") &&
+		(strings.Contains(response, "missing visibility") ||
+			strings.Contains(response, `"visibility" is missing`) ||
+			(strings.Contains(response, "missing required") && strings.Contains(response, "visibility")))
 }
 
 func errWithOutput(err error, out []byte) error {

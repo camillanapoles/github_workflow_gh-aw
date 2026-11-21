@@ -7,6 +7,8 @@ import (
 	"context"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/github/gh-aw/pkg/console"
@@ -100,7 +102,19 @@ func TestAddInteractiveConfig_resolveEngineApiKeyCredential(t *testing.T) {
 	}
 }
 
+func TestAddInteractiveConfig_resolveEngineApiKeyCredential_ClaudeOAuthToken(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "private-oauth-token")
+
+	config := &AddInteractiveConfig{EngineOverride: "claude"}
+	_, _, err := config.resolveEngineApiKeyCredential()
+	require.ErrorContains(t, err, "CLAUDE_CODE_OAUTH_TOKEN")
+	require.ErrorContains(t, err, "ANTHROPIC_API_KEY")
+	assert.NotContains(t, err.Error(), "private-oauth-token")
+}
+
 func TestAddInteractiveConfig_configureEngineAPISecret_noWriteAccess(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name   string
 		engine string
@@ -121,6 +135,7 @@ func TestAddInteractiveConfig_configureEngineAPISecret_noWriteAccess(t *testing.
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			config := &AddInteractiveConfig{
 				EngineOverride:  tt.engine,
 				RepoOverride:    "owner/repo",
@@ -137,6 +152,7 @@ func TestAddInteractiveConfig_configureEngineAPISecret_noWriteAccess(t *testing.
 }
 
 func TestAddInteractiveConfig_configureEngineAPISecret_skipSecret(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name   string
 		engine string
@@ -157,6 +173,7 @@ func TestAddInteractiveConfig_configureEngineAPISecret_skipSecret(t *testing.T) 
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			config := &AddInteractiveConfig{
 				EngineOverride:  tt.engine,
 				RepoOverride:    "owner/repo",
@@ -205,6 +222,7 @@ func TestAddInteractiveConfig_selectAIEngineAndKey_engineOverrideFormatsInfoMess
 }
 
 func TestParseSecretNames(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		input    []byte
@@ -249,22 +267,88 @@ func TestParseSecretNames(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			result := parseSecretNames(tt.input)
 			assert.Equal(t, tt.expected, result, "parseSecretNames output should match expected")
 		})
 	}
 }
 
-func TestAddInteractiveConfig_checkExistingSecrets(t *testing.T) {
+func TestAddInteractiveConfig_addRepositorySecret_UsesStdinForSecretValue(t *testing.T) {
+	fakeBinDir := t.TempDir()
+	fakeGH := filepath.Join(fakeBinDir, "gh")
+	argsLog := filepath.Join(fakeBinDir, "gh-args.log")
+	stdinLog := filepath.Join(fakeBinDir, "gh-stdin.log")
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> \"" + argsLog + "\"\n" +
+		"cat > \"" + stdinLog + "\"\n" +
+		"exit 0\n"
+	require.NoError(t, os.WriteFile(fakeGH, []byte(script), 0o755))
+	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
 	config := &AddInteractiveConfig{
-		RepoOverride: "test-owner/test-repo",
+		Ctx:          t.Context(),
+		RepoOverride: "owner/repo",
+	}
+	err := config.addRepositorySecret("TEST_SECRET", "super-secret-value")
+	require.NoError(t, err)
+
+	argsBytes, readArgsErr := os.ReadFile(argsLog)
+	require.NoError(t, readArgsErr)
+	args := string(argsBytes)
+	assert.Contains(t, args, "secret set TEST_SECRET --repo owner/repo")
+	assert.NotContains(t, args, "--body")
+	assert.NotContains(t, args, "super-secret-value")
+
+	stdinBytes, readStdinErr := os.ReadFile(stdinLog)
+	require.NoError(t, readStdinErr)
+	assert.Equal(t, "super-secret-value", strings.TrimSpace(string(stdinBytes)))
+}
+
+func TestAddInteractiveConfig_checkExistingSecrets(t *testing.T) {
+	originalRunGH := addInteractiveRunGH
+	t.Cleanup(func() { addInteractiveRunGH = originalRunGH })
+
+	addInteractiveRunGH = func(_ string, args ...string) ([]byte, error) {
+		switch args[1] {
+		case "/repos/test-owner/test-repo/actions/secrets":
+			return []byte("REPOSITORY_SECRET\n"), nil
+		case "/orgs/test-owner/actions/secrets":
+			assert.Contains(t, args, "--paginate")
+			assert.Contains(t, args, "--slurp")
+			return []byte(`[{"secrets":[
+				{"name":"ALL_SECRET","visibility":"all"},
+				{"name":"PRIVATE_SECRET","visibility":"private"},
+				{"name":"SELECTED_SECRET","visibility":"selected"},
+				{"name":"INACCESSIBLE_SECRET","visibility":"selected"}
+			]},{"secrets":[{"name":"PAGINATED_SECRET","visibility":"all"}]}]`), nil
+		case "/orgs/test-owner/actions/secrets/SELECTED_SECRET/repositories":
+			assert.Contains(t, args, "--paginate")
+			return []byte("test-owner/test-repo\n"), nil
+		case "/orgs/test-owner/actions/secrets/INACCESSIBLE_SECRET/repositories":
+			assert.Contains(t, args, "--paginate")
+			return []byte("test-owner/another-repo\n"), nil
+		default:
+			t.Fatalf("unexpected gh api arguments: %v", args)
+			return nil, nil
+		}
 	}
 
-	// This test requires GitHub CLI access, so we just verify it doesn't panic
-	// and initializes the existingSecrets map
-	require.NotPanics(t, func() {
-		_ = config.checkExistingSecrets()
-	}, "checkExistingSecrets should not panic")
+	config := &AddInteractiveConfig{RepoOverride: "test-owner/test-repo", repositoryVisibility: "private"}
+	require.NoError(t, config.checkExistingSecrets())
 
-	assert.NotNil(t, config.existingSecrets, "existingSecrets map should be initialized")
+	assert.Contains(t, config.existingSecrets, "REPOSITORY_SECRET")
+	assert.Contains(t, config.existingSecrets, "ALL_SECRET")
+	assert.Contains(t, config.existingSecrets, "PRIVATE_SECRET")
+	assert.Contains(t, config.existingSecrets, "SELECTED_SECRET")
+	assert.Contains(t, config.existingSecrets, "PAGINATED_SECRET")
+	assert.NotContains(t, config.existingSecrets, "INACCESSIBLE_SECRET")
+	assert.Equal(t, secretSourceRepository, config.secretSources["REPOSITORY_SECRET"])
+	assert.Equal(t, secretSourceOrganizationSelected, config.secretSources["SELECTED_SECRET"])
+
+	config.repositoryVisibility = "internal"
+	assert.False(t, config.organizationSecretAvailable("test-owner", organizationSecret{
+		Name:       "PRIVATE_SECRET",
+		Visibility: "private",
+	}))
 }

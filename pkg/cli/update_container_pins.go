@@ -11,8 +11,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/github/gh-aw/pkg/actionpins"
 	"github.com/github/gh-aw/pkg/console"
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/ctxutil"
 	"github.com/github/gh-aw/pkg/fileutil"
 	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/sliceutil"
@@ -21,13 +23,13 @@ import (
 
 var containerPinsLog = logger.New("cli:update_container_pins")
 
-// imageFailure pairs a container image tag with the human-readable reason it
-// could not be pinned, so the summary can surface actionable details.
-type imageFailure struct {
-	// image is the container image tag, e.g. "ghcr.io/github/github-mcp-server:v0.32.0".
-	image string
-	// reason is the human-readable error message explaining why digest resolution failed.
-	reason string
+type containerDigestResolutionError struct {
+	reason  string
+	details string
+}
+
+func (e *containerDigestResolutionError) Error() string {
+	return "could not resolve container digest without downloading image layers (" + e.reason + "): " + e.details
 }
 
 // dockerImagesArgPattern matches the download_docker_images.sh invocation in lock files
@@ -43,6 +45,56 @@ var dockerImagesArgPattern = regexp.MustCompile(`download_docker_images\.sh"?\s+
 // in practice and are not expected here.
 var buildxDigestPattern = regexp.MustCompile(`(?m)^Digest:\s+(sha256:[a-f0-9]{64})`)
 
+var registryAuthErrorPattern = regexp.MustCompile(`(?i)(?:^|[\s:])(denied|unauthorized|forbidden):`)
+
+type containerPinUpdateDeps struct {
+	fetchDigest func(ctx context.Context, image string, verbose bool) (string, error)
+}
+
+type containerPinUpdateOptions struct {
+	refreshExisting     bool
+	failOnResolveErrors bool
+	// refreshBuiltins re-resolves built-in images from the registry instead of using
+	// the compiler's embedded pins. Used when refreshing the trusted pins themselves.
+	refreshBuiltins bool
+}
+
+// isBuiltinContainerImage reports whether image (without digest) is a container that the
+// compiler injects itself (firewall, MCP gateway, router, gh-aw-node, GitHub MCP server).
+func isBuiltinContainerImage(image string) bool {
+	repo := image
+	if lastSlash := strings.LastIndex(repo, "/"); lastSlash >= 0 {
+		if colon := strings.LastIndex(repo[lastSlash:], ":"); colon >= 0 {
+			repo = repo[:lastSlash+colon]
+		}
+	}
+	switch repo {
+	case constants.DefaultMCPGatewayContainer, constants.DefaultRouterRegistry, constants.DefaultGhAwNodeImage, githubMCPServerImage:
+		return true
+	}
+	return strings.HasPrefix(repo, constants.DefaultFirewallRegistry+"/")
+}
+
+const githubMCPServerImage = "ghcr.io/github/github-mcp-server"
+
+// compilerContainerPin returns the compiler's embedded pin for a built-in image so that
+// update and upgrade keep built-in containers matched to the running compiler instead of
+// re-resolving the tag from the registry.
+func compilerContainerPin(image string, opts containerPinUpdateOptions) (actionpins.ContainerPin, bool) {
+	if opts.refreshBuiltins || !isBuiltinContainerImage(image) {
+		return actionpins.ContainerPin{}, false
+	}
+	pin, ok := actionpins.GetContainerPin(image)
+	if !ok || pin.Digest == "" || pin.PinnedImage == "" {
+		return actionpins.ContainerPin{}, false
+	}
+	return pin, true
+}
+
+func defaultContainerPinUpdateDeps() containerPinUpdateDeps {
+	return containerPinUpdateDeps{fetchDigest: fetchContainerDigest}
+}
+
 // UpdateContainerPins resolves SHA-256 digests for all container images referenced in
 // the compiled lock files under workflowDir and stores the pins in
 // .github/aw/actions-lock.json.
@@ -51,12 +103,20 @@ var buildxDigestPattern = regexp.MustCompile(`(?m)^Digest:\s+(sha256:[a-f0-9]{64
 // as they are already pinned. Images without a cached pin are queried via the
 // Docker CLI ("docker buildx imagetools inspect").
 //
-// When Docker is unavailable the function logs a warning and returns nil so that
-// the overall upgrade flow is not interrupted.
+// Built-in images injected by the compiler (firewall, MCP gateway, router, gh-aw-node,
+// GitHub MCP server) use the compiler's embedded pins when available so they always
+// match the running compiler, rather than being re-resolved from the registry.
+//
+// Resolution failures produce a short informational summary and return nil so
+// that the overall upgrade flow is not interrupted.
 //
 // Returns true when new container pins were added and lock files should be
 // recompiled to embed the digest references.
 func UpdateContainerPins(ctx context.Context, workflowDir string, verbose bool) (bool, error) {
+	return updateContainerPins(ctx, defaultContainerPinUpdateDeps(), workflowDir, verbose, containerPinUpdateOptions{})
+}
+
+func updateContainerPins(ctx context.Context, deps containerPinUpdateDeps, workflowDir string, verbose bool, opts containerPinUpdateOptions) (bool, error) {
 	containerPinsLog.Print("Starting container pin update")
 
 	if verbose {
@@ -69,7 +129,7 @@ func UpdateContainerPins(ctx context.Context, workflowDir string, verbose bool) 
 		containerPinsLog.Printf("Failed to collect images from lock files: %v", err)
 		// Non-fatal — just skip
 		if verbose {
-			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Warning: Failed to collect container images: %v", err)))
+			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to collect container images: %v", err)))
 		}
 		return false, nil
 	}
@@ -92,18 +152,10 @@ func UpdateContainerPins(ctx context.Context, workflowDir string, verbose bool) 
 		}
 	}
 
-	// Build a set of base image tags (without @sha256: digest suffix) currently
-	// referenced in the compiled lock files so that stale entries (e.g. superseded
-	// AWF versions) can be pruned. Lock files that were previously compiled may
-	// already embed pinned references (image:tag@sha256:...), so we strip the
-	// digest before comparing against container pin keys, which always use the
-	// base tag as the key.
-	imageSet := make(map[string]struct {
-	}, len(images))
+	imageSet := make(map[string]struct{}, len(images))
 	for _, img := range images {
 		base, _, _ := strings.Cut(img, "@sha256:")
-		imageSet[base] = struct {
-		}{}
+		imageSet[base] = struct{}{}
 	}
 
 	// Remove any container pin entries that are no longer referenced by the
@@ -120,34 +172,79 @@ func UpdateContainerPins(ctx context.Context, workflowDir string, verbose bool) 
 		pinnedImage string // image@sha256:...
 	}
 	var updatedImages []pinnedEntry
-	var failedImages []imageFailure
+	failedCount := 0
+	failureReasons := make(map[string]struct{})
 	var skippedImages []string
 
-	for _, image := range images {
-		// Images already containing @sha256: are immutably pinned — skip them.
-		if strings.Contains(image, "@sha256:") {
-			skippedImages = append(skippedImages, image)
+	type digestResult struct {
+		digest string
+		err    error
+	}
+	results := make([]digestResult, len(images))
+	jobs := make([]func(), 0, len(images))
+	for i, image := range images {
+		if _, ok := compilerContainerPin(image, opts); ok {
 			continue
 		}
+		pin, found := actionCache.GetContainerPin(image)
+		if found && pin.Digest != "" && !opts.refreshExisting {
+			continue
+		}
+		jobs = append(jobs, func() {
+			results[i].digest, results[i].err = deps.fetchDigest(ctx, image, verbose)
+		})
+	}
+	if err := runUpdateNetworkJobs(ctx, jobs); err != nil {
+		return false, err
+	}
 
-		// Check if we already have a valid pin for this image in the cache.
-		if pin, ok := actionCache.GetContainerPin(image); ok && pin.Digest != "" {
+	for i, image := range images {
+		existingPin, hasExistingPin := actionCache.GetContainerPin(image)
+		if builtinPin, ok := compilerContainerPin(image, opts); ok {
+			if hasExistingPin && existingPin.Digest == builtinPin.Digest && existingPin.PinnedImage == builtinPin.PinnedImage {
+				skippedImages = append(skippedImages, image)
+				continue
+			}
+			containerPinsLog.Printf("Pinning built-in image %s to compiler digest %s", image, builtinPin.Digest)
+			actionCache.SetContainerPin(image, builtinPin.Digest, builtinPin.PinnedImage)
+			updatedImages = append(updatedImages, pinnedEntry{image: image, pinnedImage: builtinPin.PinnedImage})
 			if verbose {
-				fmt.Fprintln(os.Stderr, console.FormatVerboseMessage(fmt.Sprintf("%s already pinned: %s", image, pin.Digest)))
+				fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("Pinned built-in %s → %s (compiler pin)", image, builtinPin.Digest)))
+			}
+			continue
+		}
+		if hasExistingPin && existingPin.Digest != "" && !opts.refreshExisting {
+			if verbose {
+				fmt.Fprintln(os.Stderr, console.FormatVerboseMessage(fmt.Sprintf("%s already pinned: %s", image, existingPin.Digest)))
 			}
 			skippedImages = append(skippedImages, image)
 			continue
 		}
 
-		// Attempt to resolve the digest without pulling.
-		digest, resolveErr := fetchContainerDigest(ctx, image, verbose)
+		digest, resolveErr := results[i].digest, results[i].err
 		if resolveErr != nil {
+			if errors.Is(resolveErr, context.Canceled) || errors.Is(resolveErr, context.DeadlineExceeded) {
+				return false, resolveErr
+			}
 			containerPinsLog.Printf("Failed to resolve digest for %s: %v", image, resolveErr)
-			failedImages = append(failedImages, imageFailure{image: image, reason: resolveErr.Error()})
+			failedCount++
+			reason := "registry metadata lookup failed"
+			var digestErr *containerDigestResolutionError
+			if errors.As(resolveErr, &digestErr) {
+				reason = digestErr.reason
+			}
+			failureReasons[reason] = struct{}{}
 			continue
 		}
 
 		pinnedImage := image + "@" + digest
+		if hasExistingPin && existingPin.Digest == digest && existingPin.PinnedImage == pinnedImage {
+			if verbose {
+				fmt.Fprintln(os.Stderr, console.FormatVerboseMessage(fmt.Sprintf("%s already pinned: %s", image, digest)))
+			}
+			skippedImages = append(skippedImages, image)
+			continue
+		}
 		actionCache.SetContainerPin(image, digest, pinnedImage)
 		updatedImages = append(updatedImages, pinnedEntry{image: image, pinnedImage: pinnedImage})
 
@@ -160,7 +257,7 @@ func UpdateContainerPins(ctx context.Context, workflowDir string, verbose bool) 
 	fmt.Fprintln(os.Stderr, "")
 
 	if len(updatedImages) > 0 {
-		fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("Pinned %d container image(s):", len(updatedImages))))
+		fmt.Fprintln(os.Stderr, console.FormatSuccessMessage(fmt.Sprintf("Updated %d container image pin(s):", len(updatedImages))))
 		for _, entry := range updatedImages {
 			fmt.Fprintln(os.Stderr, console.FormatListItem(entry.pinnedImage))
 		}
@@ -177,12 +274,12 @@ func UpdateContainerPins(ctx context.Context, workflowDir string, verbose bool) 
 		fmt.Fprintln(os.Stderr, "")
 	}
 
-	if len(failedImages) > 0 {
-		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to resolve digest for %d image(s) (Docker/crane may be unavailable):", len(failedImages))))
-		for _, f := range failedImages {
-			fmt.Fprintf(os.Stderr, "  %s: %s\n", f.image, f.reason)
+	if failedCount > 0 {
+		failureSummary := "Container pins could not be updated: " + strings.Join(sliceutil.SortedKeys(failureReasons), "; ") + "."
+		fmt.Fprintln(os.Stderr, console.FormatInfoMessage(failureSummary))
+		if !opts.failOnResolveErrors {
+			reportUpdateWarning(ctx, "containers", fmt.Errorf("%s (%d image(s))", failureSummary, failedCount))
 		}
-		fmt.Fprintln(os.Stderr, "")
 	}
 
 	if len(updatedImages) > 0 || prunedCount > 0 {
@@ -190,6 +287,10 @@ func UpdateContainerPins(ctx context.Context, workflowDir string, verbose bool) 
 			return false, fmt.Errorf("failed to save actions-lock.json: %w", err)
 		}
 		fmt.Fprintln(os.Stderr, console.FormatInfoMessage("Updated container pins in actions-lock.json"))
+	}
+
+	if failedCount > 0 && opts.failOnResolveErrors {
+		return len(updatedImages) > 0, fmt.Errorf("failed to resolve digest for %d image(s)", failedCount)
 	}
 
 	return len(updatedImages) > 0, nil
@@ -231,9 +332,8 @@ func collectImagesFromLockFiles(workflowDir string) ([]string, error) {
 				continue
 			}
 			for img := range strings.FieldsSeq(matches[1]) {
-				if img != "" {
-					imageSet[img] = struct {
-					}{}
+				if base, _, _ := strings.Cut(img, "@sha256:"); base != "" {
+					imageSet[base] = struct{}{}
 				}
 			}
 		}
@@ -249,18 +349,17 @@ func collectImagesFromLockFiles(workflowDir string) ([]string, error) {
 }
 
 // dockerCmdTimeout is the maximum time allowed for a single Docker CLI operation.
-// 60 seconds is sufficient for most registry metadata lookups and short pulls
+// 60 seconds is sufficient for most registry metadata lookups
 // while still bounding any hung Docker daemon or slow network connections.
 const dockerCmdTimeout = 60 * time.Second
 
 // fetchContainerDigest returns the SHA-256 content digest for the given image tag.
-// It tries three strategies in order:
-//  1. "docker buildx imagetools inspect" (no pull, preferred — works when docker daemon is running)
+// It tries two metadata-only strategies in order:
+//  1. "docker buildx imagetools inspect" (no image layers downloaded)
 //  2. "crane digest" (no pull, no daemon — works in CI without Docker)
-//  3. "docker pull" + "docker inspect" (fallback that pulls the full image)
 //
-// Returns an error when all three strategies fail.
-func fetchContainerDigest(ctx context.Context, image string, verbose bool) (string, error) {
+// Returns an error when both strategies fail; it never pulls image layers.
+func fetchContainerDigest(ctx context.Context, image string, _ bool) (string, error) {
 	containerPinsLog.Printf("Resolving digest for container image: %s", image)
 
 	type strategy struct {
@@ -276,15 +375,21 @@ func fetchContainerDigest(ctx context.Context, image string, verbose bool) (stri
 			name: "crane digest",
 			fn:   func() (string, error) { return resolveDigestViaCrane(ctx, image) },
 		},
-		{
-			name: "docker pull + inspect",
-			fn:   func() (string, error) { return resolveDigestViaPull(ctx, image, verbose) },
-		},
 	}
 
 	var errs []string
+	unavailable := 0
+	reason := "registry metadata lookup failed"
 	for _, s := range strategies {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		finish := ctxutil.StartOperation(ctx, s.name+" "+image)
 		digest, err := s.fn()
+		finish(err)
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
 		if err == nil && digest != "" {
 			containerPinsLog.Printf("Resolved %s via %s: %s", image, s.name, digest)
 			return digest, nil
@@ -292,9 +397,41 @@ func fetchContainerDigest(ctx context.Context, image string, verbose bool) (stri
 		msg := fmt.Sprintf("%s: %v", s.name, err)
 		containerPinsLog.Printf("Strategy %q failed for %s: %v", s.name, image, err)
 		errs = append(errs, msg)
+		if errors.Is(err, exec.ErrNotFound) ||
+			(s.name == "docker buildx imagetools" &&
+				(strings.Contains(msg, "is not a docker command") ||
+					strings.Contains(msg, `unknown command "buildx"`) ||
+					strings.Contains(msg, "unknown command: docker buildx"))) {
+			unavailable++
+		}
+		// Preserve the first authorization cause in resolver preference order.
+		if authReason := containerRegistryAuthReason(msg); authReason != "" && reason == "registry metadata lookup failed" {
+			reason = authReason
+		}
 	}
 
-	return "", errors.New(strings.Join(errs, "; "))
+	if unavailable == len(strategies) {
+		reason = "Docker Buildx and crane are unavailable"
+	}
+	return "", &containerDigestResolutionError{reason: reason, details: strings.Join(errs, "; ")}
+}
+
+func containerRegistryAuthReason(message string) string {
+	message = strings.ToLower(message)
+	switch {
+	case strings.Contains(message, "403 forbidden"):
+		return "registry access denied (HTTP 403)"
+	case strings.Contains(message, "401 unauthorized"):
+		return "registry authentication required (HTTP 401)"
+	}
+	authError := registryAuthErrorPattern.FindString(message)
+	if strings.Contains(authError, "unauthorized") {
+		return "registry authentication required"
+	}
+	if authError != "" {
+		return "registry access denied"
+	}
+	return ""
 }
 
 // resolveDigestViaBuildx uses "docker buildx imagetools inspect" to get the content
@@ -336,33 +473,4 @@ func resolveDigestViaCrane(ctx context.Context, image string) (string, error) {
 		return "", fmt.Errorf("unexpected digest format from crane: %q", digest)
 	}
 	return digest, nil
-}
-
-// resolveDigestViaPull pulls the image and then reads its RepoDigests field.
-func resolveDigestViaPull(ctx context.Context, image string, verbose bool) (string, error) {
-	if verbose {
-		fmt.Fprintf(os.Stderr, "  Pulling %s to resolve digest...\n", image)
-	}
-
-	pullCtx, pullCancel := context.WithTimeout(ctx, dockerCmdTimeout)
-	defer pullCancel()
-	if out, err := exec.CommandContext(pullCtx, "docker", "pull", "--quiet", image).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("docker pull failed: %w: %s", err, strings.TrimSpace(string(out)))
-	}
-
-	inspectCtx, inspectCancel := context.WithTimeout(ctx, dockerCmdTimeout)
-	defer inspectCancel()
-	out, err := exec.CommandContext(inspectCtx, "docker", "inspect",
-		"--format", "{{index .RepoDigests 0}}", image).CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("docker inspect failed: %w: %s", err, strings.TrimSpace(string(out)))
-	}
-
-	// RepoDigest format: "registry/image@sha256:..."  or "image@sha256:..."
-	repoDigest := strings.TrimSpace(string(out))
-	idx := strings.Index(repoDigest, "@sha256:")
-	if idx < 0 {
-		return "", fmt.Errorf("no sha256 digest in repo digest %q", repoDigest)
-	}
-	return repoDigest[idx+1:], nil // return "sha256:..."
 }

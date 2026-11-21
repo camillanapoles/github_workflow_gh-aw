@@ -3,37 +3,87 @@
 "use strict";
 
 const { emitInfrastructureIncomplete } = require("./safeoutputs_cli.cjs");
+const { fetchAWFReflect } = require("./awf_reflect.cjs");
 
 // Stop retrying this long before the step hard timeout so the harness can emit
 // structured safe-output diagnostics instead of being terminated by Actions.
 const SOFT_TIMEOUT_BUFFER_MS = 90 * 1000;
 
-const AI_CREDITS_EXCEEDED_PATTERNS = [/\bmax[\s_-]*ai[\s_-]*credits[\s_-]*exceeded\b/i, /\bai[\s_-]*credits[\s_-]*rate[\s_-]*limit[\s_-]*error\b/i, /ai[\s_-]*credits?.*(?:rate[\s-]*limit|limit exceeded|budget exceeded|exceeded)/i];
-
-const AWF_API_PROXY_BLOCKING_REQUESTS_PATTERNS = [/\bawf\b.*\bapi[\s_-]*proxy\b.*\bblocking requests\b/i, /\bapi[\s_-]*proxy\b.*\bblocking requests\b/i, /\bapi[\s_-]*proxy\b.*\bblocked requests?\b/i, /\bDIFC_FILTERED\b/];
-const GOAL_ALREADY_ACTIVE_PATTERNS = [/\bthis thread already has a goal\b[\s\S]*?\buse update_goal\b/i, /\bcannot create a new goal because this thread has an unfinished goal\b;\s*\bcomplete the existing goal first\b/i];
-
-// Patterns to detect Anthropic "max_runs_exceeded" (HTTP 403).
-// This occurs when the per-session LLM invocation quota is exhausted.
-// Retrying is pointless because each fresh-run attempt immediately fails with
-// the same 403 until the quota resets.  Matches both the JSON error type
-// ("max_runs_exceeded") and the human-readable message
-// ("Maximum LLM invocations exceeded").
-const MAX_RUNS_EXCEEDED_PATTERNS = [/\bmax_runs_exceeded\b/i, /Maximum LLM invocations exceeded/i];
+const errorPatterns = require("./harness_error_patterns.cjs");
 
 /**
- * Detect retry guard conditions that should stop harness retries immediately.
- * @param {unknown} output
- * @returns {{ aiCreditsExceeded: boolean, awfAPIProxyBlockingRequests: boolean, goalAlreadyActive: boolean, maxRunsExceeded: boolean }}
+ * Validate a fresh AWF reflection before treating a native terminal 429 as an
+ * exhausted shared invocation budget. Missing or malformed evidence preserves
+ * the engine's existing retry policy.
+ * @param {{
+ *   nativeTerminalRateLimitError: boolean,
+ *   env?: NodeJS.ProcessEnv,
+ *   fetchReflect?: typeof fetchAWFReflect,
+ *   logger?: (message: string) => void,
+ * }} options
+ * @returns {Promise<{ invocationCount: number, maxRuns: number } | null>}
  */
-function detectNonRetryableHarnessGuard(output) {
-  const safeOutput = typeof output === "string" ? output : "";
-  return {
-    aiCreditsExceeded: AI_CREDITS_EXCEEDED_PATTERNS.some(pattern => pattern.test(safeOutput)),
-    awfAPIProxyBlockingRequests: AWF_API_PROXY_BLOCKING_REQUESTS_PATTERNS.some(pattern => pattern.test(safeOutput)),
-    goalAlreadyActive: GOAL_ALREADY_ACTIVE_PATTERNS.some(pattern => pattern.test(safeOutput)),
-    maxRunsExceeded: MAX_RUNS_EXCEEDED_PATTERNS.some(pattern => pattern.test(safeOutput)),
-  };
+async function detectExhaustedAWFInvocationBudget({ nativeTerminalRateLimitError, env = process.env, fetchReflect = fetchAWFReflect, logger = () => {} }) {
+  if (!nativeTerminalRateLimitError || env.AWF_REFLECT_ENABLED !== "1") return null;
+  try {
+    const refreshed = await fetchReflect({ logger, timeoutMs: 3000, modelsTimeoutMs: 1000 });
+    if (!refreshed.ok) return null;
+    const runs = refreshed.reflectData?.runs;
+    if (!runs || typeof runs !== "object" || Array.isArray(runs) || runs.enabled !== true) return null;
+    const invocationCount = runs.invocation_count;
+    const maxRuns = runs.max_runs;
+    if (typeof maxRuns !== "number" || !Number.isSafeInteger(maxRuns) || maxRuns <= 0 || typeof invocationCount !== "number" || !Number.isSafeInteger(invocationCount) || invocationCount < maxRuns || runs.remaining_runs !== 0) return null;
+    return { invocationCount, maxRuns };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Add fresh budget evidence to an engine's already-classified guard, without changing trust policy.
+ * Engines that classify afterwards derive their failure class from the updated guard.
+ * @param {{
+ *   guard: { maxRunsExceeded: boolean }, attempt: number,
+ *   nativeTerminalRateLimitError: boolean, log: (message: string) => void,
+ *   result?: import("./harness_retry_runner.cjs").HarnessAttemptResult,
+ *   env?: NodeJS.ProcessEnv, fetchReflect?: typeof fetchAWFReflect,
+ * }} options
+ */
+async function observeInvocationBudget({ guard, attempt, nativeTerminalRateLimitError, log, result, env, fetchReflect }) {
+  if (guard.maxRunsExceeded) return;
+  const budget = await detectExhaustedAWFInvocationBudget({ nativeTerminalRateLimitError, logger: log, env, fetchReflect });
+  if (!budget) return;
+  guard.maxRunsExceeded = true;
+  if (result) result.failureClasses = [...new Set([...(result.failureClasses || []), "invocation_cap_exceeded"])];
+  log(`attempt ${attempt + 1}: AWF shared invocation budget exhausted (${budget.invocationCount}/${budget.maxRuns}) — confirmed by fresh reflection`);
+}
+
+/**
+ * Enforce provider waits once, after engine-local retry vetoes have been applied.
+ * @param {{
+ *   attempt: number, result: import("./harness_retry_runner.cjs").HarnessAttemptResult,
+ *   maxDelayMs: number, softTimeoutGuard: { softDeadlineMs: number } | null,
+ *   harnessName: string, log: (message: string) => void, terminal?: boolean,
+ * }} options
+ * @returns {import("./harness_retry_runner.cjs").HarnessFailureDecision | null}
+ */
+function resolveRetryAfterDecision({ attempt, result, maxDelayMs, softTimeoutGuard, harnessName, log, terminal = false }) {
+  const wait = result.retryAfterMs;
+  if (wait == null) return null;
+  const invalidWait = !Number.isSafeInteger(wait) || wait < 0;
+  const exceedsDelayCap = wait > Math.min(maxDelayMs, 2147483647);
+  const exceedsTimeout = softTimeoutGuard && Date.now() + wait >= softTimeoutGuard.softDeadlineMs;
+  if (invalidWait || exceedsDelayCap || exceedsTimeout) {
+    const reason = invalidWait ? "a valid nonnegative timer delay" : exceedsDelayCap ? `max-delay-ms=${maxDelayMs}` : "remaining job timeout budget";
+    result.failureClasses = ["rate_limit_wait_exceeded"];
+    log(`attempt ${attempt + 1}: failureClass=rate_limit_wait_exceeded — HTTP 429 Retry-After=${wait}ms exceeds ${reason}; not retrying`);
+    emitInfrastructureIncomplete(`${harnessName} HTTP 429 Retry-After wait exceeds ${reason}. Stopping rather than retrying inside the rate-limit window.`, { logger: log });
+    return { action: "stop" };
+  }
+  if (terminal) return null;
+  result.failureClasses = ["rate_limit_error"];
+  log(`attempt ${attempt + 1}: failureClass=rate_limit_error — HTTP 429 Retry-After requires ${wait}ms before next attempt`);
+  return { action: "retry", nextDelayMs: wait };
 }
 
 /**
@@ -67,13 +117,12 @@ function emitSoftTimeoutSignal(guard, context, harnessName, logFn) {
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-    detectNonRetryableHarnessGuard,
-    AI_CREDITS_EXCEEDED_PATTERNS,
-    AWF_API_PROXY_BLOCKING_REQUESTS_PATTERNS,
-    GOAL_ALREADY_ACTIVE_PATTERNS,
-    MAX_RUNS_EXCEEDED_PATTERNS,
+    ...errorPatterns,
     SOFT_TIMEOUT_BUFFER_MS,
     buildSoftTimeoutGuard,
+    detectExhaustedAWFInvocationBudget,
+    observeInvocationBudget,
+    resolveRetryAfterDecision,
     emitSoftTimeoutSignal,
   };
 }

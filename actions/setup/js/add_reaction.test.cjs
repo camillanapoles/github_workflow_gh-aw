@@ -4,6 +4,7 @@ const { ERR_NOT_FOUND, ERR_VALIDATION, ERR_API } = require("./error_codes.cjs");
 
 // Mock the global objects that GitHub Actions provides
 const mockCore = {
+  debug: vi.fn(),
   info: vi.fn(),
   warning: vi.fn(),
   error: vi.fn(),
@@ -42,6 +43,7 @@ describe("add_reaction", () => {
 
     // Reset environment variables
     delete process.env.GH_AW_REACTION;
+    delete process.env.GH_AW_REMOVE_REACTION_ID;
 
     // Reset context to default
     global.context = {
@@ -83,6 +85,213 @@ describe("add_reaction", () => {
     return import("./add_reaction.cjs?" + Date.now());
   }
 
+  describe("reaction cleanup", () => {
+    beforeEach(() => {
+      process.env.GH_AW_REMOVE_REACTION_ID = "98765";
+      process.env.GH_AW_REACTION = "rocket";
+      // DELETE returns no reaction body; cleanup must not read it or publish a new ID.
+      mockGithub.request.mockResolvedValue({ status: 204 });
+      mockGithub.graphql.mockResolvedValue({ removeReaction: { clientMutationId: null } });
+    });
+
+    const restTargets = [
+      { eventName: "issues", payload: { issue: { number: 123 } }, path: "issues/{issue_number}", params: { issue_number: 123 }, itemType: "issue" },
+      { eventName: "pull_request", payload: { pull_request: { number: 123 } }, path: "issues/{issue_number}", params: { issue_number: 123 }, itemType: "pull_request" },
+      { eventName: "issue_comment", payload: { comment: { id: 456 } }, path: "issues/comments/{comment_id}", params: { comment_id: 456 }, itemType: "issue" },
+      { eventName: "pull_request_review_comment", payload: { comment: { id: 456 } }, path: "pulls/comments/{comment_id}", params: { comment_id: 456 }, itemType: "pull_request" },
+    ];
+
+    it.each(restTargets)("removes only the original reaction for $eventName", async ({ eventName, payload, path, params }) => {
+      global.context = {
+        eventName,
+        repo: { owner: "testowner", repo: "testrepo" },
+        payload,
+      };
+
+      await runScript();
+
+      expect(mockGithub.request).toHaveBeenCalledExactlyOnceWith(`DELETE /repos/{owner}/{repo}/${path}/reactions/{reaction_id}`, {
+        owner: "testowner",
+        repo: "testrepo",
+        ...params,
+        reaction_id: "98765",
+        headers: { Accept: "application/vnd.github+json" },
+      });
+      expect(mockGithub.graphql).not.toHaveBeenCalled();
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+      expect(mockCore.setOutput).not.toHaveBeenCalled();
+    });
+
+    it.each(restTargets)("resolves dispatched $eventName cleanup to the original target", async ({ eventName, path, params, itemType }) => {
+      global.context = {
+        eventName: "workflow_dispatch",
+        repo: { owner: "workflow-owner", repo: "workflow-repo" },
+        payload: {
+          inputs: {
+            aw_context: JSON.stringify({
+              event_type: eventName,
+              item_type: itemType,
+              item_number: "123",
+              comment_id: "456",
+              repo: "target-owner/target-repo",
+            }),
+          },
+        },
+      };
+
+      await runScript();
+
+      expect(mockGithub.request).toHaveBeenCalledExactlyOnceWith(`DELETE /repos/{owner}/{repo}/${path}/reactions/{reaction_id}`, {
+        owner: "target-owner",
+        repo: "target-repo",
+        ...params,
+        reaction_id: "98765",
+        headers: { Accept: "application/vnd.github+json" },
+      });
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+    });
+
+    it.each(["discussion", "discussion_comment"])("removes the authenticated user's original content for %s", async eventName => {
+      process.env.GH_AW_REMOVE_REACTION_ID = "R_original";
+      global.context = {
+        eventName,
+        repo: { owner: "testowner", repo: "testrepo" },
+        payload: { discussion: { number: 123 }, comment: { node_id: "DC_original" } },
+      };
+      if (eventName === "discussion") {
+        mockGithub.graphql.mockResolvedValueOnce({ repository: { discussion: { id: "D_original" } } });
+      }
+
+      await runScript();
+
+      expect(mockGithub.graphql).toHaveBeenLastCalledWith(expect.stringContaining("removeReaction(input:"), {
+        subjectId: eventName === "discussion" ? "D_original" : "DC_original",
+        content: "ROCKET",
+      });
+      expect(mockGithub.graphql.mock.calls.some(([query]) => query.includes("addReaction"))).toBe(false);
+      expect(mockGithub.request).not.toHaveBeenCalled();
+      expect(mockCore.setOutput).not.toHaveBeenCalled();
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+    });
+
+    it.each(["discussion", "discussion_comment"])("resolves dispatched %s cleanup to the original subject", async eventName => {
+      global.context = {
+        eventName: "workflow_dispatch",
+        repo: { owner: "workflow-owner", repo: "workflow-repo" },
+        payload: {
+          inputs: {
+            aw_context: JSON.stringify({
+              event_type: eventName,
+              item_type: "discussion",
+              item_number: "123",
+              comment_node_id: "DC_original",
+              repo: "target-owner/target-repo",
+            }),
+          },
+        },
+      };
+      if (eventName === "discussion") {
+        mockGithub.graphql.mockResolvedValueOnce({ repository: { discussion: { id: "D_original" } } });
+      }
+
+      await runScript();
+
+      if (eventName === "discussion") {
+        expect(mockGithub.graphql).toHaveBeenNthCalledWith(1, expect.stringContaining("discussion(number:"), {
+          owner: "target-owner",
+          repo: "target-repo",
+          num: 123,
+        });
+      }
+      expect(mockGithub.graphql).toHaveBeenLastCalledWith(expect.stringContaining("removeReaction(input:"), {
+        subjectId: eventName === "discussion" ? "D_original" : "DC_original",
+        content: "ROCKET",
+      });
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+    });
+
+    it.each(["", "   "])("does not accidentally add when cleanup ID is %j", async id => {
+      process.env.GH_AW_REMOVE_REACTION_ID = id;
+
+      await runScript();
+
+      expect(mockGithub.request).not.toHaveBeenCalled();
+      expect(mockGithub.graphql).not.toHaveBeenCalled();
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+      expect(mockCore.setOutput).not.toHaveBeenCalled();
+    });
+
+    it.each(["REST", "GraphQL"])("ignores already removed, locked and rate limited %s reactions", async api => {
+      if (api === "GraphQL") {
+        global.context = {
+          eventName: "discussion_comment",
+          repo: { owner: "testowner", repo: "testrepo" },
+          payload: { comment: { node_id: "DC_original" } },
+        };
+      }
+      const request = api === "REST" ? mockGithub.request : mockGithub.graphql;
+      const errors = [
+        Object.assign(new Error("Not Found"), { status: 404 }),
+        Object.assign(new Error("Issue is locked"), { status: 403 }),
+        Object.assign(new Error("API rate limit exceeded"), { status: 403 }),
+        Object.assign(new Error("Too many requests"), { status: 429 }),
+      ];
+      for (const error of errors) {
+        vi.clearAllMocks();
+        request.mockRejectedValueOnce(error);
+
+        await runScript();
+
+        expect(request).toHaveBeenCalledTimes(1);
+        expect(mockCore.setFailed).not.toHaveBeenCalled();
+        expect(mockCore.setOutput).not.toHaveBeenCalled();
+        if (error.status === 404) {
+          expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("already removed"));
+        }
+      }
+    });
+
+    it("continues to fail on 404 when adding a reaction", async () => {
+      delete process.env.GH_AW_REMOVE_REACTION_ID;
+      mockGithub.request.mockRejectedValueOnce(Object.assign(new Error("Not Found"), { status: 404 }));
+
+      await runScript();
+
+      expect(mockCore.setFailed).toHaveBeenCalledWith(`${ERR_API}: Failed to add reaction: Not Found`);
+    });
+
+    it("warns but does not fail the job for unexpected cleanup API errors", async () => {
+      mockGithub.request.mockRejectedValueOnce(Object.assign(new Error("Forbidden"), { status: 403 }));
+
+      await runScript();
+
+      expect(mockCore.warning).toHaveBeenCalledWith(`${ERR_API}: Failed to remove reaction: Forbidden`);
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+    });
+
+    it("retains bounded connection retry behavior for cleanup", async () => {
+      const { main } = await importHelpers();
+      mockGithub.request.mockRejectedValueOnce(Object.assign(new Error("Connection failed"), { code: "UND_ERR_CONNECT_TIMEOUT" }));
+
+      vi.useFakeTimers();
+      try {
+        const operation = main();
+        await vi.runAllTimersAsync();
+        await operation;
+      } finally {
+        vi.useRealTimers();
+      }
+
+      expect(mockGithub.request).toHaveBeenCalledTimes(2);
+      for (const [route, params] of mockGithub.request.mock.calls) {
+        expect(route).toMatch(/^DELETE /);
+        expect(params.reaction_id).toBe("98765");
+        expect(params).not.toHaveProperty("content");
+      }
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+    });
+  });
+
   describe("reaction validation", () => {
     it("should use 'eyes' as default reaction when GH_AW_REACTION is not set", async () => {
       await runScript();
@@ -100,6 +309,15 @@ describe("add_reaction", () => {
 
     it("should fail for invalid reaction type", async () => {
       process.env.GH_AW_REACTION = "invalid";
+
+      await runScript();
+
+      expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Invalid reaction type"));
+      expect(mockGithub.request).not.toHaveBeenCalled();
+    });
+
+    it("should reject inherited property names as invalid reaction types", async () => {
+      process.env.GH_AW_REACTION = "constructor";
 
       await runScript();
 
@@ -151,7 +369,7 @@ describe("add_reaction", () => {
 
       await runScript();
 
-      expect(mockGithub.request).toHaveBeenCalledWith("POST /repos/testowner/testrepo/issues/456/reactions", expect.objectContaining({ content: "eyes" }));
+      expect(mockGithub.request).toHaveBeenCalledWith("POST /repos/{owner}/{repo}/issues/{issue_number}/reactions", expect.objectContaining({ content: "eyes", owner: "testowner", repo: "testrepo", issue_number: 456 }));
       expect(mockCore.setOutput).toHaveBeenCalledWith("reaction-id", "12345");
     });
 
@@ -180,7 +398,7 @@ describe("add_reaction", () => {
 
       await runScript();
 
-      expect(mockGithub.request).toHaveBeenCalledWith("POST /repos/testowner/testrepo/issues/comments/789/reactions", expect.objectContaining({ content: "eyes" }));
+      expect(mockGithub.request).toHaveBeenCalledWith("POST /repos/{owner}/{repo}/issues/comments/{comment_id}/reactions", expect.objectContaining({ content: "eyes", owner: "testowner", repo: "testrepo", comment_id: 789 }));
     });
 
     it("should fail when comment ID is missing", async () => {
@@ -206,7 +424,7 @@ describe("add_reaction", () => {
 
       await runScript();
 
-      expect(mockGithub.request).toHaveBeenCalledWith("POST /repos/testowner/testrepo/issues/999/reactions", expect.objectContaining({ content: "eyes" }));
+      expect(mockGithub.request).toHaveBeenCalledWith("POST /repos/{owner}/{repo}/issues/{issue_number}/reactions", expect.objectContaining({ content: "eyes", owner: "testowner", repo: "testrepo", issue_number: 999 }));
     });
 
     it("should fail when PR number is missing", async () => {
@@ -232,7 +450,7 @@ describe("add_reaction", () => {
 
       await runScript();
 
-      expect(mockGithub.request).toHaveBeenCalledWith("POST /repos/testowner/testrepo/pulls/comments/555/reactions", expect.objectContaining({ content: "eyes" }));
+      expect(mockGithub.request).toHaveBeenCalledWith("POST /repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions", expect.objectContaining({ content: "eyes", owner: "testowner", repo: "testrepo", comment_id: 555 }));
     });
 
     it("should fail when review comment ID is missing", async () => {
@@ -324,7 +542,6 @@ describe("add_reaction", () => {
 
       await runScript();
 
-      expect(mockCore.error).toHaveBeenCalled();
       expect(mockCore.setFailed).toHaveBeenCalled();
     });
 
@@ -339,7 +556,6 @@ describe("add_reaction", () => {
 
       await runScript();
 
-      expect(mockCore.error).toHaveBeenCalled();
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("not found"));
     });
 
@@ -464,7 +680,7 @@ describe("add_reaction", () => {
 
       await runScript();
 
-      expect(mockGithub.request).toHaveBeenCalledWith("POST /repos/target-owner/target-repo/issues/comments/456/reactions", expect.objectContaining({ content: "eyes" }));
+      expect(mockGithub.request).toHaveBeenCalledWith("POST /repos/{owner}/{repo}/issues/comments/{comment_id}/reactions", expect.objectContaining({ content: "eyes", owner: "target-owner", repo: "target-repo", comment_id: 456 }));
     });
 
     it("should fail for unsupported event types", async () => {
@@ -482,12 +698,78 @@ describe("add_reaction", () => {
   });
 
   describe("error handling", () => {
+    it("retries a transient connection timeout and succeeds", async () => {
+      const { addReaction } = await importHelpers();
+      const timeoutError = new Error("Connect Timeout Error");
+      mockGithub.request.mockRejectedValueOnce(timeoutError).mockResolvedValueOnce({
+        data: { id: 12345 },
+      });
+
+      vi.useFakeTimers();
+      try {
+        const operation = addReaction("POST /reactions", {}, "eyes");
+        await vi.advanceTimersByTimeAsync(999);
+        expect(mockGithub.request).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(1);
+        await operation;
+      } finally {
+        vi.useRealTimers();
+      }
+
+      expect(mockGithub.request).toHaveBeenCalledTimes(2);
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+    });
+
+    it("stops retrying after the bounded number of connection retries", async () => {
+      const { addReaction } = await importHelpers();
+      const timeoutError = new Error("Connect Timeout Error");
+      mockGithub.request.mockRejectedValue(timeoutError);
+
+      vi.useFakeTimers();
+      try {
+        const operation = addReaction("POST /reactions", {}, "eyes");
+        const rejection = expect(operation).rejects.toBe(timeoutError);
+        await vi.runAllTimersAsync();
+        await rejection;
+      } finally {
+        vi.useRealTimers();
+      }
+
+      expect(mockGithub.request).toHaveBeenCalledTimes(3);
+    });
+
+    it("retries connection timeouts identified by error code", async () => {
+      const { addReaction } = await importHelpers();
+      const timeoutError = Object.assign(new Error("Connection failed"), { code: "UND_ERR_CONNECT_TIMEOUT" });
+      mockGithub.request.mockRejectedValueOnce(timeoutError).mockResolvedValueOnce({ data: { id: 12345 } });
+
+      vi.useFakeTimers();
+      try {
+        const operation = addReaction("POST /reactions", {}, "eyes");
+        await vi.runAllTimersAsync();
+        await operation;
+      } finally {
+        vi.useRealTimers();
+      }
+
+      expect(mockGithub.request).toHaveBeenCalledTimes(2);
+      expect(mockCore.setOutput).toHaveBeenCalledWith("reaction-id", "12345");
+    });
+
+    it("preserves non-retryable API errors without retrying", async () => {
+      const { addReaction } = await importHelpers();
+      const lockedError = Object.assign(new Error("Issue is locked"), { status: 403 });
+      mockGithub.request.mockRejectedValueOnce(lockedError);
+
+      await expect(addReaction("POST /reactions", {}, "eyes")).rejects.toBe(lockedError);
+      expect(mockGithub.request).toHaveBeenCalledTimes(1);
+    });
+
     it("should handle API errors gracefully", async () => {
       mockGithub.request.mockRejectedValueOnce(new Error("API Error"));
 
       await runScript();
 
-      expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("Failed to add reaction"));
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Failed to add reaction"));
     });
 
@@ -502,7 +784,6 @@ describe("add_reaction", () => {
 
       await runScript();
 
-      expect(mockCore.error).toHaveBeenCalled();
       expect(mockCore.setFailed).toHaveBeenCalled();
     });
 
@@ -526,7 +807,6 @@ describe("add_reaction", () => {
 
       await runScript();
 
-      expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("Failed to add reaction"));
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Failed to add reaction"));
     });
 
@@ -537,8 +817,18 @@ describe("add_reaction", () => {
 
       await runScript();
 
-      expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("Failed to add reaction"));
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Failed to add reaction"));
+    });
+
+    it("should warn and continue for rate limit 403 errors", async () => {
+      const rateLimitError = new Error("API rate limit exceeded for installation");
+      /** @type {any} */ rateLimitError.status = 403;
+      mockGithub.request.mockRejectedValueOnce(rateLimitError);
+
+      await runScript();
+
+      expect(mockCore.warning).toHaveBeenCalledWith(expect.stringContaining("GitHub API rate limiting"));
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
     });
 
     it("should fail for other non-403 errors", async () => {
@@ -548,7 +838,6 @@ describe("add_reaction", () => {
 
       await runScript();
 
-      expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("Failed to add reaction"));
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining("Failed to add reaction"));
     });
   });
@@ -590,9 +879,12 @@ describe("add_reaction", () => {
       const { addReaction } = await importHelpers();
       mockGithub.request.mockResolvedValueOnce({ data: { id: 111 } });
 
-      await addReaction("/repos/owner/repo/issues/1/reactions", "+1");
+      await addReaction("POST /repos/{owner}/{repo}/issues/{issue_number}/reactions", { owner: "owner", repo: "repo", issue_number: 1 }, "+1");
 
-      expect(mockGithub.request).toHaveBeenCalledWith("POST /repos/owner/repo/issues/1/reactions", {
+      expect(mockGithub.request).toHaveBeenCalledWith("POST /repos/{owner}/{repo}/issues/{issue_number}/reactions", {
+        owner: "owner",
+        repo: "repo",
+        issue_number: 1,
         content: "+1",
         headers: { Accept: "application/vnd.github+json" },
       });
@@ -603,7 +895,7 @@ describe("add_reaction", () => {
       const { addReaction } = await importHelpers();
       mockGithub.request.mockResolvedValueOnce({ data: {} });
 
-      await addReaction("/repos/owner/repo/issues/1/reactions", "eyes");
+      await addReaction("POST /repos/{owner}/{repo}/issues/{issue_number}/reactions", { owner: "owner", repo: "repo", issue_number: 1 }, "eyes");
 
       expect(mockCore.setOutput).toHaveBeenCalledWith("reaction-id", "");
     });
@@ -612,7 +904,7 @@ describe("add_reaction", () => {
       const { addReaction } = await importHelpers();
       mockGithub.request.mockResolvedValueOnce({ data: { id: 777 } });
 
-      await addReaction("/repos/owner/repo/issues/1/reactions", "rocket");
+      await addReaction("POST /repos/{owner}/{repo}/issues/{issue_number}/reactions", { owner: "owner", repo: "repo", issue_number: 1 }, "rocket");
 
       expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("rocket"));
       expect(mockCore.info).toHaveBeenCalledWith(expect.stringContaining("777"));
@@ -680,12 +972,11 @@ describe("add_reaction", () => {
       expect(mockCore.setFailed).not.toHaveBeenCalled();
     });
 
-    it("should call core.error and core.setFailed for non-locked errors", async () => {
+    it("should call core.setFailed for non-locked errors", async () => {
       const { handleReactionError } = await importHelpers();
 
       handleReactionError(new Error("Some API error"));
 
-      expect(mockCore.error).toHaveBeenCalledWith(expect.stringContaining("Failed to add reaction: Some API error"));
       expect(mockCore.setFailed).toHaveBeenCalledWith(expect.stringContaining(`${ERR_API}: Failed to add reaction`));
     });
   });
@@ -694,7 +985,7 @@ describe("add_reaction", () => {
     it("should return issues endpoint", async () => {
       global.context = { eventName: "issues", repo: { owner: "o", repo: "r" }, payload: { issue: { number: 1 } } };
       const { resolveRestEndpoint } = await importHelpers();
-      expect(resolveRestEndpoint("issues", "o", "r", global.context.payload)).toBe("/repos/o/r/issues/1/reactions");
+      expect(resolveRestEndpoint("issues", "o", "r", global.context.payload)).toEqual({ route: "POST /repos/{owner}/{repo}/issues/{issue_number}/reactions", params: { owner: "o", repo: "r", issue_number: 1 } });
     });
 
     it("should return null and setFailed when issue number is missing", async () => {
@@ -707,7 +998,7 @@ describe("add_reaction", () => {
     it("should return issue_comment endpoint", async () => {
       global.context = { eventName: "issue_comment", repo: { owner: "o", repo: "r" }, payload: { comment: { id: 42 } } };
       const { resolveRestEndpoint } = await importHelpers();
-      expect(resolveRestEndpoint("issue_comment", "o", "r", global.context.payload)).toBe("/repos/o/r/issues/comments/42/reactions");
+      expect(resolveRestEndpoint("issue_comment", "o", "r", global.context.payload)).toEqual({ route: "POST /repos/{owner}/{repo}/issues/comments/{comment_id}/reactions", params: { owner: "o", repo: "r", comment_id: 42 } });
     });
 
     it("should return null and setFailed when comment id is missing", async () => {
@@ -720,7 +1011,7 @@ describe("add_reaction", () => {
     it("should return pull_request endpoint using issues path", async () => {
       global.context = { eventName: "pull_request", repo: { owner: "o", repo: "r" }, payload: { pull_request: { number: 7 } } };
       const { resolveRestEndpoint } = await importHelpers();
-      expect(resolveRestEndpoint("pull_request", "o", "r", global.context.payload)).toBe("/repos/o/r/issues/7/reactions");
+      expect(resolveRestEndpoint("pull_request", "o", "r", global.context.payload)).toEqual({ route: "POST /repos/{owner}/{repo}/issues/{issue_number}/reactions", params: { owner: "o", repo: "r", issue_number: 7 } });
     });
 
     it("should return null and setFailed when PR number is missing", async () => {
@@ -733,7 +1024,7 @@ describe("add_reaction", () => {
     it("should return pull_request_review_comment endpoint", async () => {
       global.context = { eventName: "pull_request_review_comment", repo: { owner: "o", repo: "r" }, payload: { comment: { id: 55 } } };
       const { resolveRestEndpoint } = await importHelpers();
-      expect(resolveRestEndpoint("pull_request_review_comment", "o", "r", global.context.payload)).toBe("/repos/o/r/pulls/comments/55/reactions");
+      expect(resolveRestEndpoint("pull_request_review_comment", "o", "r", global.context.payload)).toEqual({ route: "POST /repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions", params: { owner: "o", repo: "r", comment_id: 55 } });
     });
 
     it("should return null without failure for pull_request_review events", async () => {

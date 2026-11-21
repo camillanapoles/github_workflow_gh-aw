@@ -22,6 +22,9 @@ set +o histexpand
 
 set -euo pipefail
 
+TMP_DIR="$(mktemp -d /tmp/gh-aw-cache-memory.XXXXXX)"
+trap 'rm -rf -- "$TMP_DIR"' EXIT
+
 CACHE_DIR="${GH_AW_CACHE_DIR:-/tmp/gh-aw/cache-memory}"
 INTEGRITY="${GH_AW_MIN_INTEGRITY:-none}"
 
@@ -95,6 +98,29 @@ initialize_cache_memory_git_repo() {
   echo "Cache memory git repository initialized with branches: ${LEVELS[*]}"
 }
 
+scrub_git_config_entries() {
+  local key_prefix="$1"
+  while IFS= read -r key_name; do
+    [ -n "$key_name" ] || continue
+    git config --unset-all "$key_name" >/dev/null 2>&1 || true
+  done < <(
+    git config --local --name-only --list 2>/dev/null \
+      | grep -E -i "^${key_prefix}\\." \
+      | sort -u
+  )
+}
+
+has_symlinked_git_metadata() {
+  local repo_root="$1"
+  local path
+  for path in "$repo_root/.git" "$repo_root/.git/config" "$repo_root/.git/info" "$repo_root/.git/hooks"; do
+    if [ -L "$path" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 mkdir -p "$CACHE_DIR"
 cd "$CACHE_DIR"
 
@@ -130,6 +156,14 @@ else
   echo "Cache cold start: no git repository found, will initialize"
 fi
 
+# --- Security: reject symlinked git metadata before any .git operations ---
+if [ -d .git ] && has_symlinked_git_metadata "$CACHE_DIR"; then
+  echo "WARNING: Detected symlinked cache-memory git metadata; reinitializing git metadata"
+  rm -rf .git
+  IS_CACHE_HIT=false
+  initialize_cache_memory_git_repo
+fi
+
 # --- Log cache directory contents after restore (before git setup) ---
 echo "=== Cache directory: non-git files present after restore ==="
 _pre_files=$(find . -not -path './.git/*' -type f 2>/dev/null | sort || true)
@@ -156,14 +190,13 @@ else
   # If restored git metadata is corrupt (for example missing tree objects from a
   # raced or force-pushed cache branch), reset to a clean repo while preserving
   # restored files in the working tree.
-  if ! git fsck --connectivity-only --no-progress >/tmp/gh-aw-git-fsck-out 2>/tmp/gh-aw-git-fsck-err; then
+  if ! git fsck --connectivity-only --no-progress >"${TMP_DIR}/git-fsck-out" 2>"${TMP_DIR}/git-fsck-err"; then
     echo "WARNING: Detected corrupted cache-memory git repository; reinitializing git metadata"
-    cat /tmp/gh-aw-git-fsck-err 2>/dev/null || true
+    cat "${TMP_DIR}/git-fsck-err" 2>/dev/null || true
     rm -rf .git
     IS_CACHE_HIT=false
     initialize_cache_memory_git_repo
   fi
-  rm -f /tmp/gh-aw-git-fsck-out /tmp/gh-aw-git-fsck-err 2>/dev/null || true
 
   # Existing repo: disable hooks as belt-and-suspenders after the earlier
   # hook-file cleanup step in this script.
@@ -180,24 +213,48 @@ else
   rm -f "$_hooks_config_err" 2>/dev/null || true
 fi
 
+# --- Security: scrub git config/info state and enforce hardened defaults ---
+# Cache restores can carry forward untrusted git configuration and info files
+# from prior runs. Remove untrusted info overrides and dangerous config keys
+# while preserving repository metadata (remotes/branch sections).
+if [ -d .git ]; then
+  mkdir -p .git/info
+  rm -f .git/info/exclude .git/info/attributes .git/info/grafts .git/info/sparse-checkout
+
+  git config --unset-all core.attributesFile >/dev/null 2>&1 || true
+  git config --unset-all core.fsmonitor >/dev/null 2>&1 || true
+  git config --unset-all core.sshCommand >/dev/null 2>&1 || true
+  git config --unset-all core.hooksPath >/dev/null 2>&1 || true
+  scrub_git_config_entries include
+  scrub_git_config_entries includeif
+  scrub_git_config_entries credential
+  scrub_git_config_entries alias
+  scrub_git_config_entries filter
+  scrub_git_config_entries merge
+
+  git config user.email "gh-aw@github.com"
+  git config user.name "gh-aw"
+  git config core.hooksPath /dev/null
+  git config core.fsmonitor false
+fi
+
 # --- Checkout current integrity branch ---
 # Use -q to suppress "Switched to branch" noise
-if ! git checkout -q "$INTEGRITY" 2>/tmp/gh-aw-checkout-err; then
+if ! git checkout -q "$INTEGRITY" 2>"${TMP_DIR}/checkout-err"; then
   checkout_exit=$?
-  if grep -qiE "unable to read tree|could not parse HEAD|bad object|missing tree" /tmp/gh-aw-checkout-err 2>/dev/null; then
+  if grep -qiE "unable to read tree|could not parse HEAD|bad object|missing tree" "${TMP_DIR}/checkout-err" 2>/dev/null; then
     echo "WARNING: checkout failed due to cache-memory git corruption; reinitializing git metadata"
-    cat /tmp/gh-aw-checkout-err 2>/dev/null || true
+    cat "${TMP_DIR}/checkout-err" 2>/dev/null || true
     rm -rf .git
     IS_CACHE_HIT=false
     initialize_cache_memory_git_repo
     git checkout -q "$INTEGRITY"
   else
     echo "ERROR: failed to checkout integrity branch '$INTEGRITY' (exit $checkout_exit):" >&2
-    cat /tmp/gh-aw-checkout-err >&2
+    cat "${TMP_DIR}/checkout-err" >&2
     exit "$checkout_exit"
   fi
 fi
-rm -f /tmp/gh-aw-checkout-err 2>/dev/null || true
 
 # --- Merge down from higher-integrity branches ---
 # Read semantics: lower-integrity runs see higher-integrity data via merge,
@@ -208,7 +265,7 @@ for level in "${LEVELS[@]}"; do
     break
   fi
   # Merge higher-integrity branch into the current branch
-  if git merge "$level" -X theirs --no-edit -m "merge-from-$level" -q 2>/tmp/gh-aw-merge-err; then
+  if git merge "$level" -X theirs --no-edit -m "merge-from-$level" -q 2>"${TMP_DIR}/merge-err"; then
     echo "Merged integrity branch '$level' into '$INTEGRITY'"
   else
     merge_exit=$?
@@ -216,11 +273,11 @@ for level in "${LEVELS[@]}"; do
     # pre-merge state so the agent always starts from a consistent, usable tree.
     git merge --abort 2>/dev/null || git reset --hard HEAD 2>/dev/null || true
     # Ignore "already up-to-date" and "nothing to merge" — fail fast on real errors
-    if grep -qiE "already up.to.date|nothing to merge|nothing to commit" /tmp/gh-aw-merge-err 2>/dev/null; then
+    if grep -qiE "already up.to.date|nothing to merge|nothing to commit" "${TMP_DIR}/merge-err" 2>/dev/null; then
       echo "Nothing to merge from '$level' into '$INTEGRITY' (already up-to-date)"
     else
       echo "ERROR: merge from '$level' into '$INTEGRITY' failed (exit $merge_exit):" >&2
-      cat /tmp/gh-aw-merge-err >&2
+      cat "${TMP_DIR}/merge-err" >&2
       exit "$merge_exit"
     fi
   fi

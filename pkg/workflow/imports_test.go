@@ -15,6 +15,14 @@ import (
 	"github.com/github/gh-aw/pkg/workflow"
 )
 
+func compiledWorkflowBody(lock string) string {
+	lines := strings.SplitN(lock, "\n", 3)
+	if len(lines) == 3 && strings.HasPrefix(lines[0], "# gh-aw-metadata: ") && strings.HasPrefix(lines[1], "# gh-aw-manifest: ") {
+		return lines[2]
+	}
+	return lock
+}
+
 func TestCompileWorkflowWithImports(t *testing.T) {
 	// Create a temporary directory for test files
 	tempDir := testutil.TempDir(t, "test-*")
@@ -80,6 +88,57 @@ This is a test workflow.
 	// Verify the MCP URL is present
 	if !strings.Contains(workflowData, "https://example.com/mcp") {
 		t.Error("Expected compiled workflow to contain MCP URL from imported file")
+	}
+}
+
+func TestCompileWorkflowRejectsUnsupportedGitHubAccessControlFromImport(t *testing.T) {
+	tests := []struct {
+		name          string
+		field         string
+		configuration string
+	}{
+		{name: "roles", field: "roles", configuration: "roles: [write]"},
+		{name: "private-repos", field: "private-repos", configuration: "private-repos: false"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tempDir := testutil.TempDir(t, "test-unsupported-github-import-*")
+
+			sharedToolPath := filepath.Join(tempDir, "shared-tool.md")
+			sharedToolContent := "---\ntools:\n  github:\n    " + tt.configuration + "\n---\n"
+			if err := os.WriteFile(sharedToolPath, []byte(sharedToolContent), 0644); err != nil {
+				t.Fatalf("Failed to write shared tool file: %v", err)
+			}
+
+			workflowPath := filepath.Join(tempDir, "test-workflow.md")
+			workflowContent := `---
+on: issues
+permissions:
+  contents: read
+  issues: read
+engine: copilot
+strict: false
+imports:
+  - shared-tool.md
+---
+
+# Test Workflow
+
+This workflow imports shared GitHub tool configuration.
+`
+			if err := os.WriteFile(workflowPath, []byte(workflowContent), 0644); err != nil {
+				t.Fatalf("Failed to write workflow file: %v", err)
+			}
+
+			err := workflow.NewCompiler().CompileWorkflow(workflowPath)
+			if err == nil {
+				t.Fatal("Expected compilation to reject unsupported GitHub access-control fields")
+			}
+			if !strings.Contains(err.Error(), "'tools.github."+tt.field+"' is not supported by the local compiler") {
+				t.Fatalf("Expected unsupported access-control validation error, got: %v", err)
+			}
+		})
 	}
 }
 
@@ -389,6 +448,203 @@ This is a test workflow with imported MCP server.
 	}
 }
 
+// TestCompileWorkflowWithTopLevelModel verifies that a workflow declaring a top-level
+// model: field (without engine.model) compiles successfully.
+func TestCompileWorkflowWithTopLevelModel(t *testing.T) {
+	tempDir := testutil.TempDir(t, "test-*")
+
+	workflowPath := filepath.Join(tempDir, "test-workflow.md")
+	workflowContent := `---
+on: issues
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+engine: copilot
+model: small
+---
+
+# Test Workflow
+
+This workflow uses the top-level model field to express a model-size preference.
+`
+	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0644); err != nil {
+		t.Fatalf("Failed to write workflow file: %v", err)
+	}
+
+	compiler := workflow.NewCompiler()
+	if err := compiler.CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("CompileWorkflow failed for top-level model: field: %v", err)
+	}
+}
+
+// TestCompileWorkflowWithImportedTopLevelModel verifies that a workflow importing a shared
+// file that declares only a top-level model: field (without engine or engine.model) compiles
+// successfully and that the shared workflow's model is applied to the compiled output.
+func TestCompileWorkflowWithImportedTopLevelModel(t *testing.T) {
+	tempDir := testutil.TempDir(t, "test-*")
+
+	// Shared workflow that only declares a model preference using the top-level model: field
+	sharedPath := filepath.Join(tempDir, "shared-workflow.md")
+	sharedContent := `---
+model: claude-sonnet-4-5
+---
+`
+	if err := os.WriteFile(sharedPath, []byte(sharedContent), 0644); err != nil {
+		t.Fatalf("Failed to write shared workflow file: %v", err)
+	}
+
+	workflowPath := filepath.Join(tempDir, "test-workflow.md")
+	workflowContent := `---
+on: issues
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+engine: copilot
+imports:
+  - shared-workflow.md
+---
+
+# Test Workflow
+
+This workflow imports a shared file that declares a model preference via top-level model:.
+`
+	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0644); err != nil {
+		t.Fatalf("Failed to write workflow file: %v", err)
+	}
+
+	compiler := workflow.NewCompiler()
+	if err := compiler.CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("CompileWorkflow failed when imported shared workflow has top-level model: field: %v", err)
+	}
+
+	// Verify the shared workflow's model is reflected in the compiled output.
+	lockFilePath := stringutil.MarkdownToLockFile(workflowPath)
+	lockFileContent, err := os.ReadFile(lockFilePath)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockStr := string(lockFileContent)
+	if !strings.Contains(lockStr, `GH_AW_INFO_MODEL: "claude-sonnet-4-5"`) {
+		t.Errorf("Expected compiled workflow to contain GH_AW_INFO_MODEL from shared workflow's model: field")
+	}
+}
+
+// TestSharedWorkflowModelAppliedToMainWorkflow verifies the model resolution algorithm:
+// when a shared workflow declares model: and the importing main workflow does not specify
+// its own model, the shared workflow's model is considered and applied.
+func TestSharedWorkflowModelAppliedToMainWorkflow(t *testing.T) {
+	tempDir := testutil.TempDir(t, "test-*")
+
+	// Shared workflow with a model preference
+	sharedPath := filepath.Join(tempDir, "shared-config.md")
+	sharedContent := `---
+model: anthropic/claude-sonnet-4-5
+---
+`
+	if err := os.WriteFile(sharedPath, []byte(sharedContent), 0644); err != nil {
+		t.Fatalf("Failed to write shared workflow file: %v", err)
+	}
+
+	// Main workflow with no model: field — should inherit from shared workflow
+	workflowPath := filepath.Join(tempDir, "test-workflow.md")
+	workflowContent := `---
+on: issues
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+engine: copilot
+imports:
+  - shared-config.md
+---
+
+# Test Workflow
+
+This workflow inherits its model from the imported shared workflow.
+`
+	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0644); err != nil {
+		t.Fatalf("Failed to write workflow file: %v", err)
+	}
+
+	compiler := workflow.NewCompiler()
+	if err := compiler.CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("CompileWorkflow failed: %v", err)
+	}
+
+	lockFilePath := stringutil.MarkdownToLockFile(workflowPath)
+	lockFileContent, err := os.ReadFile(lockFilePath)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockStr := string(lockFileContent)
+
+	// The shared workflow's model must be present in the compiled output.
+	if !strings.Contains(lockStr, `GH_AW_INFO_MODEL: "anthropic/claude-sonnet-4-5"`) {
+		t.Errorf("Expected compiled workflow to contain GH_AW_INFO_MODEL from shared workflow's model: field, got lock file without it")
+	}
+}
+
+// TestMainWorkflowModelTakesPrecedenceOverSharedWorkflowModel verifies the model resolution
+// hierarchy: the main workflow's own model: field takes precedence over any model declared
+// in an imported shared workflow.
+func TestMainWorkflowModelTakesPrecedenceOverSharedWorkflowModel(t *testing.T) {
+	tempDir := testutil.TempDir(t, "test-*")
+
+	// Shared workflow with a model preference
+	sharedPath := filepath.Join(tempDir, "shared-config.md")
+	sharedContent := `---
+model: anthropic/claude-sonnet-4-5
+---
+`
+	if err := os.WriteFile(sharedPath, []byte(sharedContent), 0644); err != nil {
+		t.Fatalf("Failed to write shared workflow file: %v", err)
+	}
+
+	// Main workflow with its own model: field — must override the shared workflow's model
+	workflowPath := filepath.Join(tempDir, "test-workflow.md")
+	workflowContent := `---
+on: issues
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+engine: copilot
+model: openai/gpt-5.4
+imports:
+  - shared-config.md
+---
+
+# Test Workflow
+
+This workflow overrides the shared workflow's model with its own model: field.
+`
+	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0644); err != nil {
+		t.Fatalf("Failed to write workflow file: %v", err)
+	}
+
+	compiler := workflow.NewCompiler()
+	if err := compiler.CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("CompileWorkflow failed: %v", err)
+	}
+
+	lockFilePath := stringutil.MarkdownToLockFile(workflowPath)
+	lockFileContent, err := os.ReadFile(lockFilePath)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+	lockStr := compiledWorkflowBody(string(lockFileContent))
+
+	// Main workflow's model must win.
+	if !strings.Contains(lockStr, `GH_AW_INFO_MODEL: "openai/gpt-5.4"`) {
+		t.Errorf("Expected main workflow model 'openai/gpt-5.4' to take precedence over shared workflow model")
+	}
+	if strings.Contains(lockStr, "claude-sonnet-4-5") {
+		t.Errorf("Shared workflow model 'claude-sonnet-4-5' must not appear when main workflow specifies its own model")
+	}
+}
+
 // TestCompileWorkflowWithModelOnlyEngine verifies that a workflow declaring
 // engine.model without engine.id compiles successfully. This allows workflow
 // authors to express a model-size preference (e.g. "small") without committing
@@ -464,4 +720,36 @@ This workflow imports a shared file that declares a model preference.
 	if err := compiler.CompileWorkflow(workflowPath); err != nil {
 		t.Fatalf("CompileWorkflow failed when imported shared workflow has engine.model without engine.id: %v", err)
 	}
+}
+
+func TestMergeNetworkPermissionsPreservesImportedRestrictions(t *testing.T) {
+	compiler := workflow.NewCompiler()
+
+	t.Run("blocked domains", func(t *testing.T) {
+		permissions, err := compiler.MergeNetworkPermissions(
+			&workflow.NetworkPermissions{Allowed: []string{"defaults"}},
+			`{"blocked":["tracker.example.com"]}`,
+		)
+
+		if err != nil {
+			t.Fatalf("MergeNetworkPermissions returned an error: %v", err)
+		}
+		if len(permissions.Blocked) != 1 || permissions.Blocked[0] != "tracker.example.com" {
+			t.Errorf("expected imported blocked domain to be preserved, got %v", permissions.Blocked)
+		}
+	})
+
+	t.Run("empty network object", func(t *testing.T) {
+		permissions, err := compiler.MergeNetworkPermissions(
+			&workflow.NetworkPermissions{Allowed: []string{"defaults"}},
+			"{}\n{\"allowed\":[\"example.com\"]}",
+		)
+
+		if err != nil {
+			t.Fatalf("MergeNetworkPermissions returned an error: %v", err)
+		}
+		if len(permissions.Allowed) != 0 || !permissions.ExplicitlyDefined {
+			t.Errorf("expected imported empty network object to preserve deny-all semantics, got %+v", permissions)
+		}
+	})
 }

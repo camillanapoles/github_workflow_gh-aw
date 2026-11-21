@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/cli/go-gh/v2/pkg/api"
@@ -16,7 +17,7 @@ const copilotBillingTimeout = 3 * time.Second
 // copilotBillingInconclusiveNote is the user-facing message printed when the
 // org's Copilot CLI billing status cannot be confirmed (non-200 response,
 // network error, missing field, or no org login available).
-const copilotBillingInconclusiveNote = "Could not confirm org Copilot CLI billing — check with your org admin."
+const copilotBillingInconclusiveNote = "Could not confirm org Copilot CLI billing."
 
 // detectOrgCopilotCLIBillingWithClient calls GET /orgs/{org}/copilot/billing with
 // a 3 s timeout and returns the raw "cli" field. Any non-200 response or error
@@ -27,7 +28,7 @@ func detectOrgCopilotCLIBillingWithClient(ctx context.Context, orgLogin string, 
 	var result struct {
 		CLI string `json:"cli"`
 	}
-	if err := client.DoWithContext(ctx, "GET", fmt.Sprintf("orgs/%s/copilot/billing", orgLogin), nil, &result); err != nil {
+	if err := client.DoWithContext(ctx, http.MethodGet, fmt.Sprintf("orgs/%s/copilot/billing", orgLogin), nil, &result); err != nil {
 		return "", err
 	}
 	return result.CLI, nil
@@ -78,11 +79,16 @@ func probeCopilotBillingForOrgWithClient(ctx context.Context, orgLogin string, c
 			BillingStatus: cliStatus,
 			LabelSuffix:   " [recommended — org Copilot CLI billing enabled]",
 		}
-	default: // "disabled" or any other policy value
+	case cliStatus == "disabled":
 		return orgCopilotBillingProbeResult{
 			BillingStatus: cliStatus,
 			LabelSuffix:   fmt.Sprintf(" [not available — org Copilot CLI billing: %s]", cliStatus),
 			Disabled:      true,
+		}
+	default: // Unknown policy values are treated as inconclusive.
+		return orgCopilotBillingProbeResult{
+			BillingStatus: cliStatus,
+			InfoNote:      copilotBillingInconclusiveNote,
 		}
 	}
 }

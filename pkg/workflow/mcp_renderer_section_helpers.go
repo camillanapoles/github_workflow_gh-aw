@@ -46,18 +46,44 @@ func writeJSONStringMapEntriesRaw(yaml *strings.Builder, values map[string]strin
 	}
 }
 
-// writeJSONStringMapSectionRaw writes a JSON object section using writeJSONStringMapEntriesRaw.
-// Use this for env and headers sections in unquoted heredoc MCP configs.  Values are
-// JSON-encoded (so special chars remain safe) with the double-escape of shell
-// placeholders (\${VAR} → \\${VAR}) undone so bash can process them correctly.
-func writeJSONStringMapSectionRaw(yaml *strings.Builder, indent, name string, values map[string]string, trailingComma bool) {
+func marshalMCPHeredocString(value string) string {
+	// Former expanding-heredoc escapes are syntax, not payload bytes. JSON owns
+	// escaping first; then protect every shell metacharacter in the heredoc.
+	value = normalizeMCPHeredocEscapes(value)
+	encoded := mustMarshalJSONString(value)
+	return strings.NewReplacer(`\`, `\\`, "$", `\$`, "`", "\\`").Replace(encoded)
+}
+
+func normalizeMCPHeredocEscapes(value string) string {
+	return strings.NewReplacer(`\$`, `$`, "\\`", "`").Replace(value)
+}
+
+func writeMCPHeredocStringMapEntries(yaml *strings.Builder, values map[string]string, indent string) {
+	keys := sliceutil.SortedKeys(values)
+	for i, key := range keys {
+		fmt.Fprintf(yaml, "%s%s: %s%s\n", indent, marshalMCPHeredocString(key), marshalMCPHeredocString(normalizeMCPShellReferences(values[key])), renderMCPComma(i == len(keys)-1)) //nolint:fprintferrorunchecked // strings.Builder writes cannot fail.
+	}
+}
+
+// writeJSONStringMapSectionWithEntries writes a JSON object section, delegating
+// per-entry serialisation to writeEntries.  writeEntries receives the builder,
+// the values map, and the child indent string (indent+"  ").
+func writeJSONStringMapSectionWithEntries(yaml *strings.Builder, indent, name string, values map[string]string, trailingComma bool, writeEntries func(*strings.Builder, map[string]string, string)) {
 	fmt.Fprintf(yaml, "%s\"%s\": {\n", indent, name)
-	writeJSONStringMapEntriesRaw(yaml, values, indent+"  ")
+	writeEntries(yaml, values, indent+"  ")
 	if trailingComma {
 		fmt.Fprintf(yaml, "%s},\n", indent)
 		return
 	}
 	fmt.Fprintf(yaml, "%s}\n", indent)
+}
+
+// writeJSONStringMapSectionRaw writes a JSON object section using writeJSONStringMapEntriesRaw.
+// Use this for env and headers sections in unquoted heredoc MCP configs.  Values are
+// JSON-encoded (so special chars remain safe) with the double-escape of shell
+// placeholders (\${VAR} → \\${VAR}) undone so bash can process them correctly.
+func writeJSONStringMapSectionRaw(yaml *strings.Builder, indent, name string, values map[string]string, trailingComma bool) {
+	writeJSONStringMapSectionWithEntries(yaml, indent, name, values, trailingComma, writeJSONStringMapEntriesRaw)
 }
 
 func mustMarshalJSONString(value string) string {
@@ -69,13 +95,7 @@ func mustMarshalJSONString(value string) string {
 }
 
 func writeJSONStringMapSection(yaml *strings.Builder, indent, name string, values map[string]string, trailingComma bool) {
-	fmt.Fprintf(yaml, "%s\"%s\": {\n", indent, name)
-	writeJSONStringMapEntries(yaml, values, indent+"  ")
-	if trailingComma {
-		fmt.Fprintf(yaml, "%s},\n", indent)
-		return
-	}
-	fmt.Fprintf(yaml, "%s}\n", indent)
+	writeJSONStringMapSectionWithEntries(yaml, indent, name, values, trailingComma, writeJSONStringMapEntries)
 }
 
 func writeTOMLInlineStringMapSection(yaml *strings.Builder, indent, name string, values map[string]string) {
@@ -96,7 +116,7 @@ func writeTOMLInlineStringMapSection(yaml *strings.Builder, indent, name string,
 // trailing slash) because github-mcp-server expects GITHUB_HOST in the same
 // format that GitHub Actions exposes via GITHUB_SERVER_URL (for example
 // https://github.com or https://myorg.ghe.com).
-func buildGitHubMCPEnvVars(tokenValue, hostValue string, readOnly, lockdown bool, toolsets string) map[string]string {
+func buildGitHubMCPEnvVars(tokenValue, hostValue string, readOnly, lockdown bool, toolsets, features string) map[string]string {
 	envVars := map[string]string{
 		"GITHUB_PERSONAL_ACCESS_TOKEN": tokenValue,
 		"GITHUB_HOST":                  hostValue,
@@ -114,13 +134,17 @@ func buildGitHubMCPEnvVars(tokenValue, hostValue string, readOnly, lockdown bool
 		envVars["GITHUB_TOOLSETS"] = toolsets
 	}
 
+	if features != "" {
+		envVars["GITHUB_FEATURES"] = features
+	}
+
 	// Note: tokenValue is a secret and is intentionally not logged.
-	mcpRendererSectionHelpersLog.Printf("Built GitHub MCP env vars: host=%s, readOnly=%v, lockdown=%v, hasToolsets=%v", hostValue, readOnly, lockdown, toolsets != "")
+	mcpRendererSectionHelpersLog.Printf("Built GitHub MCP env vars: host=%s, readOnly=%v, lockdown=%v, hasToolsets=%v, hasFeatures=%v", hostValue, readOnly, lockdown, toolsets != "", features != "")
 
 	return envVars
 }
 
-func buildGitHubMCPRemoteHeaders(authValue string, readOnly, lockdown bool, toolsets string) map[string]string {
+func buildGitHubMCPRemoteHeaders(authValue string, readOnly, lockdown bool, toolsets, features string) map[string]string {
 	headers := map[string]string{
 		"Authorization": authValue,
 	}
@@ -137,8 +161,12 @@ func buildGitHubMCPRemoteHeaders(authValue string, readOnly, lockdown bool, tool
 		headers["X-MCP-Toolsets"] = toolsets
 	}
 
+	if features != "" {
+		headers["X-MCP-Features"] = features
+	}
+
 	// Note: authValue is a secret and is intentionally not logged.
-	mcpRendererSectionHelpersLog.Printf("Built GitHub MCP remote headers: readOnly=%v, lockdown=%v, hasToolsets=%v", readOnly, lockdown, toolsets != "")
+	mcpRendererSectionHelpersLog.Printf("Built GitHub MCP remote headers: readOnly=%v, lockdown=%v, hasToolsets=%v, hasFeatures=%v", readOnly, lockdown, toolsets != "", features != "")
 
 	return headers
 }
@@ -161,4 +189,22 @@ func renderGitHubMCPGuardPolicies(yaml *strings.Builder, guardPolicies map[strin
 	if len(guardPolicies) > 0 {
 		renderGuardPoliciesJSON(yaml, guardPolicies, indent)
 	}
+}
+
+// appendRequiredFalseField writes a "required": false field as the final field of the
+// current JSON object. renderGitHubMCPGuardPolicies (and other section helpers) always
+// render their field as the last field with no trailing comma, so when a field must
+// follow it, the preceding trailing newline must be replaced with ",\n" in place rather
+// than writing a bare "," on its own line: a line with no leading indentation would
+// dedent out of the enclosing "run: |" block scalar and corrupt the surrounding YAML.
+func appendRequiredFalseField(yaml *strings.Builder, precededByField bool, indent string) {
+	if precededByField {
+		content := yaml.String()
+		if trimmed, ok := strings.CutSuffix(content, "\n"); ok {
+			yaml.Reset()
+			yaml.WriteString(trimmed)
+			yaml.WriteString(",\n")
+		}
+	}
+	fmt.Fprintf(yaml, "%s\"required\": false\n", indent)
 }

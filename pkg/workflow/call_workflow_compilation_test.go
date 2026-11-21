@@ -53,6 +53,42 @@ jobs:
 `
 }
 
+func TestSafeOutputAuthorizationWorkflowLaunchCompilation(t *testing.T) {
+	dir := filepath.Join(testutil.TempDir(t, "authorized-call-workflow"), ".github", "workflows")
+	require.NoError(t, os.MkdirAll(dir, 0755))
+	createWorker(t, dir, "worker", "")
+	lock := compileAndReadLock(t, filepath.Join(dir, "gateway.md"), `---
+on: workflow_dispatch
+engine: copilot
+permissions:
+  contents: read
+safe-outputs:
+  authorization:
+    endpoint: https://authority.example/authorize
+    audience: gh-aw
+  call-workflow:
+    workflows: [worker]
+---
+Call the reviewed worker.
+`)
+	var workflow struct {
+		Jobs map[string]struct {
+			If          string
+			Needs       any
+			Uses        string
+			Permissions map[string]string
+		}
+	}
+	require.NoError(t, yaml.Unmarshal([]byte(lock), &workflow))
+	launch := workflow.Jobs["call-worker"]
+	require.Equal(t, "./.github/workflows/worker.lock.yml", launch.Uses)
+	require.Contains(t, launch.Needs, "authorize-call-worker")
+	require.Contains(t, launch.If, "authorized")
+	require.Equal(t, "write", workflow.Jobs["authorize-call-worker"].Permissions["id-token"])
+	require.NotEqual(t, "write", launch.Permissions["id-token"])
+	require.Contains(t, lock, "call_workflow:launch:worker")
+}
+
 // createWorker writes a worker lock file to the .github/workflows directory.
 func createWorker(t *testing.T, workflowsDir, name, inputs string) {
 	t.Helper()
@@ -565,8 +601,8 @@ safe-outputs:
 	compiler := NewCompiler(WithVersion("1.0.0"))
 	err = compiler.CompileWorkflow(gatewayFile)
 	require.Error(t, err, "Should fail when worker lacks workflow_call trigger")
-	assert.Contains(t, err.Error(), "workflow_call", "Error should mention workflow_call")
-	assert.Contains(t, err.Error(), "no-call-worker", "Error should mention the workflow name")
+	require.ErrorContains(t, err, "workflow_call", "Error should mention workflow_call")
+	require.ErrorContains(t, err, "no-call-worker", "Error should mention the workflow name")
 }
 
 // TestCallWorkflowCompile_ValidationFails_SelfReference verifies that compilation fails
@@ -595,7 +631,7 @@ safe-outputs:
 	compiler := NewCompiler(WithVersion("1.0.0"))
 	err := compiler.CompileWorkflow(gatewayFile)
 	require.Error(t, err, "Should fail for self-reference")
-	assert.Contains(t, err.Error(), "self-reference", "Error should mention self-reference")
+	require.ErrorContains(t, err, "self-reference", "Error should mention self-reference")
 }
 
 // TestCallWorkflowCompile_ValidationFails_WorkerNotFound verifies compilation fails
@@ -624,8 +660,8 @@ safe-outputs:
 	compiler := NewCompiler(WithVersion("1.0.0"))
 	err := compiler.CompileWorkflow(gatewayFile)
 	require.Error(t, err, "Should fail for missing worker")
-	assert.Contains(t, err.Error(), "not found", "Error should mention not found")
-	assert.Contains(t, err.Error(), "nonexistent-worker", "Error should name the missing workflow")
+	require.ErrorContains(t, err, "not found", "Error should mention not found")
+	require.ErrorContains(t, err, "nonexistent-worker", "Error should name the missing workflow")
 }
 
 // TestCallWorkflowCompile_ValidationFails_DuplicateWorkflow verifies that compilation
@@ -659,8 +695,8 @@ safe-outputs:
 	compiler := NewCompiler(WithVersion("1.0.0"))
 	err := compiler.CompileWorkflow(gatewayFile)
 	require.Error(t, err, "Should fail for duplicate workflow name")
-	assert.Contains(t, err.Error(), "duplicate", "Error should mention duplicate")
-	assert.Contains(t, err.Error(), "worker-a", "Error should name the duplicate workflow")
+	require.ErrorContains(t, err, "duplicate", "Error should mention duplicate")
+	require.ErrorContains(t, err, "worker-a", "Error should name the duplicate workflow")
 }
 
 // TestCallWorkflowCompile_MDSourceWorker tests that compilation succeeds when the

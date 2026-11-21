@@ -121,8 +121,8 @@ func TestValidateEngineAuthDefinition_MissingTokenURL(t *testing.T) {
 
 	err := compiler.validateEngineAuthDefinition(config)
 	require.Error(t, err, "missing token-url should produce an error")
-	assert.Contains(t, err.Error(), "token-url", "error should mention missing token-url field")
-	assert.Contains(t, err.Error(), "oauth-client-credentials", "error should mention the strategy")
+	require.ErrorContains(t, err, "token-url", "error should mention missing token-url field")
+	require.ErrorContains(t, err, "oauth-client-credentials", "error should mention the strategy")
 }
 
 // TestValidateEngineAuthDefinition_MissingClientID verifies that omitting client-id
@@ -142,7 +142,7 @@ func TestValidateEngineAuthDefinition_MissingClientID(t *testing.T) {
 
 	err := compiler.validateEngineAuthDefinition(config)
 	require.Error(t, err, "missing client-id should produce an error")
-	assert.Contains(t, err.Error(), "client-id", "error should mention missing client-id field")
+	require.ErrorContains(t, err, "client-id", "error should mention missing client-id field")
 }
 
 // TestValidateEngineAuthDefinition_MissingClientSecret verifies that omitting client-secret
@@ -162,7 +162,7 @@ func TestValidateEngineAuthDefinition_MissingClientSecret(t *testing.T) {
 
 	err := compiler.validateEngineAuthDefinition(config)
 	require.Error(t, err, "missing client-secret should produce an error")
-	assert.Contains(t, err.Error(), "client-secret", "error should mention missing client-secret field")
+	require.ErrorContains(t, err, "client-secret", "error should mention missing client-secret field")
 }
 
 // TestValidateEngineAuthDefinition_MissingHeaderNameForOAuth verifies that omitting
@@ -182,7 +182,7 @@ func TestValidateEngineAuthDefinition_MissingHeaderNameForOAuth(t *testing.T) {
 
 	err := compiler.validateEngineAuthDefinition(config)
 	require.Error(t, err, "missing header-name for oauth should produce an error")
-	assert.Contains(t, err.Error(), "header-name", "error should mention missing header-name field")
+	require.ErrorContains(t, err, "header-name", "error should mention missing header-name field")
 }
 
 // TestValidateEngineAuthDefinition_MissingHeaderNameForAPIKey verifies that api-key
@@ -200,7 +200,7 @@ func TestValidateEngineAuthDefinition_MissingHeaderNameForAPIKey(t *testing.T) {
 
 	err := compiler.validateEngineAuthDefinition(config)
 	require.Error(t, err, "api-key without header-name should produce an error")
-	assert.Contains(t, err.Error(), "header-name", "error should mention missing header-name field")
+	require.ErrorContains(t, err, "header-name", "error should mention missing header-name field")
 }
 
 // TestValidateEngineAuthDefinition_APIKeyRequiresSecret verifies that api-key
@@ -219,7 +219,7 @@ func TestValidateEngineAuthDefinition_APIKeyRequiresSecret(t *testing.T) {
 
 	err := compiler.validateEngineAuthDefinition(config)
 	require.Error(t, err, "api-key without secret should produce an error")
-	assert.Contains(t, err.Error(), "auth.secret", "error should mention missing secret field")
+	require.ErrorContains(t, err, "auth.secret", "error should mention missing secret field")
 }
 
 // TestValidateEngineAuthDefinition_BearerRequiresSecret verifies that bearer
@@ -237,7 +237,7 @@ func TestValidateEngineAuthDefinition_BearerRequiresSecret(t *testing.T) {
 
 	err := compiler.validateEngineAuthDefinition(config)
 	require.Error(t, err, "bearer without secret should produce an error")
-	assert.Contains(t, err.Error(), "auth.secret", "error should mention missing secret field")
+	require.ErrorContains(t, err, "auth.secret", "error should mention missing secret field")
 }
 
 // TestValidateEngineAuthDefinition_APIKeyValid verifies that a complete api-key definition
@@ -289,10 +289,10 @@ func TestValidateEngineAuthDefinition_UnknownStrategy(t *testing.T) {
 
 	err := compiler.validateEngineAuthDefinition(config)
 	require.Error(t, err, "unknown strategy should produce an error")
-	assert.Contains(t, err.Error(), "invalid-strategy", "error should mention the unknown strategy")
-	assert.Contains(t, err.Error(), "api-key", "error should list valid strategies")
-	assert.Contains(t, err.Error(), "oauth-client-credentials", "error should list valid strategies")
-	assert.Contains(t, err.Error(), "bearer", "error should list valid strategies")
+	require.ErrorContains(t, err, "invalid-strategy", "error should mention the unknown strategy")
+	require.ErrorContains(t, err, "api-key", "error should list valid strategies")
+	require.ErrorContains(t, err, "oauth-client-credentials", "error should list valid strategies")
+	require.ErrorContains(t, err, "bearer", "error should list valid strategies")
 }
 
 // TestValidateEngineAuthDefinition_NilAuth verifies that a nil InlineProviderAuth is a no-op.
@@ -397,7 +397,7 @@ func TestBuiltInEngineCatalogIncludesBuiltIns(t *testing.T) {
 	registry := NewEngineRegistry()
 	catalog := NewEngineCatalog(registry)
 
-	engineIDs := []string{"antigravity", "claude", "codex", "copilot", "crush", "gemini", "opencode", "pi"}
+	engineIDs := []string{"claude", "codex", "copilot", "gemini", "pi"}
 
 	for _, engineID := range engineIDs {
 		t.Run(engineID, func(t *testing.T) {
@@ -518,6 +518,69 @@ func TestParseRequestShape(t *testing.T) {
 			assert.Equal(t, tt.expected, *result, "parsed RequestShape should match expected")
 		})
 	}
+}
+
+func TestDecodeEngineConfigRejectsInvalidValues(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		input  map[string]any
+		target any
+	}{
+		{
+			name:   "auth field wrong type",
+			input:  map[string]any{"secret": 42},
+			target: &AuthDefinition{},
+		},
+		{
+			name:   "request map value wrong type",
+			input:  map[string]any{"query": map[string]any{"api-version": 42}},
+			target: &RequestShape{},
+		},
+		{
+			name:   "engine auth field wrong type",
+			input:  map[string]any{"audience": 42},
+			target: &EngineAuthConfig{},
+		},
+		{
+			name:   "engine auth null scalar field",
+			input:  map[string]any{"audience": nil},
+			target: &EngineAuthConfig{},
+		},
+		{
+			name:   "auth null scalar field",
+			input:  map[string]any{"secret": nil},
+			target: &AuthDefinition{},
+		},
+		{
+			name:   "request null map value",
+			input:  map[string]any{"query": map[string]any{"api-version": nil}},
+			target: &RequestShape{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require.Error(t, decodeEngineConfig(tt.input, tt.target))
+		})
+	}
+}
+
+// TestDecodeEngineConfigDoesNotPartiallyPopulateTargetOnError verifies that a decode
+// failure partway through a configuration leaves target at its zero value instead of
+// a struct with some fields already applied from the malformed input.
+func TestDecodeEngineConfigDoesNotPartiallyPopulateTargetOnError(t *testing.T) {
+	t.Parallel()
+
+	auth := &AuthDefinition{}
+	err := decodeEngineConfig(map[string]any{
+		"secret":      "MY_SECRET",
+		"token-field": 42, // invalid type: should abort the whole decode
+	}, auth)
+	require.Error(t, err)
+	assert.Equal(t, AuthDefinition{}, *auth, "target should remain zero-valued when decode fails")
 }
 
 // newTestCompiler creates a minimal Compiler for unit testing engine-definition logic.

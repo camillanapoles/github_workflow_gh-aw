@@ -17,6 +17,7 @@ import (
 
 // TestHeaderRoundTripper tests the custom RoundTripper that adds headers
 func TestHeaderRoundTripper(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name            string
 		headers         map[string]string
@@ -51,6 +52,7 @@ func TestHeaderRoundTripper(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			// Create a test server that captures headers
 			capturedHeaders := make(map[string]string)
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -63,9 +65,12 @@ func TestHeaderRoundTripper(t *testing.T) {
 			defer server.Close()
 
 			// Create HTTP client with custom round tripper
+			// Use a private transport so parallel tests closing idle connections on http.DefaultTransport can't break this request
+			base := http.DefaultTransport.(*http.Transport).Clone()
+			defer base.CloseIdleConnections()
 			client := &http.Client{
 				Transport: &headerRoundTripper{
-					base:    http.DefaultTransport,
+					base:    base,
 					headers: tt.headers,
 				},
 			}
@@ -94,6 +99,7 @@ func TestHeaderRoundTripper(t *testing.T) {
 
 // TestConnectHTTPMCPServer_WithHeaders tests HTTP MCP server connection with custom headers
 func TestConnectHTTPMCPServer_WithHeaders(t *testing.T) {
+	t.Parallel()
 	// Track whether headers were received
 	receivedHeaders := make(map[string]string)
 
@@ -175,6 +181,7 @@ func TestConnectHTTPMCPServer_WithHeaders(t *testing.T) {
 
 // TestConnectHTTPMCPServer_NoHeaders tests that connection works without headers
 func TestConnectHTTPMCPServer_NoHeaders(t *testing.T) {
+	t.Parallel()
 	requestCount := 0
 
 	// Create a mock MCP server
@@ -229,6 +236,7 @@ func TestConnectHTTPMCPServer_NoHeaders(t *testing.T) {
 
 // TestConnectHTTPMCPServer_NilHeaders tests that nil headers don't cause issues
 func TestConnectHTTPMCPServer_NilHeaders(t *testing.T) {
+	t.Parallel()
 	requestCount := 0
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -12,6 +12,7 @@ import (
 )
 
 func TestNewSecretsCommand(t *testing.T) {
+	t.Parallel()
 	cmd := NewSecretsCommand()
 
 	require.NotNil(t, cmd, "NewSecretsCommand should not return nil")
@@ -41,14 +42,16 @@ func TestNewSecretsCommand(t *testing.T) {
 }
 
 func TestSecretsCommandHelp(t *testing.T) {
+	t.Parallel()
 	cmd := NewSecretsCommand()
 
 	// Verify RunE returns help when command is run without subcommand
 	err := cmd.RunE(cmd, []string{})
-	assert.NoError(t, err, "Running secrets command without subcommand should show help without error")
+	require.NoError(t, err, "Running secrets command without subcommand should show help without error")
 }
 
 func TestSecretsCommandStructure(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name           string
 		expectedUse    string
@@ -71,7 +74,8 @@ func TestSecretsCommandStructure(t *testing.T) {
 	}
 }
 
-func TestSecretsBootstrapEngineFlagIncludesGemini(t *testing.T) {
+func TestSecretsBootstrapEngineFlagUsage(t *testing.T) {
+	t.Parallel()
 	cmd := NewSecretsCommand()
 
 	var bootstrapCmd *cobra.Command
@@ -86,10 +90,16 @@ func TestSecretsBootstrapEngineFlagIncludesGemini(t *testing.T) {
 
 	engineFlag := bootstrapCmd.Flags().Lookup("engine")
 	require.NotNil(t, engineFlag, "--engine flag should exist on bootstrap")
-	assert.Contains(t, engineFlag.Usage, "gemini", "--engine help should include gemini engine")
+
+	// Assert the full shared engine list is present so future additions are detected.
+	expectedEngines := []string{"copilot", "claude", "codex", "gemini", "pi", "agy"}
+	for _, engine := range expectedEngines {
+		assert.Contains(t, engineFlag.Usage, engine, "--engine help should include %s engine", engine)
+	}
 }
 
 func TestSecretsCommandUnknownSubcommandReturnsError(t *testing.T) {
+	t.Parallel()
 	cmd := NewSecretsCommand()
 	cmd.SetOut(io.Discard)
 	cmd.SetErr(io.Discard)
@@ -99,5 +109,5 @@ func TestSecretsCommandUnknownSubcommandReturnsError(t *testing.T) {
 
 	err := cmd.Execute()
 	require.Error(t, err)
-	assert.Equal(t, `unknown command "unknown-cmd" for "secrets"`, err.Error())
+	assert.Equal(t, `unknown command "unknown-cmd" for "gh aw secrets"`, err.Error())
 }

@@ -4,12 +4,15 @@ package workflow
 
 import (
 	"encoding/json"
+	"fmt"
+	"slices"
+	"strings"
 	"testing"
 )
 
 func TestGetValidationConfigJSON(t *testing.T) {
 	// Test with nil (all types)
-	jsonStr, err := GetValidationConfigJSON(nil, nil)
+	jsonStr, err := GetValidationConfigJSONWithDataSchema(nil, nil, false, nil)
 	if err != nil {
 		t.Fatalf("GetValidationConfigJSON() error = %v", err)
 	}
@@ -25,6 +28,7 @@ func TestGetValidationConfigJSON(t *testing.T) {
 	expectedTypes := []string{
 		"create_issue",
 		"create_agent_session",
+		"approve_workflow_run",
 		"add_comment",
 		"create_pull_request",
 		"add_labels",
@@ -41,7 +45,7 @@ func TestGetValidationConfigJSON(t *testing.T) {
 		"close_discussion",
 		"close_issue",
 		"close_pull_request",
-		"missing_tool",
+		"report_missing_tool",
 		"update_release",
 		"upload_asset",
 		"noop",
@@ -52,7 +56,7 @@ func TestGetValidationConfigJSON(t *testing.T) {
 		"replace_label",
 		"unassign_from_user",
 		"hide_comment",
-		"missing_data",
+		"report_missing_data",
 		"autofix_code_scanning_alert",
 		"mark_pull_request_as_ready_for_review",
 		"report_incomplete",
@@ -70,10 +74,154 @@ func TestGetValidationConfigJSON(t *testing.T) {
 	}
 }
 
+func TestNoOpValidationConfig(t *testing.T) {
+	config, ok := ValidationConfig["noop"]
+	if !ok {
+		t.Fatal("noop not found in ValidationConfig")
+	}
+
+	if config.DefaultMax != 2 {
+		t.Errorf("noop DefaultMax = %d, want 2", config.DefaultMax)
+	}
+}
+
+func TestCreateIssueArtifactsValidationConfig(t *testing.T) {
+	jsonStr, err := GetValidationConfigJSONWithDataSchema([]string{"create_issue"}, nil, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed map[string]TypeValidationConfig
+	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	artifacts, ok := parsed["create_issue"].Fields["artifacts"]
+	if !ok || artifacts.Type != "array" || artifacts.Required || artifacts.ItemSanitize {
+		t.Fatalf("artifacts validation = %+v, want an optional array preserved for handler validation", artifacts)
+	}
+}
+
+func TestApproveWorkflowRunValidationConfig(t *testing.T) {
+	config, ok := ValidationConfig["approve_workflow_run"]
+	if !ok {
+		t.Fatal("approve_workflow_run not found in ValidationConfig")
+	}
+
+	if config.DefaultMax != 1 {
+		t.Errorf("approve_workflow_run DefaultMax = %d, want 1", config.DefaultMax)
+	}
+	if runID := config.Fields["run_id"]; !runID.Required || !runID.PositiveInteger {
+		t.Errorf("approve_workflow_run run_id = %+v, want required positive integer", runID)
+	}
+
+	jsonStr, err := GetValidationConfigJSONWithDataSchema([]string{"approve_workflow_run"}, nil, false, nil)
+	if err != nil {
+		t.Fatalf("GetValidationConfigJSONWithDataSchema() error = %v", err)
+	}
+	var parsed map[string]TypeValidationConfig
+	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+		t.Fatalf("Failed to parse validation config JSON: %v", err)
+	}
+	parsedConfig, ok := parsed["approve_workflow_run"]
+	if len(parsed) != 1 || !ok || parsedConfig.DefaultMax != 1 {
+		t.Errorf("approve_workflow_run validation config = %#v, want defaultMax 1", parsedConfig)
+	}
+	if runID := parsedConfig.Fields["run_id"]; !runID.Required || !runID.PositiveInteger {
+		t.Errorf("approve_workflow_run generated run_id = %+v, want required positive integer", runID)
+	}
+}
+
+// TestCallWorkflowValidationConfigPreservesWorkflowName is a regression test for
+// samples-mode call-workflow replay dropping the workflow name (github/gh-aw#55176):
+// without a "call_workflow" entry in ValidationConfig, collect_ndjson_output.cjs
+// fell back to validateItemWithSafeJobConfig, which drops every field except
+// "type" because the call_workflow safe-outputs config has no "inputs" key. This
+// test verifies the compiler emits a validation config that declares
+// "workflow_name" (required) and "inputs" for call_workflow, mirroring
+// dispatch_workflow, so the field survives ingestion.
+func TestCallWorkflowValidationConfigPreservesWorkflowName(t *testing.T) {
+	config, ok := ValidationConfig["call_workflow"]
+	if !ok {
+		t.Fatal("call_workflow not found in ValidationConfig")
+	}
+	if config.DefaultMax != 1 {
+		t.Errorf("call_workflow DefaultMax = %d, want 1", config.DefaultMax)
+	}
+	workflowName, ok := config.Fields["workflow_name"]
+	if !ok || !workflowName.Required || workflowName.Type != "string" {
+		t.Errorf("call_workflow workflow_name = %+v, want required string", workflowName)
+	}
+	inputs, ok := config.Fields["inputs"]
+	if !ok || inputs.Type != "object" {
+		t.Errorf("call_workflow inputs = %+v, want object", inputs)
+	}
+
+	jsonStr, err := GetValidationConfigJSONWithDataSchema([]string{"call_workflow"}, nil, false, nil)
+	if err != nil {
+		t.Fatalf("GetValidationConfigJSONWithDataSchema() error = %v", err)
+	}
+	var parsed map[string]TypeValidationConfig
+	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+		t.Fatalf("Failed to parse validation config JSON: %v", err)
+	}
+	parsedConfig, ok := parsed["call_workflow"]
+	if len(parsed) != 1 || !ok || parsedConfig.DefaultMax != 1 {
+		t.Errorf("call_workflow validation config = %#v, want defaultMax 1", parsedConfig)
+	}
+	if workflowName := parsedConfig.Fields["workflow_name"]; !workflowName.Required || workflowName.Type != "string" {
+		t.Errorf("generated call_workflow workflow_name = %+v, want required string", workflowName)
+	}
+}
+
+func TestDismissPullRequestReviewValidationConfigSupportsAutoReviewID(t *testing.T) {
+	config, ok := ValidationConfig["dismiss_pull_request_review"]
+	if !ok {
+		t.Fatal("dismiss_pull_request_review not found in ValidationConfig")
+	}
+	if reviewID := config.Fields["review_id"]; !reviewID.OptionalPositiveInteger || !reviewID.AllowAuto || reviewID.Required || reviewID.PositiveInteger {
+		t.Errorf("dismiss_pull_request_review review_id = %+v, want optional positive integer or auto", reviewID)
+	}
+
+	jsonStr, err := GetValidationConfigJSONWithDataSchema([]string{"dismiss_pull_request_review"}, nil, false, nil)
+	if err != nil {
+		t.Fatalf("GetValidationConfigJSONWithDataSchema() error = %v", err)
+	}
+	var parsed map[string]TypeValidationConfig
+	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+		t.Fatalf("Failed to parse validation config JSON: %v", err)
+	}
+	if reviewID := parsed["dismiss_pull_request_review"].Fields["review_id"]; !reviewID.OptionalPositiveInteger || !reviewID.AllowAuto {
+		t.Errorf("generated dismiss_pull_request_review review_id = %+v, want optional positive integer or auto", reviewID)
+	}
+}
+
+func TestUpdatePullRequestValidationConfigSupportsReplaceIsland(t *testing.T) {
+	config, ok := ValidationConfig["update_pull_request"]
+	if !ok {
+		t.Fatal("update_pull_request not found in ValidationConfig")
+	}
+	operation := config.Fields["operation"]
+	if !slices.Contains(operation.Enum, "replace-island") {
+		t.Fatalf("update_pull_request operation enum = %v, want replace-island", operation.Enum)
+	}
+
+	jsonStr, err := GetValidationConfigJSONWithDataSchema([]string{"update_pull_request"}, nil, false, nil)
+	if err != nil {
+		t.Fatalf("GetValidationConfigJSONWithDataSchema() error = %v", err)
+	}
+	var parsed map[string]TypeValidationConfig
+	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+		t.Fatalf("Failed to parse validation config JSON: %v", err)
+	}
+	parsedOperation := parsed["update_pull_request"].Fields["operation"]
+	if !slices.Contains(parsedOperation.Enum, "replace-island") {
+		t.Fatalf("generated update_pull_request operation enum = %v, want replace-island", parsedOperation.Enum)
+	}
+}
+
 func TestGetValidationConfigJSONFiltered(t *testing.T) {
 	// Test with filtered types
 	enabledTypes := []string{"create_issue", "add_comment"}
-	jsonStr, err := GetValidationConfigJSON(enabledTypes, nil)
+	jsonStr, err := GetValidationConfigJSONWithDataSchema(enabledTypes, nil, false, nil)
 	if err != nil {
 		t.Fatalf("GetValidationConfigJSON() error = %v", err)
 	}
@@ -105,7 +253,7 @@ func TestGetValidationConfigJSONFiltered(t *testing.T) {
 
 func TestGetValidationConfigJSONEmpty(t *testing.T) {
 	// Test with empty slice (should return all types, same as nil)
-	jsonStr, err := GetValidationConfigJSON([]string{}, nil)
+	jsonStr, err := GetValidationConfigJSONWithDataSchema([]string{}, nil, false, nil)
 	if err != nil {
 		t.Fatalf("GetValidationConfigJSON() error = %v", err)
 	}
@@ -131,7 +279,7 @@ func TestGetValidationConfigJSONWithMentions(t *testing.T) {
 		"max":                  5,
 	}
 
-	jsonStr, err := GetValidationConfigJSON([]string{"add_comment"}, mentions)
+	jsonStr, err := GetValidationConfigJSONWithDataSchema([]string{"add_comment"}, mentions, false, nil)
 	if err != nil {
 		t.Fatalf("GetValidationConfigJSON() error = %v", err)
 	}
@@ -169,7 +317,7 @@ func TestGetValidationConfigJSONWithMentions(t *testing.T) {
 	}
 
 	// A second call without mentions must not include the key (cache safety).
-	plainJSON, err := GetValidationConfigJSON([]string{"add_comment"}, nil)
+	plainJSON, err := GetValidationConfigJSONWithDataSchema([]string{"add_comment"}, nil, false, nil)
 	if err != nil {
 		t.Fatalf("GetValidationConfigJSON() error = %v", err)
 	}
@@ -179,6 +327,69 @@ func TestGetValidationConfigJSONWithMentions(t *testing.T) {
 	}
 	if _, ok := plainParsed["mentions"]; ok {
 		t.Error("Did not expect mentions key in JSON produced without mentions argument")
+	}
+}
+
+func TestGetValidationConfigJSONWithDataSchema(t *testing.T) {
+	dataSchema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"verdict": map[string]any{"type": "string"},
+		},
+		"additionalProperties": false,
+	}
+
+	jsonStr, err := GetValidationConfigJSONWithDataSchema([]string{"add_comment", "close_issue"}, nil, true, dataSchema)
+	if err != nil {
+		t.Fatalf("GetValidationConfigJSONWithDataSchema() error = %v", err)
+	}
+
+	var parsed map[string]TypeValidationConfig
+	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+		t.Fatalf("Failed to parse validation config JSON: %v", err)
+	}
+
+	if parsed["add_comment"].DataSchema == nil {
+		t.Fatal("expected add_comment dataSchema to be present")
+	}
+	if !parsed["add_comment"].DataEnabled {
+		t.Fatal("expected add_comment dataEnabled to be true")
+	}
+	if parsed["close_issue"].DataSchema != nil {
+		t.Fatal("did not expect close_issue dataSchema to be present")
+	}
+	if parsed["close_issue"].DataEnabled {
+		t.Fatal("did not expect close_issue dataEnabled to be true")
+	}
+}
+
+func TestValidationConfigCollapseData(t *testing.T) {
+	for typeName, config := range ValidationConfig {
+		if want := typeName == "create_issue"; config.CollapseData != want {
+			t.Errorf("%s CollapseData = %t, want %t", typeName, config.CollapseData, want)
+		}
+	}
+
+	for _, dataEnabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("dataEnabled=%t", dataEnabled), func(t *testing.T) {
+			jsonStr, err := GetValidationConfigJSONWithDataSchema(dataSchemaBodyTypes, nil, dataEnabled, nil)
+			if err != nil {
+				t.Fatalf("GetValidationConfigJSONWithDataSchema() error = %v", err)
+			}
+			var parsed map[string]map[string]any
+			if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+				t.Fatalf("Failed to parse validation config JSON: %v", err)
+			}
+			for _, typeName := range dataSchemaBodyTypes {
+				if typeName == "create_issue" {
+					if parsed[typeName]["collapseData"] != true {
+						t.Error("expected create_issue collapseData to be true")
+					}
+				} else if _, ok := parsed[typeName]["collapseData"]; ok {
+					t.Errorf("did not expect %s collapseData to be present", typeName)
+				}
+			}
+		})
 	}
 }
 
@@ -230,12 +441,10 @@ func TestFieldValidationMarshaling(t *testing.T) {
 }
 
 func TestIssueIntentRationaleMaxLength(t *testing.T) {
-	if got := ValidationConfig["set_issue_type"].Fields["rationale"].MaxLength; got != 280 {
-		t.Fatalf("set_issue_type rationale maxLength = %d, want 280", got)
-	}
-
-	if got := ValidationConfig["set_issue_field"].Fields["rationale"].MaxLength; got != 280 {
-		t.Fatalf("set_issue_field rationale maxLength = %d, want 280", got)
+	for _, typeName := range []string{"set_issue_type", "set_issue_field", "close_issue", "assign_to_user", "assign_to_agent"} {
+		if got := ValidationConfig[typeName].Fields["rationale"].MaxLength; got != 280 {
+			t.Fatalf("%s rationale maxLength = %d, want 280", typeName, got)
+		}
 	}
 }
 
@@ -274,23 +483,52 @@ func TestUpdatePullRequestValidationConfig(t *testing.T) {
 	}
 }
 
+func TestUpdateProjectAcceptsProjectURLOrTemporaryID(t *testing.T) {
+	jsonStr, err := GetValidationConfigJSONWithDataSchema([]string{"update_project"}, nil, false, nil)
+	if err != nil {
+		t.Fatalf("GetValidationConfigJSON() error = %v", err)
+	}
+
+	var parsed map[string]TypeValidationConfig
+	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+		t.Fatalf("Failed to parse validation config JSON: %v", err)
+	}
+
+	project := parsed["update_project"].Fields["project"]
+	for _, expected := range []string{
+		"https://[^/]+/(orgs|users)/[^/]+/projects/\\d+",
+		"#?aw_[A-Za-z0-9_]{3,12}",
+	} {
+		if !strings.Contains(project.Pattern, expected) {
+			t.Fatalf("update_project.project pattern %q does not contain %q", project.Pattern, expected)
+		}
+	}
+}
+
 func TestUpdateIssueValidationConfig(t *testing.T) {
 	config, ok := ValidationConfig["update_issue"]
 	if !ok {
 		t.Fatal("update_issue not found in ValidationConfig")
 	}
 
-	if config.CustomValidation != "requiresOneOf:status,title,body,labels,assignees,milestone" {
-		t.Errorf("update_issue customValidation = %q, want %q", config.CustomValidation, "requiresOneOf:status,title,body,labels,assignees,milestone")
+	if config.CustomValidation != "requiresOneOf:status,title,body,labels,assignees,milestone,artifacts" {
+		t.Errorf("update_issue customValidation = %q, want %q", config.CustomValidation, "requiresOneOf:status,title,body,labels,assignees,milestone,artifacts")
+	}
+	if artifacts, ok := config.Fields["artifacts"]; !ok || artifacts.Type != "array" || artifacts.Sanitize {
+		t.Errorf("update_issue artifacts must be an unsanitized array, got %+v", artifacts)
 	}
 
 	if _, ok := config.Fields["labels"]; !ok {
 		t.Error("update_issue Fields is missing the 'labels' field")
 	}
+	milestone, ok := config.Fields["milestone"]
+	if !ok || !milestone.OptionalPositiveInteger || !milestone.AllowNull {
+		t.Errorf("update_issue milestone must accept positive integers and preserve explicit null, got %+v", milestone)
+	}
 }
 
 func TestIssueIntentValidationFields(t *testing.T) {
-	for _, typeName := range []string{"set_issue_type", "set_issue_field"} {
+	for _, typeName := range []string{"set_issue_type", "set_issue_field", "close_issue", "assign_to_user", "assign_to_agent"} {
 		config, ok := ValidationConfig[typeName]
 		if !ok {
 			t.Fatalf("%s not found in ValidationConfig", typeName)
@@ -351,16 +589,18 @@ func TestStripOnErrorOnlyOnOptionalFields(t *testing.T) {
 func TestValidationConfigConsistency(t *testing.T) {
 	// Verify that all types with customValidation have valid validation rules
 	validCustomValidations := map[string]bool{
-		"requiresOneOf:status,title,body,labels,assignees,milestone": true,
-		"requiresOneOf:title,body":                                   true,
-		"requiresOneOf:title,body,update_branch":                     true,
-		"requiresOneOf:title,body,labels":                            true,
-		"requiresOneOf:issue_number,pull_number":                     true,
-		"requiresOneOf:milestone_number,milestone_title":             true,
-		"requiresOneOf:field_name,field_node_id":                     true,
-		"requiresOneOf:reviewers,team_reviewers":                     true,
-		"startLineLessOrEqualLine":                                   true,
-		"parentAndSubDifferent":                                      true,
+		"requiresOneOf:status,title,body,labels,assignees,milestone,artifacts":  true,
+		"requiresOneOf:summary,description":                                     true,
+		"requiresOneOf:title,body":                                              true,
+		"requiresOneOf:title,body,update_branch":                                true,
+		"requiresOneOf:title,body,labels":                                       true,
+		"requiresOneOf:issue_number,pull_number":                                true,
+		"requiresOneOf:milestone_number,milestone_title":                        true,
+		"requiresOneOf:field_name,field_node_id":                                true,
+		"requiresOneOf:reviewers,team_reviewers":                                true,
+		"requiresOneOf:title,body,state,area_path,iteration_path,assignee,tags": true,
+		"startLineLessOrEqualLine":                                              true,
+		"parentAndSubDifferent":                                                 true,
 	}
 
 	for typeName, config := range ValidationConfig {
@@ -379,6 +619,90 @@ func TestValidationConfigConsistency(t *testing.T) {
 		if config.DefaultMax <= 0 {
 			t.Errorf("Type %q has invalid defaultMax: %d", typeName, config.DefaultMax)
 		}
+	}
+}
+
+func TestValidationConfigCoversToolInputSchemas(t *testing.T) {
+	var tools []struct {
+		Name        string `json:"name"`
+		InputSchema struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+		} `json:"inputSchema"`
+	}
+	if err := json.Unmarshal([]byte(safeOutputsToolsJSONContent), &tools); err != nil {
+		t.Fatalf("failed to parse safe outputs tool schema: %v", err)
+	}
+
+	metadataFields := map[string]bool{"secrecy": true, "integrity": true}
+	for _, tool := range tools {
+		typeName := strings.ReplaceAll(tool.Name, "-", "_")
+		config, ok := ValidationConfig[typeName]
+		if !ok {
+			t.Errorf("%s tool is missing from ValidationConfig", tool.Name)
+			continue
+		}
+		for fieldName := range tool.InputSchema.Properties {
+			if metadataFields[fieldName] {
+				continue
+			}
+			if _, ok := config.Fields[fieldName]; !ok {
+				t.Errorf("%s tool input %q is missing from ValidationConfig", tool.Name, fieldName)
+			}
+		}
+	}
+}
+
+func TestValidationConfigCoversInjectedToolProperties(t *testing.T) {
+	configs := map[string]*SafeOutputsConfig{
+		"omitted state-reason": {
+			CloseIssues: &CloseIssuesConfig{},
+		},
+		"list state-reason and allowed-events": {
+			CloseIssues: &CloseIssuesConfig{AllowedStateReason: []string{"completed", "duplicate"}},
+			SubmitPullRequestReview: &SubmitPullRequestReviewConfig{
+				AllowedEvents: []string{"APPROVE", "COMMENT"},
+			},
+		},
+	}
+
+	for name, safeOutputs := range configs {
+		t.Run(name, func(t *testing.T) {
+			injections := computePropertyInjections(safeOutputs)
+			for toolName, properties := range injections {
+				for propertyName := range properties {
+					if _, ok := ValidationConfig[toolName].Fields[propertyName]; !ok {
+						t.Errorf("%s injected property %q is missing from ValidationConfig", toolName, propertyName)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestCreateDiscussionValidationPreservesTemporaryID(t *testing.T) {
+	jsonStr, err := GetValidationConfigJSONWithDataSchema([]string{"create_discussion"}, nil, false, nil)
+	if err != nil {
+		t.Fatalf("GetValidationConfigJSONWithDataSchema() error = %v", err)
+	}
+
+	var parsed map[string]TypeValidationConfig
+	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+		t.Fatalf("Failed to parse validation config JSON: %v", err)
+	}
+
+	for name, config := range map[string]TypeValidationConfig{
+		"source":    ValidationConfig["create_discussion"],
+		"generated": parsed["create_discussion"],
+	} {
+		t.Run(name, func(t *testing.T) {
+			temporaryID, ok := config.Fields["temporary_id"]
+			if !ok {
+				t.Fatal("temporary_id field not found in create_discussion validation config")
+			}
+			if temporaryID.Required || temporaryID.Type != "string" || temporaryID.Pattern != "^#?aw_[A-Za-z0-9_]{3,12}$" {
+				t.Errorf("create_discussion temporary_id = %+v, want optional string accepting canonical and bare temporary IDs", temporaryID)
+			}
+		})
 	}
 }
 
@@ -474,7 +798,7 @@ func TestAssignMilestoneValidationConfig(t *testing.T) {
 }
 
 func TestAssignMilestoneValidationConfigJSON(t *testing.T) {
-	jsonStr, err := GetValidationConfigJSON([]string{"assign_milestone"}, nil)
+	jsonStr, err := GetValidationConfigJSONWithDataSchema([]string{"assign_milestone"}, nil, false, nil)
 	if err != nil {
 		t.Fatalf("GetValidationConfigJSON() error = %v", err)
 	}

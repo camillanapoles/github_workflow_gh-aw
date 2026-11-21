@@ -1,19 +1,38 @@
+import type { SafeOutputAuthorizationRequirement } from "./handler-factory";
+
 // Base interface for all safe output configurations
 interface SafeOutputConfig {
   type: string;
   max?: number;
   min?: number;
   "github-token"?: string;
+  "body-footer"?: string;
+  authorization?: SafeOutputAuthorizationRequirement;
 }
 
 // === Specific Safe Output Configuration Interfaces ===
+
+interface AddSecurityAdvisoryCommentConfig extends SafeOutputConfig {
+  footer?: boolean;
+  staged?: boolean;
+}
+
+interface CreateSecurityAdvisoryConfig extends SafeOutputConfig {
+  staged?: boolean;
+}
 
 /**
  * Configuration for creating GitHub issues
  */
 interface CreateIssueConfig extends SafeOutputConfig {
+  /** Maximum artifacts per issue (default: 10); non-positive values disable artifacts. */
+  "max-issue-artifacts"?: number;
+  /** Maximum UTF-8 body size: integer bytes or human-friendly size (default: "1mb"). */
+  "max-issue-artifact-size"?: number | string;
   "title-prefix"?: string;
+  "body-footer"?: string;
   "deduplicate-by-title"?: boolean | number;
+  "deduplicate-by-labels"?: string[];
   labels?: string[];
   "target-repo"?: string;
   "allowed-repos"?: string[];
@@ -73,6 +92,15 @@ interface MarkPullRequestAsReadyForReviewConfig extends SafeOutputConfig {
 }
 
 /**
+ * Configuration for approving pending workflow runs awaiting required approval
+ */
+interface ApproveWorkflowRunConfig extends SafeOutputConfig {
+  fork?: boolean;
+  comment?: boolean;
+  "allowed-workflows": string[];
+}
+
+/**
  * Configuration for adding comments to issues or PRs
  */
 interface AddCommentConfig extends SafeOutputConfig {
@@ -85,12 +113,18 @@ interface AddCommentConfig extends SafeOutputConfig {
  */
 interface CreatePullRequestConfig extends SafeOutputConfig {
   "title-prefix"?: string;
+  "body-footer"?: string;
   labels?: string[];
   reviewers?: string | string[];
   "team-reviewers"?: string | string[];
   assignees?: string | string[];
   draft?: boolean;
   "if-no-changes"?: string;
+  "target-repo"?: string;
+  "head-repo"?: string;
+  "allowed-repos"?: string[];
+  "head-github-token"?: string;
+  "base-branch"?: string;
   "allowed-branches"?: string[];
   footer?: boolean;
   "auto-close-issue"?: boolean | string;
@@ -150,6 +184,14 @@ interface CreateCodeScanningAlertConfig extends SafeOutputConfig {
 }
 
 /**
+ * Configuration for uploading a code coverage report via actions/upload-code-coverage
+ */
+interface UploadCodeCoverageConfig extends SafeOutputConfig {
+  "fail-on-error"?: boolean;
+  "wait-for-processing-timeout"?: number;
+}
+
+/**
  * Configuration for adding code scanning autofixes
  */
 interface AutofixCodeScanningAlertConfig extends SafeOutputConfig {
@@ -176,10 +218,15 @@ interface AddReviewerConfig extends SafeOutputConfig {
  * Configuration for updating issues
  */
 interface UpdateIssueConfig extends SafeOutputConfig {
+  /** Maximum artifacts per issue (default: 10); non-positive values disable artifacts. */
+  "max-issue-artifacts"?: number;
+  /** Maximum UTF-8 body size: integer bytes or human-friendly size (default: "1mb"). */
+  "max-issue-artifact-size"?: number | string;
   status?: boolean;
   target?: string;
   title?: boolean;
   body?: boolean;
+  operation?: "append" | "prepend" | "replace" | "replace-island";
   footer?: boolean;
 }
 
@@ -212,13 +259,23 @@ interface PushToPullRequestBranchConfig extends SafeOutputConfig {
   "required-labels"?: string[];
   labels?: string[];
   "if-no-changes"?: string;
+  "target-repo"?: string;
+  "head-repo"?: string;
+  "allowed-repos"?: string[];
+  "head-github-token"?: string;
+  "base-branch"?: string;
 }
 
 /**
  * Configuration for merging pull requests with policy checks.
  */
 interface MergePullRequestConfig extends SafeOutputConfig {
+  "allowed-base-branches": string[];
   "required-labels"?: string[];
+  "required-title-prefix"?: string;
+  "required-checks"?: string[];
+  "required-check-apps"?: Record<string, number>;
+  "required-approvers"?: string[];
   "allowed-labels"?: string[];
   "allowed-branches"?: string[];
   "allowed-files"?: string[];
@@ -261,6 +318,7 @@ interface AssignToAgentConfig extends SafeOutputConfig {
   "custom-agent"?: string;
   "custom-instructions"?: string;
   allowed?: string[];
+  "required-labels"?: string[];
   target?: string;
   "target-repo"?: string;
   "pull-request-repo"?: string;
@@ -323,6 +381,8 @@ interface SafeJobInput {
  * Safe job configuration item
  */
 interface SafeJobConfig {
+  authorization?: SafeOutputAuthorizationRequirement;
+  staged?: boolean | string;
   name?: string;
   "runs-on"?: any;
   if?: string;
@@ -337,6 +397,8 @@ interface SafeJobConfig {
 
 // Union type of all specific safe output configurations
 type SpecificSafeOutputConfig =
+  | AddSecurityAdvisoryCommentConfig
+  | CreateSecurityAdvisoryConfig
   | CreateIssueConfig
   | CreateDiscussionConfig
   | UpdateDiscussionConfig
@@ -344,11 +406,13 @@ type SpecificSafeOutputConfig =
   | CloseIssueConfig
   | ClosePullRequestConfig
   | MarkPullRequestAsReadyForReviewConfig
+  | ApproveWorkflowRunConfig
   | AddCommentConfig
   | CreatePullRequestConfig
   | CreatePullRequestReviewCommentConfig
   | SubmitPullRequestReviewConfig
   | CreateCodeScanningAlertConfig
+  | UploadCodeCoverageConfig
   | AutofixCodeScanningAlertConfig
   | AddLabelsConfig
   | AddReviewerConfig
@@ -371,6 +435,8 @@ type SpecificSafeOutputConfig =
 type SafeOutputConfigs = Record<string, SafeOutputConfig | SpecificSafeOutputConfig>;
 
 export {
+  AddSecurityAdvisoryCommentConfig,
+  CreateSecurityAdvisoryConfig,
   SafeOutputConfig,
   SafeOutputConfigs,
   // Specific configuration types
@@ -381,11 +447,13 @@ export {
   CloseIssueConfig,
   ClosePullRequestConfig,
   MarkPullRequestAsReadyForReviewConfig,
+  ApproveWorkflowRunConfig,
   AddCommentConfig,
   CreatePullRequestConfig,
   CreatePullRequestReviewCommentConfig,
   SubmitPullRequestReviewConfig,
   CreateCodeScanningAlertConfig,
+  UploadCodeCoverageConfig,
   AutofixCodeScanningAlertConfig,
   AddLabelsConfig,
   AddReviewerConfig,

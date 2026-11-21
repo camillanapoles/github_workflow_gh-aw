@@ -4,8 +4,6 @@ emoji: "🦛"
 name: Daily Hippo Learn
 description: Runs hippo-memory's learn and sleep commands daily to extract lessons from git commits, consolidate the memory store, and suggest actionable improvements to the team
 on:
-  schedule:
-    - cron: "daily around 7:00"
   workflow_dispatch:
 
 max-daily-ai-credits: 10000
@@ -17,10 +15,10 @@ permissions:
 
   copilot-requests: write
 tracker-id: daily-hippo-learn
+model: copilot/gpt-5
 engine:
   id: pi
-  model: copilot/gpt-5.4
-  bare: true
+  model-provider: github
 
 timeout-minutes: 30
 
@@ -36,8 +34,6 @@ network:
 sandbox:
   agent:
     id: awf
-    sudo: false
-
 tools:
   cli-proxy: true
   bash:
@@ -65,6 +61,11 @@ imports:
   - shared/otlp.md
 features:
   gh-aw-detection: true
+evals:
+  - id: hippo_learn_executed
+    question: Did the agent run hippo-memory's learn and sleep commands on recent git commits?
+  - id: improvements_suggested
+    question: Were actionable improvement suggestions produced from the consolidated memory store?
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}

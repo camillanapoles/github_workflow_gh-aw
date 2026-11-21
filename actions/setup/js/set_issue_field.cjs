@@ -8,11 +8,11 @@
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
-const { isStagedMode, checkRequiredFilter } = require("./safe_output_helpers.cjs");
+const { isStagedMode, checkRequiredFilter, resolveTarget } = require("./safe_output_helpers.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { parseAllowedIssueFields, validateAllowedIssueFieldName, BUILTIN_ISSUE_FIELD_NAMES } = require("./allowed_issue_fields.cjs");
 const { resolveSafeOutputIssueTarget } = require("./temporary_id.cjs");
-const { hasIssueIntentsRuntimeFeature, normalizeIssueIntentMetadata } = require("./issue_intents.cjs");
+const { normalizeIssueIntentMetadata } = require("./issue_intents.cjs");
 
 /** @type {string} Safe output type handled by this module */
 const HANDLER_TYPE = "set_issue_field";
@@ -136,18 +136,9 @@ function buildFieldUpdatePayload(field, rawValue) {
  * @param {Object} githubClient - Authenticated GitHub client
  * @param {string} issueNodeId - GraphQL node ID of the issue
  * @param {{fieldId: string, singleSelectOptionId?: string, numberValue?: number, dateValue?: string, textValue?: string, rationale?: string, confidence?: "LOW"|"MEDIUM"|"HIGH", suggest?: boolean}} fieldUpdate
- * @param {boolean} [useIntentHeader] - When true, includes the GraphQL-Features header to expose intent input types
  * @returns {Promise<void>}
  */
-async function setIssueFieldValue(githubClient, issueNodeId, fieldUpdate, useIntentHeader) {
-  /** @type {Record<string, unknown>} */
-  const variables = {
-    issueId: issueNodeId,
-    issueFields: [fieldUpdate],
-  };
-  if (useIntentHeader) {
-    variables.headers = { "GraphQL-Features": "update_issue_suggestions" };
-  }
+async function setIssueFieldValue(githubClient, issueNodeId, fieldUpdate) {
   await githubClient.graphql(
     `mutation($issueId: ID!, $issueFields: [IssueFieldCreateOrUpdateInput!]!) {
       setIssueFieldValue(input: { issueId: $issueId, issueFields: $issueFields }) {
@@ -156,7 +147,10 @@ async function setIssueFieldValue(githubClient, issueNodeId, fieldUpdate, useInt
         }
       }
     }`,
-    variables
+    {
+      issueId: issueNodeId,
+      issueFields: [fieldUpdate],
+    }
   );
 }
 
@@ -166,10 +160,12 @@ async function setIssueFieldValue(githubClient, issueNodeId, fieldUpdate, useInt
  */
 async function main(config = {}) {
   const maxCount = config.max || 5;
+  const targetConfig = config.target || "triggering";
   const allowedIssueFields = parseAllowedIssueFields(config.allowed_fields);
   const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
   const githubClient = await createAuthenticatedGitHubClient(config);
   const isStaged = isStagedMode(config);
+  const issueIntentEnabled = config.issue_intent !== false;
 
   core.info(`Set issue field configuration: max=${maxCount}`);
   const requiredLabels = Array.isArray(config.required_labels) ? config.required_labels : [];
@@ -210,23 +206,24 @@ async function main(config = {}) {
     const { repo: itemRepo, repoParts } = repoResult;
     core.info(`Target repository: ${itemRepo}`);
 
-    const targetResult = resolveSafeOutputIssueTarget({ message: item, resolvedTemporaryIds, repoParts, handlerType: "set_issue_field", aliases: ["issue_number"] });
-    if (!targetResult.success) return targetResult;
-    let issueNumber;
-    if (targetResult.number !== null) {
-      issueNumber = targetResult.number;
-      core.info(`Resolved issue number: #${issueNumber}`);
-    } else {
-      const contextIssueNumber = context.payload?.issue?.number;
-      if (!contextIssueNumber) {
-        core.warning("No issue_number provided and not in issue context");
-        return {
-          success: false,
-          error: "No issue number available",
-        };
+    let targetItem = item;
+    if (targetConfig === "*") {
+      const explicitTarget = resolveSafeOutputIssueTarget({ message: item, resolvedTemporaryIds, repoParts, handlerType: "set_issue_field", aliases: ["issue_number"] });
+      if (!explicitTarget.success) return explicitTarget;
+      if (explicitTarget.number !== null) {
+        targetItem = { ...item, issue_number: explicitTarget.number };
       }
-      issueNumber = contextIssueNumber;
     }
+    const targetResult = resolveTarget({
+      targetConfig,
+      item: targetItem,
+      context,
+      itemType: "set_issue_field",
+      supportsIssue: true,
+    });
+    if (!targetResult.success) return { success: false, error: targetResult.error };
+    const issueNumber = targetResult.number;
+    core.info(`Resolved issue number: #${issueNumber}`);
 
     const filterResult = await checkRequiredFilter(githubClient, repoParts, issueNumber, requiredLabels, requiredTitlePrefix, "set_issue_field");
     if (filterResult) return filterResult;
@@ -288,6 +285,7 @@ async function main(config = {}) {
         return { success: false, skipped: true, error: warning };
       }
 
+      /** @type {any} */
       let resolvedFieldByName = null;
       if (fieldName) {
         resolvedFieldByName = availableFields.find(field => field.name.toLowerCase() === fieldName.toLowerCase()) || null;
@@ -342,13 +340,11 @@ async function main(config = {}) {
         ...fieldUpdateResult.update,
       };
 
-      const useIntentHeader = hasIssueIntentsRuntimeFeature();
-      if (useIntentHeader) {
+      if (issueIntentEnabled) {
         Object.assign(fieldUpdate, normalizeIssueIntentMetadata(item));
-        core.info(`Using GraphQL-Features header for issue field mutation (issue_intents runtime feature enabled)`);
       }
 
-      await setIssueFieldValue(githubClient, issueNodeId, fieldUpdate, useIntentHeader);
+      await setIssueFieldValue(githubClient, issueNodeId, fieldUpdate);
 
       core.info(`Successfully set issue field ${JSON.stringify(fieldName || fieldNodeId)} to ${JSON.stringify(value)} on issue #${issueNumber}`);
 

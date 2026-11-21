@@ -11,6 +11,29 @@ import (
 	"github.com/github/gh-aw/pkg/constants"
 )
 
+// compilerInjectedStepNames are not part of the checkout ordering contract exercised
+// by these tests. OTLP steps are emitted for every workflow because the endpoint
+// defaults to the enterprise GH_AW_DEFAULT_OTLP_ENDPOINT secret or variable /
+// GH_AW_DEFAULT_OTLP_HEADERS secret pair.
+var compilerInjectedStepNames = map[string]bool{
+	"Mask OTLP telemetry headers":         true,
+	"Mask OTLP custom attribute values":   true,
+	"Check OTLP telemetry configuration":  true,
+	"Initialize agent execution evidence": true,
+}
+
+// filterCompilerInjectedSteps removes unrelated compiler-injected steps from a step name list.
+func filterCompilerInjectedSteps(names []string) []string {
+	filtered := make([]string, 0, len(names))
+	for _, name := range names {
+		if compilerInjectedStepNames[name] {
+			continue
+		}
+		filtered = append(filtered, name)
+	}
+	return filtered
+}
+
 // TestCheckoutRuntimeOrderInCustomSteps verifies that when custom steps contain
 // a checkout step, the temp directory is created first, then the checkout step
 // runs, and runtime setup steps are inserted AFTER the checkout step. This ensures
@@ -119,6 +142,8 @@ steps:
 		}
 	}
 
+	stepNames = filterCompilerInjectedSteps(stepNames)
+
 	t.Logf("Found %d steps: %v", len(stepNames), stepNames)
 
 	if len(stepNames) < 9 {
@@ -220,6 +245,126 @@ steps:
 	}
 }
 
+func TestCheckoutRuntimeOrderInCustomStepVariants(t *testing.T) {
+	tests := []struct {
+		name                 string
+		customSteps          string
+		orderedMarkers       []string
+		wantSetupNodeNames   int
+		wantSetupNodeActions int
+	}{
+		{
+			name: "unnamed checkout with options as first custom step",
+			customSteps: `  - uses: actions/checkout@v5
+    with:
+      fetch-depth: 0
+      persist-credentials: false
+  - name: Prepare context
+    run: echo ready`,
+			orderedMarkers: []string{
+				"uses: actions/checkout@",
+				"- name: Setup Node.js",
+				"- name: Prepare context",
+			},
+			wantSetupNodeNames:   1,
+			wantSetupNodeActions: 1,
+		},
+		{
+			name: "named checkout with options as first custom step",
+			customSteps: `  - name: Checkout repository
+    uses: actions/checkout@v5
+    with:
+      fetch-depth: 0
+      persist-credentials: false
+  - name: Prepare context
+    run: echo ready`,
+			orderedMarkers: []string{
+				"uses: actions/checkout@",
+				"- name: Setup Node.js",
+				"- name: Prepare context",
+			},
+			wantSetupNodeNames:   1,
+			wantSetupNodeActions: 1,
+		},
+		{
+			name: "checkout after deterministic step",
+			customSteps: `  - name: Prepare context
+    run: echo before
+  - uses: actions/checkout@v5
+    with:
+      persist-credentials: false
+  - name: After checkout
+    run: echo after`,
+			orderedMarkers: []string{
+				"- name: Prepare context",
+				"uses: actions/checkout@",
+				"- name: Setup Node.js",
+				"- name: After checkout",
+			},
+			wantSetupNodeNames:   1,
+			wantSetupNodeActions: 1,
+		},
+		{
+			name: "multiple checkout steps insert runtime once after first checkout",
+			customSteps: `  - name: Prepare context
+    run: echo before
+  - uses: actions/checkout@v5
+    with:
+      persist-credentials: false
+  - name: After first checkout
+    run: echo middle
+  - uses: actions/checkout@v5
+    with:
+      persist-credentials: false
+  - name: After second checkout
+    run: echo done`,
+			orderedMarkers: []string{
+				"- name: Prepare context",
+				"uses: actions/checkout@",
+				"- name: Setup Node.js",
+				"- name: After first checkout",
+				"uses: actions/checkout@",
+				"- name: After second checkout",
+			},
+			wantSetupNodeNames:   1,
+			wantSetupNodeActions: 1,
+		},
+		{
+			name: "customized runtime setup action is preserved without duplication",
+			customSteps: `  - uses: actions/checkout@v5
+    with:
+      persist-credentials: false
+  - name: Setup Node from file
+    uses: actions/setup-node@v5
+    with:
+      node-version-file: .nvmrc
+  - name: Prepare context
+    run: echo ready`,
+			orderedMarkers: []string{
+				"uses: actions/checkout@",
+				"- name: Setup Node from file",
+				"- name: Prepare context",
+			},
+			wantSetupNodeNames:   0,
+			wantSetupNodeActions: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			agentJobSection := compileWorkflowAndGetAgentJobSection(t, tt.customSteps)
+			assertOrderedMarkers(t, agentJobSection, tt.orderedMarkers)
+
+			if got := strings.Count(agentJobSection, "- name: Setup Node.js"); got != tt.wantSetupNodeNames {
+				t.Fatalf("expected %d generated Setup Node.js steps, got %d\n%s", tt.wantSetupNodeNames, got, agentJobSection)
+			}
+			if got := strings.Count(agentJobSection, "uses: actions/setup-node@"); got != tt.wantSetupNodeActions {
+				t.Fatalf("expected %d setup-node actions, got %d\n%s", tt.wantSetupNodeActions, got, agentJobSection)
+			}
+		})
+	}
+}
+
 // TestCheckoutFirstWhenNoCustomSteps verifies that when there are no custom steps,
 // the automatic checkout is added first.
 func TestCheckoutFirstWhenNoCustomSteps(t *testing.T) {
@@ -316,6 +461,8 @@ Run node --version to check the Node.js version.
 		}
 	}
 
+	stepNames = filterCompilerInjectedSteps(stepNames)
+
 	if len(stepNames) < 4 {
 		t.Fatalf("Expected at least 4 steps, got %d: %v", len(stepNames), stepNames)
 	}
@@ -324,7 +471,7 @@ Run node --version to check the Node.js version.
 	// 1. First step should be "Checkout actions folder" (checkout local actions)
 	// 2. Second step should be "Setup Scripts" (use the checked out action)
 	// 3. Third step should be "Set runtime paths" (safe-outputs port, always injected)
-	// 4. Fourth step should be "Checkout repository" (automatic full checkout - no separate .github checkout needed)
+	// 4. Fourth step should be the generated default repository checkout (no separate .github checkout needed)
 	// NOTE: The .github sparse checkout is skipped when full repository checkout is performed
 
 	if stepNames[0] != "Checkout actions folder" {
@@ -339,8 +486,8 @@ Run node --version to check the Node.js version.
 		t.Errorf("Third step should be 'Set runtime paths', got '%s'", stepNames[2])
 	}
 
-	if stepNames[3] != "Checkout repository" {
-		t.Errorf("Fourth step should be 'Checkout repository', got '%s'", stepNames[3])
+	if stepNames[3] != "Checkout repository (gh-aw default)" {
+		t.Errorf("Fourth step should be the generated default repository checkout, got '%s'", stepNames[3])
 	}
 
 	// Verify that .github checkout is NOT present (redundant with full checkout)
@@ -355,4 +502,94 @@ Run node --version to check the Node.js version.
 	t.Logf("  2. %s", stepNames[1])
 	t.Logf("  3. %s", stepNames[2])
 	t.Logf("  4. %s", stepNames[3])
+}
+
+func compileWorkflowAndGetAgentJobSection(t *testing.T, customSteps string) string {
+	t.Helper()
+
+	workflowContent := `---
+on: workflow_dispatch
+engine: copilot
+runs-on: self-hosted
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+steps:
+` + customSteps + `
+---
+
+# Test workflow with custom checkout steps
+`
+
+	tempDir, err := os.MkdirTemp("", "checkout-runtime-order-variant")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	workflowsDir := filepath.Join(tempDir, constants.GetWorkflowDir())
+	if err := os.MkdirAll(workflowsDir, 0755); err != nil {
+		t.Fatalf("Failed to create workflows directory: %v", err)
+	}
+
+	workflowPath := filepath.Join(workflowsDir, "test-workflow.md")
+	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0644); err != nil {
+		t.Fatalf("Failed to write workflow file: %v", err)
+	}
+
+	compiler := NewCompiler()
+	compiler.SetActionMode(ActionModeDev)
+	if err := compiler.CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("Failed to compile workflow: %v", err)
+	}
+
+	lockPath := filepath.Join(workflowsDir, "test-workflow.lock.yml")
+	lockContent, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("Failed to read lock file: %v", err)
+	}
+
+	return extractAgentJobSection(t, string(lockContent))
+}
+
+func extractAgentJobSection(t *testing.T, lockStr string) string {
+	t.Helper()
+
+	agentJobStart := strings.Index(lockStr, "  agent:")
+	if agentJobStart == -1 {
+		t.Fatal("Could not find agent job in compiled workflow")
+	}
+
+	remainingContent := lockStr[agentJobStart+10:]
+	nextJobStart := -1
+	lines := strings.Split(remainingContent, "\n")
+	for i, line := range lines {
+		if len(line) > 2 && line[0] == ' ' && line[1] == ' ' && line[2] != ' ' && line[2] != '\t' {
+			nextJobStart = 0
+			for j := range i {
+				nextJobStart += len(lines[j]) + 1
+			}
+			break
+		}
+	}
+
+	if nextJobStart == -1 {
+		return lockStr[agentJobStart:]
+	}
+
+	return lockStr[agentJobStart : agentJobStart+10+nextJobStart]
+}
+
+func assertOrderedMarkers(t *testing.T, content string, markers []string) {
+	t.Helper()
+
+	cursor := 0
+	for _, marker := range markers {
+		idx := strings.Index(content[cursor:], marker)
+		if idx == -1 {
+			t.Fatalf("marker %q not found after offset %d\n%s", marker, cursor, content)
+		}
+		cursor += idx + len(marker)
+	}
 }

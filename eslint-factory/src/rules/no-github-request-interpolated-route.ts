@@ -1,9 +1,11 @@
 import { AST_NODE_TYPES, ESLintUtils, TSESTree } from "@typescript-eslint/utils";
+import { resolveWriteOnceInitializerChain } from "./command-initializer-utils";
 
 const createRule = ESLintUtils.RuleCreator(name => `https://github.com/github/gh-aw/tree/main/eslint-factory#${name}`);
 
 const OCTOKIT_CLIENT_NAMES = new Set(["github", "octokit", "githubClient", "octokitClient"]);
-const GET_OCTOKIT_MEMBER_OBJECT_NAMES = new Set(["github", "actions"]);
+const GET_OCTOKIT_MEMBER_OBJECT_NAMES = new Set(["github", "actions", "global", "globalState"]);
+const HTTP_METHOD_PREFIXES = new Set(["GET ", "POST ", "PUT ", "PATCH ", "DELETE ", "HEAD ", "OPTIONS "]);
 
 /**
  * Returns true when the node is a template literal that contains at least one
@@ -40,6 +42,54 @@ function isStringConcatenation(node: TSESTree.Node): boolean {
 }
 
 /**
+ * Returns true when `text` is an exact HTTP-method route prefix including the
+ * required trailing space, such as `GET ` or `POST `.
+ */
+function isValidHttpMethodPrefix(text: string | null | undefined): boolean {
+  return typeof text === "string" && HTTP_METHOD_PREFIXES.has(text);
+}
+
+/**
+ * Returns the human-readable route-expression kind string used in diagnostics,
+ * or null when `node` is not one of the interpolated route shapes this rule
+ * reports on.
+ */
+function getInterpolatedRouteKind(node: TSESTree.Node): string | null {
+  if (isInterpolatedTemplateLiteral(node)) return "template literal with interpolations";
+  if (isStringConcatenation(node)) return "string concatenation expression";
+  return null;
+}
+
+/**
+ * Returns true when the route expression is exactly an HTTP method plus a
+ * single opaque route expression, such as:
+ * - `POST ${endpoint}`
+ * - `"POST " + endpoint`
+ *
+ * This shape differs from value-into-path interpolation because there is no
+ * known static path at the call site to rewrite with `{placeholder}` segments.
+ */
+function isOpaqueWholeRouteInterpolation(node: TSESTree.Node): boolean {
+  if (node.type === "TemplateLiteral") {
+    const hasTwoQuasis = node.quasis.length === 2;
+    const hasSingleExpression = node.expressions.length === 1;
+    const hasMethodPrefix = hasTwoQuasis && isValidHttpMethodPrefix(node.quasis[0].value.cooked);
+    const hasEmptyTrailingQuasi = hasTwoQuasis && node.quasis[1].value.cooked === "";
+    const isDynamicWholeRoute = hasSingleExpression && !isStaticRouteExpression(node.expressions[0]);
+    return hasMethodPrefix && hasEmptyTrailingQuasi && isDynamicWholeRoute;
+  }
+
+  if (node.type === "BinaryExpression" && node.operator === "+") {
+    if (node.left.type !== "Literal" || typeof node.left.value !== "string") return false;
+    const hasMethodPrefix = isValidHttpMethodPrefix(node.left.value);
+    const isRightDynamic = !isStaticRouteExpression(node.right);
+    return hasMethodPrefix && isRightDynamic;
+  }
+
+  return false;
+}
+
+/**
  * Returns true when `node` is the `context.github` member expression.
  */
 function isContextGithubExpression(node: TSESTree.Node): boolean {
@@ -55,9 +105,12 @@ function isContextGithubExpression(node: TSESTree.Node): boolean {
  * - `getOctokit(...)` call results (bare or via known module objects, e.g.
  *   `github.getOctokit(...)` or `actions.getOctokit(...)`)
  * - `context.github` member expression
+ * - Fallback (`||` / `??`) and ternary expressions with a known source branch
  */
 function isOctokitSourceExpression(node: TSESTree.Node): boolean {
   if (node.type === AST_NODE_TYPES.Identifier && OCTOKIT_CLIENT_NAMES.has(node.name)) return true;
+  if (node.type === AST_NODE_TYPES.LogicalExpression && (node.operator === "||" || node.operator === "??")) return isOctokitSourceExpression(node.left) || isOctokitSourceExpression(node.right);
+  if (node.type === AST_NODE_TYPES.ConditionalExpression) return isOctokitSourceExpression(node.consequent) || isOctokitSourceExpression(node.alternate);
 
   if (node.type === AST_NODE_TYPES.CallExpression) {
     const callee = node.callee;
@@ -87,11 +140,14 @@ export const noGithubRequestInterpolatedRouteRule = createRule({
       description:
         "Disallow template literals with interpolations or string concatenation as the route argument of Octokit.request() calls. " +
         "Octokit clients are detected by well-known names (github, octokit, githubClient, octokitClient), " +
-        "identifiers initialized from getOctokit(...) call results, context.github, and simple const aliases of any of these. " +
-        'Use the typed placeholder form instead: "GET /repos/{owner}/{repo}" with a separate params object.',
+        "identifiers initialized from getOctokit(...) call results, context.github, and const aliases or fallback expressions containing any of these. " +
+        "Use the typed placeholder form for value interpolation, or thread a typed route string from the caller when the entire route is dynamic.",
     },
     schema: [],
     messages: {
+      opaqueWholeRoute:
+        "Avoid using an opaque whole-route {{kind}} as the route argument of {{client}}.request(). " +
+        "When the entire route is dynamic, pass a typed route string from the caller instead of interpolating or concatenating a route variable.",
       interpolatedRoute:
         "Avoid using a {{kind}} as the route argument of {{client}}.request(). " +
         'Use the typed placeholder form instead — e.g. github.request("GET /repos/{owner}/{repo}", { owner, repo }) — ' +
@@ -167,24 +223,27 @@ export const noGithubRequestInterpolatedRouteRule = createRule({
         if (!clientName) return;
 
         const firstArg = node.arguments[0];
-        if (!firstArg) return;
+        if (!firstArg || firstArg.type === AST_NODE_TYPES.SpreadElement) return;
 
-        if (isInterpolatedTemplateLiteral(firstArg)) {
+        const routeExpr = resolveWriteOnceInitializerChain(firstArg as TSESTree.Expression, context.sourceCode);
+
+        const routeKind = getInterpolatedRouteKind(routeExpr);
+        if (!routeKind) return;
+
+        if (isOpaqueWholeRouteInterpolation(routeExpr)) {
           context.report({
             node: firstArg,
-            messageId: "interpolatedRoute",
-            data: { kind: "template literal with interpolations", client: clientName },
+            messageId: "opaqueWholeRoute",
+            data: { kind: routeKind, client: clientName },
           });
           return;
         }
 
-        if (isStringConcatenation(firstArg)) {
-          context.report({
-            node: firstArg,
-            messageId: "interpolatedRoute",
-            data: { kind: "string concatenation expression", client: clientName },
-          });
-        }
+        context.report({
+          node: firstArg,
+          messageId: "interpolatedRoute",
+          data: { kind: routeKind, client: clientName },
+        });
       },
     };
   },

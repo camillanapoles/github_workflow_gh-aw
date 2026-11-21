@@ -31,10 +31,11 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/stringutil"
 )
 
-var eventValidationLog = newValidationLogger("event")
+var eventValidationLog = logger.New("workflow:event_validation")
 
 // validGitHubEventTypes is the list of all supported GitHub Actions event types.
 // Source: https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows
@@ -89,15 +90,18 @@ var ghAwOnSectionKeys = map[string]bool{
 	"labels":                             true,
 	"needs":                              true,
 	"reaction":                           true,
+	"report-blocked-version":             true,
 	"roles":                              true,
 	"skip-author-associations":           true,
 	"skip-if-match":                      true,
 	"skip-if-no-match":                   true,
 	"slash_command":                      true,
 	"stale-check":                        true,
+	"admission":                          true,
 	"status-comment":                     true,
 	"steps":                              true,
 	"stop-after":                         true,
+	"gateway-dispatch":                   true,
 }
 
 // ValidateEventTypes validates that the event types in the 'on:' section of a
@@ -149,12 +153,7 @@ func ValidateEventTypes(frontmatter map[string]any) error {
 		// Check for a case-only difference first (e.g. "Push" → "push")
 		lowerEventName := strings.ToLower(eventName)
 		if lowerEventName != eventName && isKnownGitHubEvent(lowerEventName) {
-			return fmt.Errorf(
-				"unknown event type %q in 'on:' section.\n\nDid you mean: %s?\n\nValid event types include: %s\n\nSee: https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows",
-				eventName,
-				lowerEventName,
-				strings.Join(validGitHubEventTypes[:10], ", ")+"...",
-			)
+			return unknownEventTypeError(eventName, lowerEventName)
 		}
 
 		// Only flag as a typo when there is a close match
@@ -164,15 +163,19 @@ func ValidateEventTypes(frontmatter map[string]any) error {
 			continue
 		}
 
-		return fmt.Errorf(
-			"unknown event type %q in 'on:' section.\n\nDid you mean: %s?\n\nValid event types include: %s\n\nSee: https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows",
-			eventName,
-			strings.Join(suggestions, ", "),
-			strings.Join(validGitHubEventTypes[:10], ", ")+"...",
-		)
+		return unknownEventTypeError(eventName, suggestions...)
 	}
 
 	return nil
+}
+
+func unknownEventTypeError(eventName string, suggestions ...string) error {
+	return fmt.Errorf(
+		"unknown event type %q in 'on:' section.\n\nDid you mean: %s?\n\nValid event types include: %s\n\nSee: https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows",
+		eventName,
+		strings.Join(suggestions, ", "),
+		strings.Join(validGitHubEventTypes[:10], ", ")+"...",
+	)
 }
 
 // isKnownGitHubEvent returns true if the event name is in the list of valid GitHub Actions event types.

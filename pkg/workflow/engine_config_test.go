@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/github/gh-aw/pkg/constants"
+	"github.com/github/gh-aw/pkg/stringutil"
 	"github.com/github/gh-aw/pkg/testutil"
 	"github.com/stretchr/testify/assert"
 )
@@ -21,6 +22,7 @@ func TestExtractEngineConfig(t *testing.T) {
 		frontmatter           map[string]any
 		expectedEngineSetting string
 		expectedConfig        *EngineConfig
+		expectedModel         string
 	}{
 		{
 			name:                  "no engine specified",
@@ -78,6 +80,22 @@ func TestExtractEngineConfig(t *testing.T) {
 			expectedConfig:        &EngineConfig{MaxToolDenials: "${{ inputs.max-tool-denials }}"},
 		},
 		{
+			name: "top-level max-tool-calls without engine",
+			frontmatter: map[string]any{
+				"max-tool-calls": 24,
+			},
+			expectedEngineSetting: "",
+			expectedConfig:        &EngineConfig{MaxToolCalls: "24"},
+		},
+		{
+			name: "top-level max-tool-calls expression",
+			frontmatter: map[string]any{
+				"max-tool-calls": "${{ inputs.max-tool-calls }}",
+			},
+			expectedEngineSetting: "",
+			expectedConfig:        &EngineConfig{MaxToolCalls: "${{ inputs.max-tool-calls }}"},
+		},
+		{
 			name: "top-level max-turn-cache-misses without engine",
 			frontmatter: map[string]any{
 				"max-turn-cache-misses": 6,
@@ -102,6 +120,19 @@ func TestExtractEngineConfig(t *testing.T) {
 			expectedConfig:        nil,
 		},
 		{
+			// ExtractEngineConfig returns &EngineConfig{} (empty struct, not nil) when
+			// only a top-level model: is present and no engine: key is specified.
+			// Callers must nil-check config before reading fields in the engine-present path,
+			// but for the model-only path they receive a non-nil empty config.
+			name: "top-level model without engine",
+			frontmatter: map[string]any{
+				"model": "gpt-4",
+			},
+			expectedEngineSetting: "",
+			expectedConfig:        &EngineConfig{},
+			expectedModel:         "gpt-4",
+		},
+		{
 			name:                  "string format - claude",
 			frontmatter:           map[string]any{"engine": "claude"},
 			expectedEngineSetting: "claude",
@@ -112,6 +143,16 @@ func TestExtractEngineConfig(t *testing.T) {
 			frontmatter:           map[string]any{"engine": "codex"},
 			expectedEngineSetting: "codex",
 			expectedConfig:        &EngineConfig{ID: "codex"},
+		},
+		{
+			name: "string format - top-level model returned",
+			frontmatter: map[string]any{
+				"engine": "copilot",
+				"model":  "claude-sonnet-4.5",
+			},
+			expectedEngineSetting: "copilot",
+			expectedConfig:        &EngineConfig{ID: "copilot"},
+			expectedModel:         "claude-sonnet-4.5",
 		},
 		{
 			name: "object format - minimal (id only)",
@@ -176,7 +217,49 @@ func TestExtractEngineConfig(t *testing.T) {
 				},
 			},
 			expectedEngineSetting: "codex",
-			expectedConfig:        &EngineConfig{ID: "codex", Model: "gpt-4o"},
+			expectedConfig:        &EngineConfig{ID: "codex"},
+			expectedModel:         "gpt-4o",
+		},
+		{
+			name: "object format - engine.model overrides top-level model",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id":    "codex",
+					"model": "gpt-4o",
+				},
+				"model": "gpt-5",
+			},
+			expectedEngineSetting: "codex",
+			expectedConfig:        &EngineConfig{ID: "codex"},
+			expectedModel:         "gpt-4o",
+		},
+		{
+			// Empty top-level model: "" must NOT override engine.model.
+			// The implementation guards with topLevelModel != "", so an empty
+			// string leaves the engine.model value intact.
+			name: "object format - empty top-level model does not override engine.model",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id":    "codex",
+					"model": "gpt-4o",
+				},
+				"model": "",
+			},
+			expectedEngineSetting: "codex",
+			expectedConfig:        &EngineConfig{ID: "codex"},
+			expectedModel:         "gpt-4o",
+		},
+		{
+			name: "object format - top-level model alone (no engine.model)",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id": "claude",
+				},
+				"model": "claude-sonnet-4.5",
+			},
+			expectedEngineSetting: "claude",
+			expectedConfig:        &EngineConfig{ID: "claude"},
+			expectedModel:         "claude-sonnet-4.5",
 		},
 		{
 			name: "object format - with model-provider override",
@@ -187,7 +270,30 @@ func TestExtractEngineConfig(t *testing.T) {
 				},
 			},
 			expectedEngineSetting: "claude",
-			expectedConfig:        &EngineConfig{ID: "claude", LLMProvider: "github"},
+			expectedConfig:        &EngineConfig{ID: "claude", LLMProvider: LLMProviderGitHub},
+		},
+		{
+			name: "object format - with provider override",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id":       "claude",
+					"provider": "openai",
+				},
+			},
+			expectedEngineSetting: "claude",
+			expectedConfig:        &EngineConfig{ID: "claude", LLMProvider: LLMProviderOpenAI},
+		},
+		{
+			name: "object format - provider override wins over model-provider",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id":             "claude",
+					"model-provider": "github",
+					"provider":       "openai",
+				},
+			},
+			expectedEngineSetting: "claude",
+			expectedConfig:        &EngineConfig{ID: "claude", LLMProvider: LLMProviderOpenAI},
 		},
 		{
 			name: "object format - deprecated llm-provider ignored",
@@ -210,7 +316,8 @@ func TestExtractEngineConfig(t *testing.T) {
 				},
 			},
 			expectedEngineSetting: "claude",
-			expectedConfig:        &EngineConfig{ID: "claude", Version: "beta", Model: "claude-3-5-sonnet-20241022"},
+			expectedConfig:        &EngineConfig{ID: "claude", Version: "beta"},
+			expectedModel:         "claude-3-5-sonnet-20241022",
 		},
 		{
 			name: "object format - with max-turns",
@@ -257,6 +364,17 @@ func TestExtractEngineConfig(t *testing.T) {
 			expectedConfig:        &EngineConfig{ID: "copilot", MaxToolDenials: "8"},
 		},
 		{
+			name: "object format - with top-level max-tool-calls",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"id": "copilot",
+				},
+				"max-tool-calls": 24,
+			},
+			expectedEngineSetting: "copilot",
+			expectedConfig:        &EngineConfig{ID: "copilot", MaxToolCalls: "24"},
+		},
+		{
 			name: "object format - top-level max-turns overrides engine max-turns",
 			frontmatter: map[string]any{
 				"engine": map[string]any{
@@ -290,7 +408,8 @@ func TestExtractEngineConfig(t *testing.T) {
 				},
 			},
 			expectedEngineSetting: "claude",
-			expectedConfig:        &EngineConfig{ID: "claude", Version: "beta", Model: "claude-3-5-sonnet-20241022", MaxTurns: "10"},
+			expectedConfig:        &EngineConfig{ID: "claude", Version: "beta", MaxTurns: "10"},
+			expectedModel:         "claude-3-5-sonnet-20241022",
 		},
 		{
 			// float64 is what json.Unmarshal produces for numbers when deserializing engine
@@ -351,7 +470,8 @@ func TestExtractEngineConfig(t *testing.T) {
 				},
 			},
 			expectedEngineSetting: "claude",
-			expectedConfig:        &EngineConfig{ID: "claude", Version: "beta", Model: "claude-3-5-sonnet-20241022", MaxTurns: "5", Env: map[string]string{"AWS_REGION": "us-west-2", "API_ENDPOINT": "https://api.example.com"}},
+			expectedConfig:        &EngineConfig{ID: "claude", Version: "beta", MaxTurns: "5", Env: map[string]string{"AWS_REGION": "us-west-2", "API_ENDPOINT": "https://api.example.com"}},
+			expectedModel:         "claude-3-5-sonnet-20241022",
 		},
 		{
 			name: "object format - missing id",
@@ -362,7 +482,8 @@ func TestExtractEngineConfig(t *testing.T) {
 				},
 			},
 			expectedEngineSetting: "",
-			expectedConfig:        &EngineConfig{Version: "beta", Model: "gpt-4o"},
+			expectedConfig:        &EngineConfig{Version: "beta"},
+			expectedModel:         "gpt-4o",
 		},
 		{
 			name: "object format - with user-agent (hyphen)",
@@ -436,7 +557,8 @@ func TestExtractEngineConfig(t *testing.T) {
 				},
 			},
 			expectedEngineSetting: "codex",
-			expectedConfig:        &EngineConfig{ID: "codex", Version: "beta", Model: "gpt-4o", MaxTurns: "3", UserAgent: "complete-custom-agent", Env: map[string]string{"CUSTOM_VAR": "value1"}},
+			expectedConfig:        &EngineConfig{ID: "codex", Version: "beta", MaxTurns: "3", UserAgent: "complete-custom-agent", Env: map[string]string{"CUSTOM_VAR": "value1"}},
+			expectedModel:         "gpt-4o",
 		},
 		{
 			name: "object format - harness sub-object retry policy fields (integer literals)",
@@ -448,6 +570,7 @@ func TestExtractEngineConfig(t *testing.T) {
 						"initial-delay-ms":   10000,
 						"backoff-multiplier": 2,
 						"max-delay-ms":       180000,
+						"watchdog-timeout":   120,
 					},
 				},
 			},
@@ -458,6 +581,7 @@ func TestExtractEngineConfig(t *testing.T) {
 				HarnessInitialDelayMs:    "10000",
 				HarnessBackoffMultiplier: "2",
 				HarnessMaxDelayMs:        "180000",
+				HarnessWatchdogTimeoutMs: "120000",
 			},
 		},
 		{
@@ -470,6 +594,7 @@ func TestExtractEngineConfig(t *testing.T) {
 						"initial-delay-ms":   "${{ vars.RETRY_DELAY }}",
 						"backoff-multiplier": "${{ vars.BACKOFF }}",
 						"max-delay-ms":       "${{ vars.MAX_DELAY }}",
+						"watchdog-timeout":   "${{ vars.WATCHDOG_TIMEOUT_SEC }}",
 					},
 				},
 			},
@@ -480,6 +605,7 @@ func TestExtractEngineConfig(t *testing.T) {
 				HarnessInitialDelayMs:    "${{ vars.RETRY_DELAY }}",
 				HarnessBackoffMultiplier: "${{ vars.BACKOFF }}",
 				HarnessMaxDelayMs:        "${{ vars.MAX_DELAY }}",
+				HarnessWatchdogTimeoutMs: "${{ vars.WATCHDOG_TIMEOUT_SEC }}",
 			},
 		},
 		{
@@ -500,7 +626,7 @@ func TestExtractEngineConfig(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			engineSetting, config := compiler.ExtractEngineConfig(test.frontmatter)
+			engineSetting, config, model := compiler.ExtractEngineConfig(test.frontmatter)
 
 			if engineSetting != test.expectedEngineSetting {
 				t.Errorf("Expected engineSetting '%s', got '%s'", test.expectedEngineSetting, engineSetting)
@@ -524,8 +650,8 @@ func TestExtractEngineConfig(t *testing.T) {
 					t.Errorf("Expected config.Version '%s', got '%s'", test.expectedConfig.Version, config.Version)
 				}
 
-				if config.Model != test.expectedConfig.Model {
-					t.Errorf("Expected config.Model '%s', got '%s'", test.expectedConfig.Model, config.Model)
+				if model != test.expectedModel {
+					t.Errorf("Expected model '%s', got '%s'", test.expectedModel, model)
 				}
 
 				if config.MaxTurns != test.expectedConfig.MaxTurns {
@@ -533,6 +659,9 @@ func TestExtractEngineConfig(t *testing.T) {
 				}
 				if config.MaxToolDenials != test.expectedConfig.MaxToolDenials {
 					t.Errorf("Expected config.MaxToolDenials '%s', got '%s'", test.expectedConfig.MaxToolDenials, config.MaxToolDenials)
+				}
+				if config.MaxToolCalls != test.expectedConfig.MaxToolCalls {
+					t.Errorf("Expected config.MaxToolCalls '%s', got '%s'", test.expectedConfig.MaxToolCalls, config.MaxToolCalls)
 				}
 
 				if config.MaxRuns != test.expectedConfig.MaxRuns {
@@ -571,6 +700,9 @@ func TestExtractEngineConfig(t *testing.T) {
 				if config.HarnessMaxDelayMs != test.expectedConfig.HarnessMaxDelayMs {
 					t.Errorf("Expected config.HarnessMaxDelayMs '%s', got '%s'", test.expectedConfig.HarnessMaxDelayMs, config.HarnessMaxDelayMs)
 				}
+				if config.HarnessWatchdogTimeoutMs != test.expectedConfig.HarnessWatchdogTimeoutMs {
+					t.Errorf("Expected config.HarnessWatchdogTimeoutMs '%s', got '%s'", test.expectedConfig.HarnessWatchdogTimeoutMs, config.HarnessWatchdogTimeoutMs)
+				}
 
 				if len(config.Env) != len(test.expectedConfig.Env) {
 					t.Errorf("Expected config.Env length %d, got %d", len(test.expectedConfig.Env), len(config.Env))
@@ -591,7 +723,7 @@ func TestExtractEngineConfig(t *testing.T) {
 
 func TestExtractEngineConfig_EngineAuthMapsToAWFEnv(t *testing.T) {
 	compiler := NewCompiler()
-	_, config := compiler.ExtractEngineConfig(map[string]any{
+	_, config, _ := compiler.ExtractEngineConfig(map[string]any{
 		"engine": map[string]any{
 			"id": "copilot",
 			"auth": map[string]any{
@@ -625,7 +757,7 @@ func TestExtractEngineConfig_EngineAuthMapsToAWFEnv(t *testing.T) {
 
 func TestExtractEngineConfig_EngineEnvTakesPrecedenceOverEngineAuth(t *testing.T) {
 	compiler := NewCompiler()
-	_, config := compiler.ExtractEngineConfig(map[string]any{
+	_, config, _ := compiler.ExtractEngineConfig(map[string]any{
 		"engine": map[string]any{
 			"id": "copilot",
 			"env": map[string]any{
@@ -646,7 +778,7 @@ func TestExtractEngineConfig_EngineEnvTakesPrecedenceOverEngineAuth(t *testing.T
 
 func TestExtractEngineConfig_AnthropicWIFMapsToAWFEnv(t *testing.T) {
 	compiler := NewCompiler()
-	_, config := compiler.ExtractEngineConfig(map[string]any{
+	_, config, _ := compiler.ExtractEngineConfig(map[string]any{
 		"engine": map[string]any{
 			"id": "claude",
 			"auth": map[string]any{
@@ -666,7 +798,7 @@ func TestExtractEngineConfig_AnthropicWIFMapsToAWFEnv(t *testing.T) {
 		assert.Equal(t, "anthropic", config.Auth.Provider)
 		assert.Equal(t, "fr_01ABC", config.Auth.AnthropicFederationRuleID)
 		assert.Equal(t, "org_01XYZ", config.Auth.AnthropicOrganizationID)
-		assert.Equal(t, "sa_01DEF", config.Auth.AnthropicServiceAccountID)
+		assert.Equal(t, "sa_01DEF", config.Auth.ServiceAccountID)
 		assert.Equal(t, "ws_01GHI", config.Auth.AnthropicWorkspaceID)
 	}
 
@@ -678,6 +810,34 @@ func TestExtractEngineConfig_AnthropicWIFMapsToAWFEnv(t *testing.T) {
 	assert.Equal(t, "ws_01GHI", config.Env["AWF_AUTH_ANTHROPIC_WORKSPACE_ID"])
 }
 
+func TestExtractEngineConfig_OpenAIWIFMapsToAWFEnv(t *testing.T) {
+	_, config, _ := NewCompiler().ExtractEngineConfig(map[string]any{
+		"engine": map[string]any{
+			"id": "codex",
+			"auth": map[string]any{
+				"type":                 "github-oidc",
+				"provider":             "openai",
+				"identity-provider-id": "idp_01ABC",
+				"service-account-id":   "svc_01DEF",
+				"audience":             "https://api.openai.com/v1",
+			},
+		},
+	})
+
+	assert.NotNil(t, config)
+	if assert.NotNil(t, config.Auth) {
+		assert.Equal(t, "openai", config.Auth.Provider)
+		assert.Equal(t, "idp_01ABC", config.Auth.OpenAIIdentityProviderID)
+		assert.Equal(t, "svc_01DEF", config.Auth.ServiceAccountID)
+	}
+	assert.Equal(t, "github-oidc", config.Env["AWF_AUTH_TYPE"])
+	assert.Equal(t, "openai", config.Env["AWF_AUTH_PROVIDER"])
+	assert.Equal(t, "https://api.openai.com/v1", config.Env["AWF_AUTH_OIDC_AUDIENCE"])
+	assert.Equal(t, "idp_01ABC", config.Env["AWF_AUTH_OPENAI_IDENTITY_PROVIDER_ID"])
+	assert.Equal(t, "svc_01DEF", config.Env["AWF_AUTH_OPENAI_SERVICE_ACCOUNT_ID"])
+	assert.NotContains(t, config.Env, "AWF_AUTH_ANTHROPIC_SERVICE_ACCOUNT_ID")
+}
+
 func TestCompileWorkflowWithExtendedEngine(t *testing.T) {
 	// Create temporary directory for test files
 	tmpDir := testutil.TempDir(t, "extended-engine-test")
@@ -687,6 +847,7 @@ func TestCompileWorkflowWithExtendedEngine(t *testing.T) {
 		content        string
 		expectedAI     string
 		expectedConfig *EngineConfig
+		expectedModel  string
 	}{
 		{
 			name: "string engine format",
@@ -725,7 +886,8 @@ engine:
 
 This is a test workflow.`,
 			expectedAI:     "claude",
-			expectedConfig: &EngineConfig{ID: "claude", Version: "beta", Model: "claude-3-5-sonnet-20241022"},
+			expectedConfig: &EngineConfig{ID: "claude", Version: "beta"},
+			expectedModel:  "claude-3-5-sonnet-20241022",
 		},
 		{
 			name: "object engine format - codex with model",
@@ -745,7 +907,8 @@ engine:
 
 This is a test workflow.`,
 			expectedAI:     "codex",
-			expectedConfig: &EngineConfig{ID: "codex", Model: "gpt-4o"},
+			expectedConfig: &EngineConfig{ID: "codex"},
+			expectedModel:  "gpt-4o",
 		},
 	}
 
@@ -786,12 +949,197 @@ This is a test workflow.`,
 					t.Errorf("Expected EngineConfig.Version '%s', got '%s'", test.expectedConfig.Version, workflowData.EngineConfig.Version)
 				}
 
-				if workflowData.EngineConfig.Model != test.expectedConfig.Model {
-					t.Errorf("Expected EngineConfig.Model '%s', got '%s'", test.expectedConfig.Model, workflowData.EngineConfig.Model)
+				if workflowData.Model != test.expectedModel {
+					t.Errorf("Expected WorkflowData.Model '%s', got '%s'", test.expectedModel, workflowData.Model)
 				}
 			}
 		})
 	}
+}
+
+func TestParseWorkflowWithSplitEngineModels(t *testing.T) {
+	workflowPath := filepath.Join(testutil.TempDir(t, "split-engine-model-test"), "workflow.md")
+	workflowContent := `---
+on: push
+permissions:
+  contents: read
+strict: false
+engine:
+  id: codex
+model: openai/gpt-4o-mini
+safe-outputs:
+  threat-detection:
+    engine:
+      id: copilot
+      model: gpt-5-mini
+---
+
+# Test Workflow
+`
+	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	workflowData, err := NewCompiler().ParseWorkflowFile(workflowPath)
+	if err != nil {
+		t.Fatalf("ParseWorkflowFile failed: %v", err)
+	}
+
+	assert.Equal(t, "openai/gpt-4o-mini", workflowData.Model)
+	if assert.NotNil(t, workflowData.SafeOutputs) && assert.NotNil(t, workflowData.SafeOutputs.ThreatDetection) {
+		assert.Equal(t, "gpt-5-mini", workflowData.SafeOutputs.ThreatDetection.Model)
+	}
+
+	compiler := NewCompiler()
+	if err := compiler.CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("CompileWorkflow failed: %v", err)
+	}
+	lockFile, err := os.ReadFile(stringutil.MarkdownToLockFile(workflowPath))
+	if err != nil {
+		t.Fatalf("ReadFile lock file failed: %v", err)
+	}
+	metadata, legacy, err := ExtractMetadataFromLockFile(string(lockFile))
+	if err != nil {
+		t.Fatalf("ExtractMetadataFromLockFile failed: %v", err)
+	}
+	if metadata == nil {
+		t.Fatal("Expected compiled lock file to contain metadata")
+	}
+	if legacy {
+		t.Fatal("Expected compiled lock file to contain structured metadata")
+	}
+	assert.Equal(t, "openai/gpt-4o-mini", metadata.AgentModel)
+	assert.Equal(t, "gpt-5-mini", metadata.DetectionAgentModel)
+}
+
+// TestCompileClaudeWithExperimentsModel ensures that ${{ experiments.<name> }} used as
+// engine.model is rewritten to a valid GitHub Actions expression everywhere it lands in the
+// compiled lock file, instead of the literal (invalid) `experiments` context reference.
+// Regression test for https://github.com/github/gh-aw/issues/61584.
+func TestCompileClaudeWithExperimentsModel(t *testing.T) {
+	workflowPath := filepath.Join(testutil.TempDir(t, "claude-experiments-model-test"), "workflow.md")
+	workflowContent := `---
+on:
+  workflow_dispatch:
+engine:
+  id: claude
+  model: ${{ experiments.model }}
+experiments:
+  model: [sonnet, opus]
+safe-outputs:
+  noop:
+---
+
+# Test Workflow
+
+Write a haiku and say Done.
+`
+	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := NewCompiler().CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("CompileWorkflow failed: %v", err)
+	}
+	lockFile, err := os.ReadFile(stringutil.MarkdownToLockFile(workflowPath))
+	if err != nil {
+		t.Fatalf("ReadFile lock file failed: %v", err)
+	}
+	lock := string(lockFile)
+
+	// The literal (invalid) "experiments" context must never appear in the compiled workflow.
+	assert.False(t, containsInNonCommentLines(lock, "experiments.model }}"), "the raw experiments.model expression must be rewritten")
+
+	// Within the activation job (same job as the pick-experiment step), the info step must
+	// read the step output directly since a job cannot reference its own outputs via needs.
+	assert.Contains(t, lock, `GH_AW_INFO_MODEL: "${{ steps.pick-experiment.outputs.model }}"`)
+
+	// The pick-experiment step must run before the info step, otherwise its output is not
+	// yet available and the resolved model would be empty at run time.
+	pickIdx := strings.Index(lock, "id: pick-experiment")
+	infoIdx := strings.Index(lock, "id: generate_aw_info")
+	assert.NotEqual(t, -1, pickIdx, "pick-experiment step should be present")
+	assert.NotEqual(t, -1, infoIdx, "generate_aw_info step should be present")
+	assert.Less(t, pickIdx, infoIdx, "experiment selection must precede the agentic run info step")
+	// Everywhere else (agent job env, safe-outputs job env), the activation job's output
+	// must be referenced via the needs context.
+	assert.Contains(t, lock, "ANTHROPIC_MODEL: ${{ needs.activation.outputs.model }}")
+	assert.Contains(t, lock, `GH_AW_ENGINE_MODEL: "${{ needs.activation.outputs.model }}"`)
+}
+
+// TestCompileClaudeWithExperimentsModelSplitField is like TestCompileClaudeWithExperimentsModel
+// but uses the split top-level `model:` field (rather than `engine.model`) to confirm both
+// paths funnel through the same rewrite before the compiled workflow is emitted.
+func TestCompileClaudeWithExperimentsModelSplitField(t *testing.T) {
+	workflowPath := filepath.Join(testutil.TempDir(t, "claude-experiments-model-split-test"), "workflow.md")
+	workflowContent := `---
+on:
+  workflow_dispatch:
+engine:
+  id: claude
+model: ${{ experiments.model }}
+experiments:
+  model: [sonnet, opus]
+safe-outputs:
+  noop:
+---
+
+# Test Workflow
+
+Write a haiku and say Done.
+`
+	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := NewCompiler().CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("CompileWorkflow failed: %v", err)
+	}
+	lockFile, err := os.ReadFile(stringutil.MarkdownToLockFile(workflowPath))
+	if err != nil {
+		t.Fatalf("ReadFile lock file failed: %v", err)
+	}
+	lock := string(lockFile)
+
+	assert.False(t, containsInNonCommentLines(lock, "experiments.model }}"), "the raw experiments.model expression must be rewritten")
+	assert.Contains(t, lock, `GH_AW_INFO_MODEL: "${{ steps.pick-experiment.outputs.model }}"`)
+	assert.Contains(t, lock, "ANTHROPIC_MODEL: ${{ needs.activation.outputs.model }}")
+	assert.Contains(t, lock, `GH_AW_ENGINE_MODEL: "${{ needs.activation.outputs.model }}"`)
+}
+
+func TestCompileCodexWithCopilotModel(t *testing.T) {
+	workflowPath := filepath.Join(testutil.TempDir(t, "codex-copilot-model-test"), "workflow.md")
+	workflowContent := `---
+on: push
+permissions:
+  contents: read
+  copilot-requests: write
+strict: false
+engine: codex
+model: copilot/auto
+---
+
+# Test Workflow
+`
+	if err := os.WriteFile(workflowPath, []byte(workflowContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := NewCompiler().CompileWorkflow(workflowPath); err != nil {
+		t.Fatalf("CompileWorkflow failed: %v", err)
+	}
+	lockFile, err := os.ReadFile(stringutil.MarkdownToLockFile(workflowPath))
+	if err != nil {
+		t.Fatalf("ReadFile lock file failed: %v", err)
+	}
+	lock := string(lockFile)
+	assert.Contains(t, lock, "GH_AW_LLM_PROVIDER: github")
+	assert.Contains(t, lock, "COPILOT_GITHUB_TOKEN: ${{ github.token }}")
+	assert.Contains(t, lock, constants.CopilotBYOKDummyAPIKeyEnvVar+": "+constants.CopilotBYOKDummyAPIKey)
+	assert.Contains(t, lock, `export CODEX_API_KEY="$`+constants.CopilotBYOKDummyAPIKeyEnvVar+`"`)
+	assert.Contains(t, lock, "GH_AW_MODEL_AGENT_CODEX: auto")
+	assert.NotContains(t, lock, "secrets.CODEX_API_KEY")
+	assert.NotContains(t, lock, "secrets.OPENAI_API_KEY")
 }
 
 func TestEngineConfigurationWithModel(t *testing.T) {
@@ -806,8 +1154,7 @@ func TestEngineConfigurationWithModel(t *testing.T) {
 			name:   "Claude with model",
 			engine: NewClaudeEngine(),
 			engineConfig: &EngineConfig{
-				ID:    "claude",
-				Model: "claude-3-5-sonnet-20241022",
+				ID: "claude",
 			},
 			expectedModel:  "claude-3-5-sonnet-20241022",
 			expectedAPIKey: "",
@@ -816,8 +1163,7 @@ func TestEngineConfigurationWithModel(t *testing.T) {
 			name:   "Codex with model",
 			engine: NewCodexEngine(),
 			engineConfig: &EngineConfig{
-				ID:    "codex",
-				Model: "gpt-4o",
+				ID: "codex",
 			},
 			expectedModel:  "gpt-4o",
 			expectedAPIKey: "",
@@ -828,6 +1174,7 @@ func TestEngineConfigurationWithModel(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			workflowData := &WorkflowData{
 				Name:         "test-workflow",
+				Model:        tt.expectedModel,
 				EngineConfig: tt.engineConfig,
 			}
 			steps := tt.engine.GetExecutionSteps(workflowData, "test-log")
@@ -993,6 +1340,92 @@ func TestNilEngineConfig(t *testing.T) {
 	}
 }
 
+func TestEngineDynamicWorkflowsFieldExtraction(t *testing.T) {
+	compiler := NewCompiler()
+	tests := []struct {
+		name    string
+		engine  any
+		enabled bool
+	}{
+		{
+			name:    "engine string uses engine default",
+			engine:  "claude",
+			enabled: false,
+		},
+		{
+			name: "engine object uses engine default",
+			engine: map[string]any{
+				"id": "claude",
+			},
+			enabled: false,
+		},
+		{
+			name: "explicitly enabled",
+			engine: map[string]any{
+				"id":                "claude",
+				"dynamic-workflows": true,
+			},
+			enabled: true,
+		},
+		{
+			name: "explicitly disabled",
+			engine: map[string]any{
+				"id":                "claude",
+				"dynamic-workflows": false,
+			},
+			enabled: false,
+		},
+	}
+
+	for _, engineID := range []string{"claude", "copilot"} {
+		for _, tt := range tests {
+			t.Run(engineID+"/"+tt.name, func(t *testing.T) {
+				engine := tt.engine
+				if object, ok := engine.(map[string]any); ok {
+					engineObject := map[string]any{"id": engineID}
+					if value, exists := object["dynamic-workflows"]; exists {
+						engineObject["dynamic-workflows"] = value
+					}
+					engine = engineObject
+				} else {
+					engine = engineID
+				}
+				_, config, _ := compiler.ExtractEngineConfig(map[string]any{"engine": engine})
+				if !assert.NotNil(t, config) {
+					return
+				}
+				assert.Equal(t, tt.enabled, config.DynamicWorkflowsEnabled())
+			})
+		}
+	}
+}
+
+func TestDynamicWorkflowsEnabledUsesEngineCapability(t *testing.T) {
+	engine := NewClaudeEngine()
+	engine.id = "not-claude"
+	assert.False(t, dynamicWorkflowsEnabled(engine, nil))
+	enabled := true
+	assert.True(t, dynamicWorkflowsEnabled(engine, &EngineConfig{DynamicWorkflows: &enabled}))
+
+	disabled := false
+	assert.False(t, dynamicWorkflowsEnabled(engine, &EngineConfig{DynamicWorkflows: &disabled}))
+
+	engine.capabilities.DynamicWorkflows = false
+	assert.False(t, dynamicWorkflowsEnabled(engine, nil))
+}
+
+func TestDynamicWorkflowsEnabledRequiresOptIn(t *testing.T) {
+	enabled, disabled := true, false
+	for _, engine := range []CodingAgentEngine{NewCopilotEngine(), NewClaudeEngine(), NewCodexEngine()} {
+		t.Run(engine.GetID(), func(t *testing.T) {
+			assert.False(t, dynamicWorkflowsEnabled(engine, nil))
+			assert.False(t, dynamicWorkflowsEnabled(engine, &EngineConfig{}))
+			assert.False(t, dynamicWorkflowsEnabled(engine, &EngineConfig{DynamicWorkflows: &disabled}))
+			assert.Equal(t, engine.GetCapabilities().DynamicWorkflows, dynamicWorkflowsEnabled(engine, &EngineConfig{DynamicWorkflows: &enabled}))
+		})
+	}
+}
+
 func TestEngineBareFieldExtraction(t *testing.T) {
 	compiler := NewCompiler()
 
@@ -1064,7 +1497,7 @@ func TestEngineBareFieldExtraction(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, config := compiler.ExtractEngineConfig(tt.frontmatter)
+			_, config, _ := compiler.ExtractEngineConfig(tt.frontmatter)
 			if config == nil {
 				t.Fatal("Expected config to be non-nil")
 			}
@@ -1188,6 +1621,11 @@ func TestSupportsBareMode(t *testing.T) {
 			expected: true,
 		},
 		{
+			name:     "pi supports bare mode",
+			engine:   NewPiEngine(),
+			expected: true,
+		},
+		{
 			name:     "codex does not support bare mode",
 			engine:   NewCodexEngine(),
 			expected: false,
@@ -1203,6 +1641,26 @@ func TestSupportsBareMode(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.expected, tt.engine.GetCapabilities().BareMode,
 				"BareMode capability should be %v for %s", tt.expected, tt.engine.GetID())
+		})
+	}
+}
+
+func TestSupportsContextWindow(t *testing.T) {
+	tests := []struct {
+		name     string
+		engine   CodingAgentEngine
+		expected bool
+	}{
+		{name: "Claude does not support context-window", engine: NewClaudeEngine()},
+		{name: "Codex does not support context-window", engine: NewCodexEngine()},
+		{name: "Copilot does not support context-window", engine: NewCopilotEngine()},
+		{name: "Gemini does not support context-window", engine: NewGeminiEngine()},
+		{name: "Pi supports context-window", engine: NewPiEngine(), expected: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, tt.engine.GetCapabilities().ContextWindow)
 		})
 	}
 }
@@ -1297,7 +1755,7 @@ func TestEngineMCPSessionTimeoutExtraction(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, config := compiler.ExtractEngineConfig(tt.frontmatter)
+			_, config, _ := compiler.ExtractEngineConfig(tt.frontmatter)
 			if config == nil {
 				t.Fatal("Expected non-nil config")
 			}
@@ -1365,7 +1823,7 @@ func TestEngineMCPToolTimeoutExtraction(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, config := compiler.ExtractEngineConfig(tt.frontmatter)
+			_, config, _ := compiler.ExtractEngineConfig(tt.frontmatter)
 			if config == nil {
 				t.Fatal("Expected non-nil config")
 			}

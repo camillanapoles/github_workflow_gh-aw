@@ -11,6 +11,7 @@ import (
 )
 
 func TestMCPCommandUnknownSubcommandReturnsError(t *testing.T) {
+	t.Parallel()
 	cmd := NewMCPCommand()
 	cmd.SetOut(io.Discard)
 	cmd.SetErr(io.Discard)
@@ -20,5 +21,5 @@ func TestMCPCommandUnknownSubcommandReturnsError(t *testing.T) {
 
 	err := cmd.Execute()
 	require.Error(t, err)
-	assert.Equal(t, `unknown command "remove" for "mcp"`, err.Error())
+	assert.Equal(t, `unknown command "remove" for "gh aw mcp"`, err.Error())
 }

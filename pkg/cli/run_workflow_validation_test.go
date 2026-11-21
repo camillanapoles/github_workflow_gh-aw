@@ -5,6 +5,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/github/gh-aw/pkg/workflow"
@@ -12,7 +13,86 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestValidateRemoteWorkflowPaginated(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script fake gh is not supported on Windows")
+	}
+
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "args.log")
+	responsePath := filepath.Join(dir, "response.json")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"" + argsPath + "\"\ncat \"" + responsePath + "\"\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "gh"), []byte(script), 0o755))
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GH_TOKEN", "")
+	t.Setenv("GITHUB_TOKEN", "")
+
+	tests := []struct {
+		name      string
+		repo      string
+		response  string
+		wantError string
+		wantHost  string
+	}{
+		{
+			name:     "workflow on later page",
+			repo:     "owner/repo",
+			response: `[{"workflows":[{"id":1,"path":".github/workflows/first.lock.yml","state":"active"}]},{"workflows":[{"id":2,"name":"ESLint Factory Dispatcher","path":".github/workflows/eslint-factory-dispatcher.lock.yml","state":"active"}]}]`,
+		},
+		{
+			name:     "disabled workflow is discoverable",
+			repo:     "owner/repo",
+			response: `[{"workflows":[{"id":2,"path":".github/workflows/eslint-factory-dispatcher.lock.yml","state":"disabled_manually"}]}]`,
+		},
+		{
+			name:     "enterprise host",
+			repo:     "github.example.com/owner/repo",
+			response: `[{"workflows":[{"id":2,"path":".github/workflows/eslint-factory-dispatcher.lock.yml","state":"active"}]}]`,
+			wantHost: "github.example.com",
+		},
+		{
+			name:      "similarly suffixed workflow is not a match",
+			repo:      "owner/repo",
+			response:  `[{"workflows":[{"id":2,"path":".github/workflows/not-eslint-factory-dispatcher.lock.yml","state":"active"}]}]`,
+			wantError: "not found in repository",
+		},
+		{
+			name:      "empty inventory",
+			repo:      "owner/repo",
+			response:  `[{"workflows":[]}]`,
+			wantError: "not found in repository",
+		},
+		{
+			name:      "malformed response",
+			repo:      "owner/repo",
+			response:  `invalid-json`,
+			wantError: "invalid JSON",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.NoError(t, os.WriteFile(responsePath, []byte(tt.response), 0o600))
+			err := validateRemoteWorkflow(t.Context(), ".github/workflows/eslint-factory-dispatcher.md", tt.repo, true)
+			if tt.wantError == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, tt.wantError)
+				if tt.wantError == "not found in repository" {
+					assert.Contains(t, err.Error(), workflowDispatchRegistrationHint)
+				}
+			}
+			args, err := os.ReadFile(argsPath)
+			require.NoError(t, err)
+			assert.Contains(t, string(args), "api --paginate --slurp repos/owner/repo/actions/workflows?per_page=100")
+			if tt.wantHost != "" {
+				assert.Contains(t, string(args), "--hostname "+tt.wantHost)
+			}
+		})
+	}
+}
+
 func TestGetLockFilePath(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name         string
 		markdownPath string
@@ -32,6 +112,7 @@ func TestGetLockFilePath(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			result := getLockFilePath(tt.markdownPath)
 			assert.Equal(t, tt.expected, result)
 		})
@@ -39,6 +120,7 @@ func TestGetLockFilePath(t *testing.T) {
 }
 
 func TestIsRunnable_WithLockFile(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name           string
 		markdownFile   string
@@ -149,7 +231,7 @@ jobs:
 			if tt.expectError {
 				require.Error(t, err)
 				if tt.errorContains != "" {
-					assert.Contains(t, err.Error(), tt.errorContains)
+					require.ErrorContains(t, err, tt.errorContains)
 				}
 			} else {
 				require.NoError(t, err)
@@ -160,6 +242,7 @@ jobs:
 }
 
 func TestGetWorkflowInputs_WithLockFile(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name          string
 		markdownFile  string
@@ -319,7 +402,7 @@ jobs:
 			if tt.expectError {
 				require.Error(t, err)
 				if tt.errorContains != "" {
-					assert.Contains(t, err.Error(), tt.errorContains)
+					require.ErrorContains(t, err, tt.errorContains)
 				}
 			} else {
 				require.NoError(t, err)
@@ -420,8 +503,8 @@ jobs:
 	// Test with missing required input
 	err = validateWorkflowInputs(markdownPath, []string{})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "Missing required input(s)")
-	assert.Contains(t, err.Error(), "issue_url")
+	require.ErrorContains(t, err, "Missing required input(s)")
+	require.ErrorContains(t, err, "issue_url")
 	var validationErr *workflow.WorkflowValidationError
 	require.ErrorAs(t, err, &validationErr, "expected WorkflowValidationError for invalid inputs")
 	assert.Contains(t, validationErr.Suggestion, "on:")
@@ -435,7 +518,7 @@ jobs:
 	// Test with typo in input name
 	err = validateWorkflowInputs(markdownPath, []string{"issue_ur=https://example.com"})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "Invalid input name")
-	assert.Contains(t, err.Error(), "issue_ur", "Error should include invalid input")
-	assert.Contains(t, err.Error(), "issue_url", "Error should suggest correct input name")
+	require.ErrorContains(t, err, "Invalid input name")
+	require.ErrorContains(t, err, "issue_ur", "Error should include invalid input")
+	require.ErrorContains(t, err, "issue_url", "Error should suggest correct input name")
 }

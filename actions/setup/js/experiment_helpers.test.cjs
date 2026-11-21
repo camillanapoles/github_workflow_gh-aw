@@ -15,7 +15,10 @@ describe("readExperimentAssignments", () => {
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     readFileSpy.mockRestore();
+    delete process.env.GH_AW_EXPERIMENTS_PROMPT_STYLE;
+    delete process.env.GH_AW_EXPERIMENTS_REASONING_DEPTH;
     if (savedStateDir !== undefined) {
       process.env.GH_AW_EXPERIMENT_STATE_DIR = savedStateDir;
     } else {
@@ -66,5 +69,19 @@ describe("readExperimentAssignments", () => {
       throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
     });
     expect(readExperimentAssignments()).toEqual({ mode: "fast" });
+  });
+
+  it("falls back to GH_AW_EXPERIMENTS_* environment variables when assignments file is unavailable", () => {
+    process.env.GH_AW_EXPERIMENTS_PROMPT_STYLE = "concise";
+    process.env.GH_AW_EXPERIMENTS_REASONING_DEPTH = "deep";
+    expect(readExperimentAssignments()).toEqual({ prompt_style: "concise", reasoning_depth: "deep" });
+  });
+
+  it("never treats the secret broker endpoint as an experiment assignment", () => {
+    vi.stubEnv("GH_AW_BROKER_EXPERIMENTS_URL", "https://synthetic-broker.example.test/secret");
+    expect(readExperimentAssignments()).toBeNull();
+    vi.stubEnv("GH_AW_EXPERIMENTS_BROKER_URL", "candidate");
+    process.env.GH_AW_EXPERIMENTS_PROMPT_STYLE = "concise";
+    expect(readExperimentAssignments()).toEqual({ broker_url: "candidate", prompt_style: "concise" });
   });
 });

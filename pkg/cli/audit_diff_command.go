@@ -18,7 +18,7 @@ import (
 func NewAuditDiffSubcommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:    "diff <base-run-id> <compare-run-id>...",
-		Short:  "Compare behavior across workflow runs",
+		Short:  "[Deprecated] Compare workflow runs (use: gh aw audit <base> <compare...>)",
 		Hidden: true,
 		Long: `Deprecated: pass multiple run IDs directly to the audit command instead.
 
@@ -162,6 +162,9 @@ func RunAuditDiff(ctx context.Context, baseRunID int64, compareRunIDs []int64, o
 	if err != nil {
 		return fmt.Errorf("failed to load data for base run %d: %w", baseRunID, err)
 	}
+	if err := exportRunATIF(ctx, baseRunID, resolveAuditOutputDir(outputDir, baseRunID)); err != nil {
+		return err
+	}
 
 	diffs := make([]*AuditDiff, 0, len(compareRunIDs))
 
@@ -178,6 +181,9 @@ func RunAuditDiff(ctx context.Context, baseRunID int64, compareRunIDs []int64, o
 		compareSummary, err := loadRunSummaryForDiff(ctx, compareRunID, outputDir, owner, repo, hostname, verbose, artifactFilter)
 		if err != nil {
 			return fmt.Errorf("failed to load data for run %d: %w", compareRunID, err)
+		}
+		if err := exportRunATIF(ctx, compareRunID, resolveAuditOutputDir(outputDir, compareRunID)); err != nil {
+			return err
 		}
 
 		// Warn if no firewall data found for this pair

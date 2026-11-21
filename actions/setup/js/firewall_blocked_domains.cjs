@@ -13,12 +13,26 @@ const path = require("path");
 const { sanitizeDomainName } = require("./sanitize_content_core.cjs");
 const { renderTemplateFromFile, getPromptPath } = require("./messages_core.cjs");
 const { renderMarkdownTemplate } = require("./render_template.cjs");
+const { parseReportMarkdown } = require("./report_markdown.cjs");
+const { renderReport } = require("./report_ast.cjs");
+
+// Internal AWF sidecar container hostnames added to network.topologyAttach by
+// gh-aw itself (e.g. the MCP Gateway and the CLI proxy). These are
+// framework-managed, not user-controllable external domains, and must never
+// surface in the "blocked domains" warning shown on issues/PRs.
+const AWF_INTERNAL_SIDECAR_HOSTS = ["awmg-mcpg", "awmg-cli-proxy"];
+
+// Pre-compute sanitized forms at module load time.
+// sanitizeDomainName strips non-alphanumeric characters (including hyphens),
+// which is exactly how these container names appear after log sanitization
+// (e.g. "awmg-mcpg" → "awmgmcpg", "awmg-cli-proxy" → "awmgcliproxy").
+const AWF_INTERNAL_SIDECAR_HOSTS_SANITIZED = new Set(AWF_INTERNAL_SIDECAR_HOSTS.map(h => sanitizeDomainName(h)));
 
 /**
  * Parses a single firewall log line
  * Format: timestamp client_ip:port domain dest_ip:port proto method status decision url user_agent
  * @param {string} line - Log line to parse
- * @returns {object|null} Parsed entry or null if invalid
+ * @returns {any|null} Parsed entry or null if invalid
  */
 function parseFirewallLogLine(line) {
   const trimmed = line.trim();
@@ -61,6 +75,10 @@ function parseFirewallLogLine(line) {
 function isRequestBlocked(decision, status) {
   // Check status code first
   const statusCode = parseInt(status, 10);
+  if (statusCode === 200 || statusCode === 206 || statusCode === 304) {
+    return false;
+  }
+
   if (statusCode === 403 || statusCode === 407) {
     return true;
   }
@@ -68,11 +86,6 @@ function isRequestBlocked(decision, status) {
   // Check decision field
   if (decision.includes("NONE_NONE") || decision.includes("TCP_DENIED")) {
     return true;
-  }
-
-  // Check for allowed indicators
-  if (statusCode === 200 || statusCode === 206 || statusCode === 304) {
-    return false;
   }
 
   if (decision.includes("TCP_TUNNEL") || decision.includes("TCP_HIT") || decision.includes("TCP_MISS")) {
@@ -173,7 +186,7 @@ function getBlockedDomains(logsDir) {
           domainField = entry.destIpPort;
         }
         const sanitizedDomain = extractAndSanitizeDomain(domainField);
-        if (sanitizedDomain && sanitizedDomain !== "-") {
+        if (sanitizedDomain && sanitizedDomain !== "-" && !AWF_INTERNAL_SIDECAR_HOSTS_SANITIZED.has(sanitizedDomain)) {
           blockedDomainsSet.add(sanitizedDomain);
         }
       }
@@ -191,8 +204,18 @@ function getBlockedDomains(logsDir) {
  * @returns {string} GitHub warning alert with details section, or empty string if no blocked domains
  */
 function generateBlockedDomainsSection(blockedDomains, templatePath) {
+  const children = generateBlockedDomainsReportSection(blockedDomains, templatePath);
+  return children.length ? "\n\n" + renderReport({ type: "report", title: "Firewall blocked domains", children }).body : "";
+}
+
+/**
+ * @param {string[]} blockedDomains
+ * @param {string} [templatePath]
+ * @returns {import("./report_ast.cjs").ReportBlock[]}
+ */
+function generateBlockedDomainsReportSection(blockedDomains, templatePath) {
   if (!blockedDomains || blockedDomains.length === 0) {
-    return "";
+    return [];
   }
 
   const domainCount = blockedDomains.length;
@@ -200,10 +223,11 @@ function generateBlockedDomainsSection(blockedDomains, templatePath) {
   const verb = domainCount === 1 ? "was" : "were";
 
   // Build domain bullet list lines
-  const domainList = blockedDomains.map(domain => `> - \`${domain}\`\n`).join("");
+  /** @type {import("./report_ast.cjs").ReportBlock[]} */
+  const domainList = [{ type: "list", ordered: false, agentTainted: false, items: blockedDomains.map(domain => [{ type: "paragraph", agentTainted: false, children: [{ type: "code", value: domain, agentTainted: true }] }]) }];
 
   // Build YAML network.allowed list lines
-  const yamlNetworkList = blockedDomains.map(domain => `>     - "${domain}"\n`).join("");
+  const yamlNetworkList = blockedDomains.map(domain => `    - ${JSON.stringify(domain)}`).join("\n");
 
   const hasGitHubApiBlocked = blockedDomains.includes("api.github.com");
 
@@ -219,18 +243,18 @@ function generateBlockedDomainsSection(blockedDomains, templatePath) {
   // renderMarkdownTemplate's isTruthy() correctly evaluates the
   // {{#if {has_github_api_blocked}}} conditional in the template
   // (isTruthy("false") === false per the template engine's explicit check).
-  const rendered = renderTemplateFromFile(resolvedTemplatePath, {
-    domain_count: domainCount,
-    domain_word: domainWord,
-    verb,
-    domain_list: domainList,
-    yaml_network_list: yamlNetworkList,
-    has_github_api_blocked: hasGitHubApiBlocked ? "true" : "false",
+  const template = renderMarkdownTemplate(renderTemplateFromFile(resolvedTemplatePath, { has_github_api_blocked: hasGitHubApiBlocked ? "true" : "false" }));
+  return parseReportMarkdown(template, {
+    agentTainted: false,
+    context: {
+      domain_count: domainCount,
+      domain_word: domainWord,
+      verb,
+      domain_list: domainList,
+      yaml_network_list: yamlNetworkList,
+      has_github_api_blocked: hasGitHubApiBlocked ? "true" : "false",
+    },
   });
-
-  // Second pass: evaluate {{#if ...}} conditional blocks (e.g. the gh-proxy tip section)
-  // Template starts without leading newlines; prepend separator expected by callers
-  return "\n\n" + renderMarkdownTemplate(rendered);
 }
 
 module.exports = {
@@ -239,4 +263,5 @@ module.exports = {
   extractAndSanitizeDomain,
   getBlockedDomains,
   generateBlockedDomainsSection,
+  generateBlockedDomainsReportSection,
 };

@@ -22,13 +22,9 @@ const (
 	CodexEngine EngineName = "codex"
 	// GeminiEngine is the Google Gemini engine identifier
 	GeminiEngine EngineName = "gemini"
-	// AntigravityEngine is the Antigravity engine identifier
-	AntigravityEngine EngineName = "antigravity"
-	// OpenCodeEngine is the OpenCode engine identifier
-	OpenCodeEngine EngineName = "opencode"
-	// CrushEngine is the Crush engine identifier
-	CrushEngine EngineName = "crush"
-	// PiEngine is the Pi engine identifier (experimental)
+	// AgyEngine is the experimental Google Antigravity CLI engine identifier.
+	AgyEngine EngineName = "agy"
+	// PiEngine is the Pi engine identifier
 	PiEngine EngineName = "pi"
 
 	// DefaultEngine is the default agentic engine used when no engine is explicitly specified.
@@ -40,7 +36,7 @@ const (
 // Deprecated: Use workflow.NewEngineCatalog(workflow.NewEngineRegistry()).IDs() for a
 // catalog-derived list. This slice is maintained for backward compatibility and must
 // stay in sync with the built-in engines registered in NewEngineCatalog.
-var AgenticEngines = []string{string(ClaudeEngine), string(CodexEngine), string(CopilotEngine), string(GeminiEngine), string(AntigravityEngine), string(OpenCodeEngine), string(CrushEngine), string(PiEngine)}
+var AgenticEngines = []string{string(AgyEngine), string(ClaudeEngine), string(CodexEngine), string(CopilotEngine), string(GeminiEngine), string(PiEngine)}
 
 // EngineOption represents a selectable AI engine with its display metadata and secret configuration
 type EngineOption struct {
@@ -87,44 +83,26 @@ var EngineOptions = []EngineOption{
 	},
 	{
 		Value:       string(GeminiEngine),
-		Label:       "Gemini",
-		Description: "Google Gemini CLI coding agent",
+		Label:       "Gemini (Deprecated)",
+		Description: "Deprecated Google Gemini CLI; use the experimental agy engine where supported",
 		SecretName:  GeminiAPIKey,
 		KeyURL:      "https://aistudio.google.com/app/apikey",
 		WhenNeeded:  "Gemini engine workflows",
 	},
 	{
-		Value:       string(AntigravityEngine),
-		Label:       "Antigravity",
-		Description: "Antigravity CLI coding agent",
-		SecretName:  AntigravityAPIKey,
+		Value:       string(AgyEngine),
+		Label:       "Google Antigravity CLI (Experimental)",
+		Description: "Experimental native Agy CLI with Gemini API-key authentication",
+		SecretName:  GeminiAPIKey,
 		KeyURL:      "https://aistudio.google.com/app/apikey",
-		WhenNeeded:  "Antigravity engine workflows",
-	},
-	{
-		Value:              string(OpenCodeEngine),
-		Label:              "OpenCode",
-		Description:        "OpenCode multi-provider AI coding agent (BYOK)",
-		SecretName:         CopilotGitHubToken,
-		AlternativeSecrets: []string{AnthropicAPIKey, OpenAIAPIKey, CodexAPIKey},
-		KeyURL:             "https://github.com/anomalyco/opencode",
-		WhenNeeded:         "OpenCode engine workflows (default: Copilot routing)",
-	},
-	{
-		Value:              string(CrushEngine),
-		Label:              "Crush",
-		Description:        "Crush multi-provider AI coding agent (BYOK)",
-		SecretName:         CopilotGitHubToken,
-		AlternativeSecrets: []string{AnthropicAPIKey, OpenAIAPIKey, CodexAPIKey},
-		KeyURL:             "https://github.com/charmbracelet/crush#installation",
-		WhenNeeded:         "Crush engine workflows (default: Copilot routing)",
+		WhenNeeded:  "Experimental Agy engine workflows (API key only)",
 	},
 	{
 		Value:              string(PiEngine),
 		Label:              "Pi",
-		Description:        "Pi AI coding agent (experimental)",
+		Description:        "Pi AI coding agent",
 		SecretName:         CopilotGitHubToken,
-		AlternativeSecrets: []string{AnthropicAPIKey, OpenAIAPIKey, CodexAPIKey},
+		AlternativeSecrets: []string{AnthropicAPIKey, OpenAIAPIKey, CodexAPIKey, GeminiAPIKey},
 		KeyURL:             "https://github.com/settings/personal-access-tokens/new",
 		WhenNeeded:         "Pi engine workflows",
 	},
@@ -219,8 +197,6 @@ const (
 	OpenAIAPIKey = "OPENAI_API_KEY"
 	// GeminiAPIKey is the API key secret name required by the Gemini engine.
 	GeminiAPIKey = "GEMINI_API_KEY"
-	// AntigravityAPIKey is the API key secret name required by the Antigravity engine.
-	AntigravityAPIKey = "ANTIGRAVITY_API_KEY"
 )
 
 // Environment variable names for model configuration
@@ -235,10 +211,6 @@ const (
 	EnvVarModelAgentCustom = "GH_AW_MODEL_AGENT_CUSTOM"
 	// EnvVarModelAgentGemini configures the default Gemini model for agent execution
 	EnvVarModelAgentGemini = "GH_AW_MODEL_AGENT_GEMINI"
-	// EnvVarModelAgentAntigravity configures the default Antigravity model for agent execution
-	EnvVarModelAgentAntigravity = "GH_AW_MODEL_AGENT_ANTIGRAVITY"
-	// EnvVarModelAgentOpenCode configures the default OpenCode model for agent execution
-	EnvVarModelAgentOpenCode = "GH_AW_MODEL_AGENT_OPENCODE"
 	// EnvVarModelDetectionCopilot configures the default Copilot model for detection
 	EnvVarModelDetectionCopilot = "GH_AW_MODEL_DETECTION_COPILOT"
 	// EnvVarModelDetectionClaude configures the default Claude model for detection
@@ -247,16 +219,23 @@ const (
 	EnvVarModelDetectionCodex = "GH_AW_MODEL_DETECTION_CODEX"
 	// EnvVarModelDetectionGemini configures the default Gemini model for detection
 	EnvVarModelDetectionGemini = "GH_AW_MODEL_DETECTION_GEMINI"
-	// EnvVarModelDetectionAntigravity configures the default Antigravity model for detection
-	EnvVarModelDetectionAntigravity = "GH_AW_MODEL_DETECTION_ANTIGRAVITY"
-	// EnvVarModelDetectionOpenCode configures the default OpenCode model for detection
-	EnvVarModelDetectionOpenCode = "GH_AW_MODEL_DETECTION_OPENCODE"
-	// EnvVarModelAgentCrush configures the default Crush model for agent execution
-	EnvVarModelAgentCrush = "GH_AW_MODEL_AGENT_CRUSH"
-	// EnvVarModelDetectionCrush configures the default Crush model for detection
-	EnvVarModelDetectionCrush = "GH_AW_MODEL_DETECTION_CRUSH"
+	// EnvVarModelEvalsCopilot configures the default Copilot model for evals execution
+	EnvVarModelEvalsCopilot = "GH_AW_MODEL_EVALS_COPILOT"
+	// EnvVarModelEvalsClaude configures the default Claude model for evals execution
+	EnvVarModelEvalsClaude = "GH_AW_MODEL_EVALS_CLAUDE"
+	// EnvVarModelEvalsCodex configures the default Codex model for evals execution
+	EnvVarModelEvalsCodex = "GH_AW_MODEL_EVALS_CODEX"
+	// EnvVarModelEvalsGemini configures the default Gemini model for evals execution
+	EnvVarModelEvalsGemini = "GH_AW_MODEL_EVALS_GEMINI"
 	// EnvVarModelAgentPi configures the default Pi model for agent execution
 	EnvVarModelAgentPi = "GH_AW_MODEL_AGENT_PI"
+	// EnvVarModelEvalsPi configures the default Pi model for evals execution
+	EnvVarModelEvalsPi = "GH_AW_MODEL_EVALS_PI"
+
+	// EnvVarModelFallback carries the standard org/enterprise/built-in model fallback
+	// expression for the current engine step. Runtime JavaScript harnesses can use this
+	// when a configured model expression resolves to an empty string.
+	EnvVarModelFallback = "GH_AW_MODEL_FALLBACK"
 
 	// CopilotCLIModelEnvVar is the native environment variable name supported by the Copilot CLI
 	// for selecting the model. Setting this env var is equivalent to passing --model to the CLI.
@@ -307,6 +286,12 @@ const (
 	// runtime to start the sidecar without any argument parsing.
 	CopilotSDKServerArgsEnvVar = "GH_AW_COPILOT_SDK_SERVER_ARGS"
 
+	// CopilotSDKToolConfigEnvVar is the environment variable that holds the
+	// compiler-owned SDK tool contract. The built-in SDK driver uses this
+	// contract for model-visible tool filtering, permission enforcement, and
+	// deterministic custom-tool registration.
+	CopilotSDKToolConfigEnvVar = "GH_AW_COPILOT_SDK_TOOL_CONFIG"
+
 	// CopilotSDKDriverEnvVar is set to "1" when the copilot_sdk_driver.cjs program
 	// is used as the execution command instead of inline SDK handling inside the harness.
 	// The harness checks this flag to run the driver as a regular subprocess via runProcess
@@ -326,18 +311,24 @@ const (
 	// inline next to a *_API_KEY key in the YAML env: block.
 	CopilotBYOKDummyAPIKeyEnvVar = "COPILOT_DUMMY_BYOK"
 
-	// CopilotBYOKDefaultModel is the explicit fallback model for Copilot BYOK mode.
-	// BYOK providers require a non-empty model, so this value is used when the
-	// corresponding GH_AW_MODEL_*_COPILOT variable is unset.
-	//
-	// Use Claude Sonnet 4.6 as the explicit default model for Copilot BYOK mode.
-	// This matches the current Copilot default model.
-	CopilotBYOKDefaultModel = "claude-sonnet-4.6"
+	// SonnetDefaultModel is the shared Sonnet-tier fallback model used when workflows
+	// need an explicit default and no engine-specific override is configured.
+	SonnetDefaultModel = "claude-sonnet-5"
 
-	// CodexDefaultModel is the default model for the Codex agentic engine.
-	// Used as the fallback when no explicit model is configured and the
-	// GH_AW_MODEL_AGENT_CODEX / GH_AW_MODEL_DETECTION_CODEX variable is unset.
-	CodexDefaultModel = "gpt-5.4"
+	// CopilotBYOKDefaultModel is the explicit fallback model used when no Copilot model
+	// is configured and the corresponding GH_AW_MODEL_*_COPILOT variable is unset.
+	//
+	// "auto" lets the Copilot API select the best available model automatically.
+	CopilotBYOKDefaultModel = "auto"
+
+	// CodexDefaultModel leaves model selection to explicit configuration or Codex itself.
+	// gh-aw must not introduce an unsanctioned terminal model into fallback chains.
+	CodexDefaultModel = ""
+
+	// AgentDefaultModel is the model display string returned for engines whose model is
+	// dynamically determined by the AI provider (e.g. Claude, Gemini, Pi).
+	// It is used as the GH_AW_INFO_MODEL value when no explicit model is configured.
+	AgentDefaultModel = "agent"
 
 	// ClaudeCLIModelEnvVar is the native environment variable name supported by the Claude Code CLI
 	// for selecting the model. Setting this env var is equivalent to passing --model to the CLI.
@@ -346,18 +337,6 @@ const (
 	// GeminiCLIModelEnvVar is the native environment variable name supported by the Gemini CLI
 	// for selecting the model. Setting this env var is equivalent to passing --model to the CLI.
 	GeminiCLIModelEnvVar = "GEMINI_MODEL"
-
-	// AntigravityCLIModelEnvVar is the native environment variable name supported by the Antigravity CLI
-	// for selecting the model. Setting this env var is equivalent to passing --model to the CLI.
-	AntigravityCLIModelEnvVar = "ANTIGRAVITY_MODEL"
-
-	// CrushCLIModelEnvVar is the native environment variable name for Crush model selection.
-	// Crush uses provider/model format (e.g., "anthropic/claude-sonnet-4-20250514").
-	CrushCLIModelEnvVar = "CRUSH_MODEL"
-
-	// OpenCodeCLIModelEnvVar is the native environment variable name for OpenCode model selection.
-	// OpenCode uses provider/model format (e.g., "anthropic/claude-sonnet-4-20250514").
-	OpenCodeCLIModelEnvVar = "OPENCODE_MODEL"
 
 	// PiCLIModelEnvVar is the native environment variable name for Pi model selection.
 	// Setting PI_MODEL is equivalent to passing --model to the Pi CLI.

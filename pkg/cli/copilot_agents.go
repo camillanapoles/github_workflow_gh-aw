@@ -23,7 +23,11 @@ import (
 var copilotAgentsLog = logger.New("cli:copilot_agents")
 
 const agenticWorkflowsSkillFileListPlaceholder = "{{AW_FILE_LIST}}"
+const agenticWorkflowsOTELSkillParagraph = "When the task involves OTEL, OTLP, traces, observability backends, or telemetry-driven analysis, also read and follow `skills/otel-queries/SKILL.md` after loading the matching workflow prompt or skill."
 const ghAWMarkdownFilesAPIURL = "https://api.github.com/repos/github/gh-aw/contents/.github/aw?ref=main"
+const ghAWMarkdownFilesRawURL = "https://raw.githubusercontent.com/github/gh-aw/main/pkg/cli/data/agentic_workflows_fallback_aw_files.json"
+const agenticWorkflowsSkillDirDescription = ".github/skills/agentic-workflows directory"
+const agenticWorkflowsAgentDirDescription = ".github/agents directory"
 
 //go:embed data/agentic_workflows_agent.md
 var agenticWorkflowsAgentTemplate string
@@ -38,7 +42,7 @@ var listAgenticWorkflowsMarkdownFiles = fetchAgenticWorkflowsMarkdownFiles
 
 // ensureAgenticWorkflowsDispatcher ensures that .github/skills/agentic-workflows/SKILL.md
 // exists and contains the routing instructions loaded by the Agentic Workflows agent.
-func ensureAgenticWorkflowsDispatcher(verbose bool, skipInstructions bool) error {
+func ensureAgenticWorkflowsDispatcher(ctx context.Context, verbose bool, skipInstructions bool, write bool) error {
 	copilotAgentsLog.Print("Ensuring agentic workflows dispatcher skill")
 
 	if skipInstructions {
@@ -54,20 +58,15 @@ func ensureAgenticWorkflowsDispatcher(verbose bool, skipInstructions bool) error
 	targetDir := filepath.Join(gitRoot, ".github", "skills", "agentic-workflows")
 	targetPath := filepath.Join(targetDir, "SKILL.md")
 
-	if err := fileutil.EnsureParentDir(targetPath, constants.DirPermPublic); err != nil {
-		return fmt.Errorf("failed to create .github/skills/agentic-workflows directory: %w", err)
-	}
-
-	skillContent, err := buildAgenticWorkflowsSkillContent()
+	skillContent, err := buildAgenticWorkflowsSkillContent(ctx)
 	if err != nil {
 		copilotAgentsLog.Printf("Failed to build dispatcher skill: %v", err)
 		return fmt.Errorf("failed to build dispatcher skill: %w", err)
 	}
 
-	// Check if the file already exists and matches the downloaded content
-	existingContent := ""
-	if content, err := os.ReadFile(targetPath); err == nil {
-		existingContent = string(content)
+	existingContent, fileExists, err := readExistingRepositoryInstructionFile(targetPath, "dispatcher skill")
+	if err != nil {
+		return err
 	}
 
 	// Check if content matches the downloaded template
@@ -80,13 +79,21 @@ func ensureAgenticWorkflowsDispatcher(verbose bool, skipInstructions bool) error
 		return nil
 	}
 
-	// Skill files are committed repository instructions, so keep them world-readable.
-	if err := os.WriteFile(targetPath, []byte(skillContent), constants.FilePermPublic); err != nil {
+	if !write {
+		action := "update"
+		if !fileExists {
+			action = "create"
+		}
+		fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Would %s dispatcher skill: %s", action, targetPath)))
+		return nil
+	}
+
+	if err := writeGeneratedRepositoryInstructionFile(targetPath, []byte(skillContent), write, agenticWorkflowsSkillDirDescription, "dispatcher skill"); err != nil {
 		copilotAgentsLog.Printf("Failed to write dispatcher skill: %s, error: %v", targetPath, err)
 		return fmt.Errorf("failed to write dispatcher skill: %w", err)
 	}
 
-	if existingContent == "" {
+	if !fileExists {
 		copilotAgentsLog.Printf("Created dispatcher skill: %s", targetPath)
 		if verbose {
 			fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Created dispatcher skill: "+targetPath))
@@ -102,7 +109,7 @@ func ensureAgenticWorkflowsDispatcher(verbose bool, skipInstructions bool) error
 }
 
 // ensureAgenticWorkflowsAgent ensures that .github/agents/agentic-workflows.md contains the custom agent.
-func ensureAgenticWorkflowsAgent(verbose bool) error {
+func ensureAgenticWorkflowsAgent(verbose bool, write bool) error {
 	copilotAgentsLog.Print("Ensuring agentic workflows custom agent")
 
 	gitRoot, err := gitutil.FindGitRoot()
@@ -113,13 +120,9 @@ func ensureAgenticWorkflowsAgent(verbose bool) error {
 	targetDir := filepath.Join(gitRoot, ".github", "agents")
 	targetPath := filepath.Join(targetDir, "agentic-workflows.md")
 
-	if err := fileutil.EnsureParentDir(targetPath, constants.DirPermPublic); err != nil {
-		return fmt.Errorf("failed to create .github/agents directory: %w", err)
-	}
-
-	existingContent := ""
-	if content, err := os.ReadFile(targetPath); err == nil {
-		existingContent = string(content)
+	existingContent, fileExists, err := readExistingRepositoryInstructionFile(targetPath, "Agentic Workflows custom agent")
+	if err != nil {
+		return err
 	}
 
 	agenticWorkflowsAgentContent, err := buildAgenticWorkflowsAgentContent(gitRoot)
@@ -136,11 +139,20 @@ func ensureAgenticWorkflowsAgent(verbose bool) error {
 		return nil
 	}
 
-	if err := os.WriteFile(targetPath, []byte(agenticWorkflowsAgentContent), constants.FilePermPublic); err != nil {
+	if !write {
+		action := "update"
+		if !fileExists {
+			action = "create"
+		}
+		fmt.Fprintln(os.Stderr, console.FormatInfoMessage(fmt.Sprintf("Would %s Agentic Workflows custom agent: %s", action, targetPath)))
+		return nil
+	}
+
+	if err := writeGeneratedRepositoryInstructionFile(targetPath, []byte(agenticWorkflowsAgentContent), write, agenticWorkflowsAgentDirDescription, "Agentic Workflows custom agent"); err != nil {
 		return fmt.Errorf("failed to write Agentic Workflows custom agent: %w", err)
 	}
 
-	if existingContent == "" {
+	if !fileExists {
 		copilotAgentsLog.Printf("Created Agentic Workflows custom agent: %s", targetPath)
 		if verbose {
 			fmt.Fprintln(os.Stderr, console.FormatSuccessMessage("Created Agentic Workflows custom agent: "+targetPath))
@@ -155,16 +167,51 @@ func ensureAgenticWorkflowsAgent(verbose bool) error {
 	return nil
 }
 
+func writeGeneratedRepositoryInstructionFile(targetPath string, content []byte, write bool, parentDirDescription string, artifactDescription string) error {
+	if !write {
+		return fmt.Errorf("internal error: refusing to write %s without --write: %s", artifactDescription, targetPath)
+	}
+
+	if err := fileutil.EnsureParentDir(targetPath, constants.DirPermPublic); err != nil {
+		return fmt.Errorf("failed to create %s: %w", parentDirDescription, err)
+	}
+
+	// Repository instruction files are committed artifacts, so keep them world-readable.
+	if err := os.WriteFile(targetPath, content, constants.FilePermPublic); err != nil {
+		return fmt.Errorf("failed to write %s: %w", artifactDescription, err)
+	}
+
+	return nil
+}
+
+func readExistingRepositoryInstructionFile(targetPath string, artifactDescription string) (string, bool, error) {
+	content, err := os.ReadFile(targetPath)
+	if err == nil {
+		return string(content), true, nil
+	}
+	if os.IsNotExist(err) {
+		return "", false, nil
+	}
+	return "", false, fmt.Errorf("failed to read existing %s: %w", artifactDescription, err)
+}
+
 func buildAgenticWorkflowsAgentContent(gitRoot string) (string, error) {
 	return agenticWorkflowsAgentTemplate, nil
 }
 
-func buildAgenticWorkflowsSkillContent() (string, error) {
-	awFiles, err := listAgenticWorkflowsMarkdownFiles(context.Background())
+func buildAgenticWorkflowsSkillContent(ctx context.Context) (string, error) {
+	awFiles, err := listAgenticWorkflowsMarkdownFiles(ctx)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Failed to fetch .github/aw markdown file list from github/gh-aw: %v. Falling back to embedded list.", err)))
 		awFiles = embeddedFallbackAWMarkdownFiles()
 	}
+	return renderAgenticWorkflowsSkillContent(awFiles)
+}
+
+func renderAgenticWorkflowsSkillContent(awFiles []string) (string, error) {
 	sort.Strings(awFiles)
 	if len(awFiles) == 0 {
 		return "", errors.New("no .github/aw markdown files available from remote or embedded fallback")
@@ -179,7 +226,11 @@ func buildAgenticWorkflowsSkillContent() (string, error) {
 		return "", fmt.Errorf("agentic workflows skill template is missing %s placeholder", agenticWorkflowsSkillFileListPlaceholder)
 	}
 
-	return strings.Replace(agenticWorkflowsSkillTemplate, agenticWorkflowsSkillFileListPlaceholder, fileList.String(), 1), nil
+	content := strings.Replace(agenticWorkflowsSkillTemplate, agenticWorkflowsSkillFileListPlaceholder, fileList.String(), 1)
+	if !strings.Contains(content, agenticWorkflowsOTELSkillParagraph) {
+		content = strings.TrimRight(content, "\n") + "\n\n" + agenticWorkflowsOTELSkillParagraph + "\n"
+	}
+	return content, nil
 }
 
 type gitHubRepositoryContentEntry struct {
@@ -206,6 +257,10 @@ func fetchAgenticWorkflowsMarkdownFiles(ctx context.Context) ([]string, error) {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusForbidden {
+		copilotAgentsLog.Print("GitHub API returned HTTP 403; fetching public raw markdown file list without authentication")
+		return fetchAgenticWorkflowsRawMarkdownFiles(ctx, client)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("github API returned %s", resp.Status)
 	}
@@ -227,6 +282,34 @@ func fetchAgenticWorkflowsMarkdownFiles(ctx context.Context) ([]string, error) {
 		return nil, errors.New("github API returned no markdown files")
 	}
 
+	sort.Strings(awFiles)
+	return awFiles, nil
+}
+
+func fetchAgenticWorkflowsRawMarkdownFiles(ctx context.Context, client *http.Client) ([]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ghAWMarkdownFilesRawURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build public raw file list request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("public raw file list request failed: %w", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			copilotAgentsLog.Printf("Failed to close public raw file list response: %v", err)
+		}
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("public raw file list returned HTTP %d", resp.StatusCode)
+	}
+	var awFiles []string
+	if err := json.NewDecoder(resp.Body).Decode(&awFiles); err != nil {
+		return nil, fmt.Errorf("failed to decode public raw file list: %w", err)
+	}
+	if len(awFiles) == 0 {
+		return nil, errors.New("public raw file list returned no markdown files")
+	}
 	sort.Strings(awFiles)
 	return awFiles, nil
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/github/gh-aw/pkg/semverutil"
 	"github.com/github/gh-aw/pkg/testutil"
+	"github.com/stretchr/testify/require"
 )
 
 const setupNodeV6ExpectedUsesPlaceholder = "__setup_node_v6__"
@@ -205,7 +206,7 @@ func TestApplyActionPinToStep(t *testing.T) {
 				"name": "Setup Node",
 				"uses": "actions/setup-node@v6",
 				"with": map[string]any{
-					"node-version": "20",
+					"node-version": "24",
 				},
 			},
 			expectPinned: true,
@@ -323,16 +324,16 @@ func TestGetLatestActionPinByRepo(t *testing.T) {
 		expectVersionPrefix string
 	}{
 		{
-			repo:          "actions/checkout",
-			expectExists:  true,
-			expectRepo:    "actions/checkout",
-			expectVersion: "v7.0.0",
+			repo:                "actions/checkout",
+			expectExists:        true,
+			expectRepo:          "actions/checkout",
+			expectVersionPrefix: "v",
 		},
 		{
 			repo:                "actions/setup-node",
 			expectExists:        true,
 			expectRepo:          "actions/setup-node",
-			expectVersionPrefix: "v6.",
+			expectVersionPrefix: "v",
 		},
 		{
 			repo:         "unknown/action",
@@ -398,7 +399,7 @@ func TestApplyActionPinToTypedStep(t *testing.T) {
 				Name: "Setup Node",
 				Uses: "actions/setup-node@v6",
 				With: map[string]any{
-					"node-version": "20",
+					"node-version": "24",
 				},
 			},
 			expectPinned: true,
@@ -438,6 +439,15 @@ func TestApplyActionPinToTypedStep(t *testing.T) {
 			},
 			expectPinned: false,
 			expectedUses: "./.github/actions/my-setup",
+		},
+		{
+			name: "self-repository action ref ($/) is passed through unchanged",
+			step: &WorkflowStep{
+				Name: "Self-repository action",
+				Uses: "$/.github/actions/my-setup",
+			},
+			expectPinned: false,
+			expectedUses: "$/.github/actions/my-setup",
 		},
 		{
 			name: "local action ref (../) returns error",
@@ -620,18 +630,16 @@ func TestGetActionPinWithData_SemverPreference(t *testing.T) {
 		shouldFallback bool // Whether we expect to fall back to highest version
 	}{
 		{
-			name:           "fallback for setup-go v6.2.0 resolves to v6.5.0",
+			name:           "fallback for setup-go v6.2.0 resolves to latest pinned version",
 			repo:           "actions/setup-go",
 			requestedVer:   "v6.2.0",
-			expectedVer:    "v6.5.0",
 			strictMode:     false,
 			shouldFallback: true,
 		},
 		{
-			name:           "fallback for setup-go v6.2.0 from hardcoded pins resolves to v6.5.0",
+			name:           "fallback for setup-go v6.2.0 from hardcoded pins resolves to latest pinned version",
 			repo:           "actions/setup-go",
 			requestedVer:   "v6.2.0",
-			expectedVer:    "v6.5.0",
 			strictMode:     false,
 			shouldFallback: true,
 		},
@@ -642,9 +650,6 @@ func TestGetActionPinWithData_SemverPreference(t *testing.T) {
 			expectedVer:    "v7.0.1",
 			strictMode:     false,
 			shouldFallback: true,
-			// Note: When requesting v4 without dynamic resolution, the system uses v4.6.2's SHA
-			// (the highest v4.x.x version from hardcoded pins), but shows v4 in the comment
-			// to preserve the user's intent.
 		},
 		{
 			name:           "fallback to highest semver-compatible version for upload-artifact when requesting v5",
@@ -655,10 +660,9 @@ func TestGetActionPinWithData_SemverPreference(t *testing.T) {
 			shouldFallback: true,
 		},
 		{
-			name:           "fallback for upload-artifact v4.6.2 resolves to v7.0.1",
+			name:           "fallback for upload-artifact v4.6.2 resolves to latest pinned version",
 			repo:           "actions/upload-artifact",
 			requestedVer:   "v4.6.2",
-			expectedVer:    "v7.0.1",
 			strictMode:     false,
 			shouldFallback: true,
 		},
@@ -666,6 +670,10 @@ func TestGetActionPinWithData_SemverPreference(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if !tt.shouldFallback && tt.expectedVer == "" {
+				t.Fatalf("invalid test case %q: expectedVer must be set when shouldFallback is false", tt.name)
+			}
+
 			data := &WorkflowData{
 				StrictMode: tt.strictMode,
 			}
@@ -680,10 +688,19 @@ func TestGetActionPinWithData_SemverPreference(t *testing.T) {
 				t.Fatalf("getActionPinWithData(%s, %s) returned empty string", tt.repo, tt.requestedVer)
 			}
 
+			expectedVersion := tt.expectedVer
+			if tt.shouldFallback {
+				latestPin, ok := getLatestActionPinByRepo(tt.repo)
+				if !ok {
+					t.Fatalf("expected latest pinned version to exist for %s", tt.repo)
+				}
+				expectedVersion = latestPin.Version
+			}
+
 			// Check that the result contains the expected version in the comment
-			if !strings.Contains(result, "# "+tt.expectedVer) {
+			if !strings.Contains(result, "# "+expectedVersion) {
 				t.Errorf("getActionPinWithData(%s, %s) = %s, expected version %s in comment",
-					tt.repo, tt.requestedVer, result, tt.expectedVer)
+					tt.repo, tt.requestedVer, result, expectedVersion)
 			}
 
 			// Verify the result format is correct (repo@sha # version)
@@ -692,8 +709,8 @@ func TestGetActionPinWithData_SemverPreference(t *testing.T) {
 					tt.repo, tt.requestedVer, result)
 			}
 
-			if tt.shouldFallback && !strings.Contains(result, "(source ") {
-				t.Errorf("getActionPinWithData(%s, %s) = %s, expected fallback to include resolved-version metadata",
+			if tt.shouldFallback && !strings.HasSuffix(result, "# "+expectedVersion) {
+				t.Errorf("getActionPinWithData(%s, %s) = %s, expected a single fallback version comment",
 					tt.repo, tt.requestedVer, result)
 			}
 		})
@@ -942,7 +959,7 @@ func TestApplyActionPinsToTypedSteps(t *testing.T) {
 	}
 }
 
-// TestGetActionPinWithData_V7Fallback verifies v7 fallback preserves source annotation.
+// TestGetActionPinWithData_V7Fallback verifies fallback uses the resolved version.
 func TestGetActionPinWithData_V7Fallback(t *testing.T) {
 	data := &WorkflowData{
 		StrictMode: false,
@@ -960,13 +977,12 @@ func TestGetActionPinWithData_V7Fallback(t *testing.T) {
 
 	t.Logf("Result: %s", result)
 
-	// Should include resolved + source format for fallback.
-	if !strings.Contains(result, "# v7.0.1 (source v7)") {
-		t.Errorf("Expected resolved/source comment format in result, got: %s", result)
+	if !strings.HasSuffix(result, "# v7.0.2") {
+		t.Errorf("Expected single resolved version comment in result, got: %s", result)
 	}
 
-	// Check the SHA matches v7 (resolves to v7.0.1 pin)
-	expectedSHA := "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+	// Check the SHA matches the resolved v7.0.2 pin.
+	expectedSHA := "cf430e030ddbb5b0abf93d22962f4752f3646cd9"
 	if !strings.Contains(result, expectedSHA) {
 		t.Errorf("Expected SHA %s in result, got: %s", expectedSHA, result)
 	}
@@ -1051,9 +1067,9 @@ func TestGetActionPinWithData_ExactVersionResolution(t *testing.T) {
 	}
 }
 
-// TestFallbackVersionUsesRequestedVersionInComment tests that fallback comments
-// now record both resolved and source versions.
-func TestFallbackVersionUsesRequestedVersionInComment(t *testing.T) {
+// TestFallbackVersionUsesResolvedVersionInComment tests that fallback comments
+// use the version of the pinned SHA rather than a mismatched requested version.
+func TestFallbackVersionUsesResolvedVersionInComment(t *testing.T) {
 	tests := []struct {
 		name            string
 		repo            string
@@ -1062,17 +1078,17 @@ func TestFallbackVersionUsesRequestedVersionInComment(t *testing.T) {
 		expectedSHA     string
 	}{
 		{
-			name:            "v8 falls back to v9.0.0 and comment records source v8",
+			name:            "v8 falls back to v9.0.0 and comment records v9.0.0",
 			repo:            "actions/github-script",
 			requestedVer:    "v8",
-			expectedComment: "# v9.0.0 (source v8)",
+			expectedComment: "# v9.0.0",
 			expectedSHA:     "3a2844b7e9c422d3c10d287c895573f7108da1b3",
 		},
 		{
-			name:            "v7 falls back to v9.0.0 and comment records source v7",
+			name:            "v7 falls back to v9.0.0 and comment records v9.0.0",
 			repo:            "actions/github-script",
 			requestedVer:    "v7",
-			expectedComment: "# v9.0.0 (source v7)",
+			expectedComment: "# v9.0.0",
 			expectedSHA:     "3a2844b7e9c422d3c10d287c895573f7108da1b3",
 		},
 	}
@@ -1088,7 +1104,7 @@ func TestFallbackVersionUsesRequestedVersionInComment(t *testing.T) {
 				t.Fatalf("getActionPinWithData(%s, %s) returned error: %v", tt.repo, tt.requestedVer, err)
 			}
 
-			if !strings.Contains(result, tt.expectedComment) {
+			if !strings.HasSuffix(result, tt.expectedComment) {
 				t.Errorf("getActionPinWithData(%s, %s) = %s, expected comment to contain %s",
 					tt.repo, tt.requestedVer, result, tt.expectedComment)
 			}
@@ -1096,10 +1112,6 @@ func TestFallbackVersionUsesRequestedVersionInComment(t *testing.T) {
 			if !strings.Contains(result, tt.expectedSHA) {
 				t.Errorf("getActionPinWithData(%s, %s) = %s, expected SHA %s",
 					tt.repo, tt.requestedVer, result, tt.expectedSHA)
-			}
-
-			if tt.requestedVer == "v8" && !strings.Contains(result, "# v9.0.0 (source v8)") {
-				t.Errorf("Expected v8 fallback comment to record resolved version v9.0.0, got: %s", result)
 			}
 		})
 	}
@@ -1355,7 +1367,7 @@ func TestMapToStepWithActionPinning(t *testing.T) {
 				"name": "Setup Node",
 				"uses": "actions/setup-node@v6",
 				"with": map[string]any{
-					"node-version": "20",
+					"node-version": "24",
 					"cache":        "npm",
 				},
 				"env": map[string]string{
@@ -1612,7 +1624,7 @@ func TestSliceToStepsErrorHandling(t *testing.T) {
 	}
 }
 
-// TestGetActionPinGHESArtifactCompat verifies GHES compat mode does not emit deprecated v3 artifact pins.
+// TestGetActionPinGHESArtifactCompat verifies GHES compat mode emits compatible v3 artifact pins.
 func TestGetActionPinGHESArtifactCompat(t *testing.T) {
 	// Verify default (compat disabled) returns latest (v7/v8)
 	defaultCompiler := NewCompiler()
@@ -1643,19 +1655,19 @@ func TestGetActionPinGHESArtifactCompat(t *testing.T) {
 	compatCompiler.ghesArtifactCompat = true
 
 	uploadPinGHES := compatCompiler.getActionPin("actions/upload-artifact")
-	if strings.Contains(uploadPinGHES, "# v3") {
-		t.Errorf("With GHES compat, expected non-v3 upload-artifact pin, got: %s", uploadPinGHES)
+	if !strings.Contains(uploadPinGHES, "c6a366c94c3e0affe28c06c8df20a878f24da3cf # v3.2.2") {
+		t.Errorf("With GHES compat, expected upload-artifact v3.2.2 pin, got: %s", uploadPinGHES)
 	}
-	if uploadPinGHES != uploadPin {
-		t.Errorf("With GHES compat, expected upload-artifact pin to match default, default=%s compat=%s", uploadPin, uploadPinGHES)
+	if uploadPinGHES == uploadPin {
+		t.Errorf("With GHES compat, expected upload-artifact pin to differ from default, got: %s", uploadPinGHES)
 	}
 
 	downloadPinGHES := compatCompiler.getActionPin("actions/download-artifact")
-	if strings.Contains(downloadPinGHES, "# v3") {
-		t.Errorf("With GHES compat, expected non-v3 download-artifact pin, got: %s", downloadPinGHES)
+	if !strings.Contains(downloadPinGHES, "a9bc5e6ef2cb54c177f32aa5726adaa15e7e2d59 # v3.1.0") {
+		t.Errorf("With GHES compat, expected download-artifact v3.1.0 pin, got: %s", downloadPinGHES)
 	}
-	if downloadPinGHES != downloadPin {
-		t.Errorf("With GHES compat, expected download-artifact pin to match default, default=%s compat=%s", downloadPin, downloadPinGHES)
+	if downloadPinGHES == downloadPin {
+		t.Errorf("With GHES compat, expected download-artifact pin to differ from default, got: %s", downloadPinGHES)
 	}
 
 	// Non-artifact actions should be unaffected by GHES compat
@@ -1665,8 +1677,8 @@ func TestGetActionPinGHESArtifactCompat(t *testing.T) {
 	}
 }
 
-// TestGHESArtifactCompatDoesNotUseV3 verifies GHES compat mode never emits deprecated v3 artifact pins.
-func TestGHESArtifactCompatDoesNotUseV3(t *testing.T) {
+// TestGHESArtifactCompatPinsExist verifies GHES compatibility pins are complete.
+func TestGHESArtifactCompatPinsExist(t *testing.T) {
 	c := NewCompiler()
 	c.ghesArtifactCompat = true
 	for _, repo := range []string{"actions/upload-artifact", "actions/download-artifact"} {
@@ -1675,11 +1687,42 @@ func TestGHESArtifactCompatDoesNotUseV3(t *testing.T) {
 			if result == "" {
 				t.Errorf("getActionPin(%s) returned empty with GHES compat enabled", repo)
 			}
-			if strings.Contains(result, "# v3") {
-				t.Errorf("getActionPin(%s) should not return a v3 pin, got: %s", repo, result)
+			if !strings.Contains(result, "# v3") {
+				t.Errorf("getActionPin(%s) should return a v3 pin, got: %s", repo, result)
 			}
 		})
 	}
+}
+
+func TestGeneratedArtifactStepsHonorGHESCompat(t *testing.T) {
+	t.Run("firewall log upload uses workflow data", func(t *testing.T) {
+		data := &WorkflowData{Name: "GHES Firewall", GHES: true}
+		step := strings.Join([]string(generateSquidLogsUploadStep(data.Name, data)), "\n")
+		if !strings.Contains(step, "actions/upload-artifact@c6a366c94c3e0affe28c06c8df20a878f24da3cf # v3.2.2") {
+			t.Fatalf("expected GHES upload-artifact pin in firewall step, got:\n%s", step)
+		}
+		if strings.Contains(step, "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a") {
+			t.Fatalf("expected firewall step not to use default upload-artifact pin, got:\n%s", step)
+		}
+	})
+
+	t.Run("repo memory download uses compiler compatibility", func(t *testing.T) {
+		c := NewCompiler()
+		c.SetGHESCompat(true)
+		c.configureGHESCompatibility()
+		data := &WorkflowData{
+			RepoMemoryConfig: &RepoMemoryConfig{
+				Memories: []RepoMemoryEntry{{ID: "default"}},
+			},
+		}
+		step := strings.Join(c.buildPushRepoMemoryDownloadSteps(data, false), "\n")
+		if !strings.Contains(step, "actions/download-artifact@a9bc5e6ef2cb54c177f32aa5726adaa15e7e2d59 # v3.1.0") {
+			t.Fatalf("expected GHES download-artifact pin in repo-memory step, got:\n%s", step)
+		}
+		if strings.Contains(step, "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c") {
+			t.Fatalf("expected repo-memory step not to use default download-artifact pin, got:\n%s", step)
+		}
+	})
 }
 
 func TestGetActionPinPrefersLatestEmbeddedOverStaleCache(t *testing.T) {
@@ -1754,6 +1797,14 @@ func TestGetActionPinPrefersLatestEmbeddedOverStaleCache(t *testing.T) {
 func TestWarnIfOutdatedActionVersion(t *testing.T) {
 	const checkoutRepo = "actions/checkout"
 	checkoutLatest := latestActionVersionForRepo(t, checkoutRepo)
+	checkoutLatestSemver := semverutil.ParseVersion(checkoutLatest)
+	if checkoutLatestSemver == nil || checkoutLatestSemver.Major < 1 {
+		t.Skipf("need a parseable checkout version with major >= 1, got %q", checkoutLatest)
+	}
+	checkoutMajorTag := fmt.Sprintf("v%d", checkoutLatestSemver.Major)
+	checkoutMinorTag := fmt.Sprintf("v%d.%d", checkoutLatestSemver.Major, checkoutLatestSemver.Minor)
+	checkoutOlderMajorTag := fmt.Sprintf("v%d", checkoutLatestSemver.Major-1)
+	checkoutOlderMinorTag := fmt.Sprintf("v%d.1", checkoutLatestSemver.Major-1)
 
 	tests := []struct {
 		name         string
@@ -1782,39 +1833,39 @@ func TestWarnIfOutdatedActionVersion(t *testing.T) {
 		{
 			name:       "same version does not warn",
 			repo:       checkoutRepo,
-			rawVersion: "v7.0.0",
+			rawVersion: checkoutLatest,
 			latestVer:  checkoutLatest,
 			expectWarn: false,
 		},
 		{
 			name:       "partial tag same major does not warn",
 			repo:       checkoutRepo,
-			rawVersion: "v7",
+			rawVersion: checkoutMajorTag,
 			latestVer:  checkoutLatest,
 			expectWarn: false,
 		},
 		{
 			name:       "minor partial tag same major does not warn",
 			repo:       checkoutRepo,
-			rawVersion: "v7.0",
-			latestVer:  "v7.1.0",
+			rawVersion: checkoutMinorTag,
+			latestVer:  checkoutLatest,
 			expectWarn: false,
 		},
 		{
 			name:         "partial tag older major warns",
 			repo:         checkoutRepo,
-			rawVersion:   "v6",
+			rawVersion:   checkoutOlderMajorTag,
 			latestVer:    checkoutLatest,
 			expectWarn:   true,
-			warnContains: "v6",
+			warnContains: checkoutOlderMajorTag,
 		},
 		{
 			name:         "minor partial tag older major warns",
 			repo:         checkoutRepo,
-			rawVersion:   "v6.1",
-			latestVer:    "v7.1.0",
+			rawVersion:   checkoutOlderMinorTag,
+			latestVer:    checkoutLatest,
 			expectWarn:   true,
-			warnContains: "v6.1",
+			warnContains: checkoutOlderMinorTag,
 		},
 		{
 			name:       "SHA ref does not warn",
@@ -1947,5 +1998,222 @@ func TestApplyActionPinToTypedStep_NoOutdatedWarningForCurrentVersion(t *testing
 	}
 	if strings.Contains(output, "⚠") || strings.Contains(output, "is outdated") {
 		t.Errorf("expected no outdated warning for current version, got: %q", output)
+	}
+}
+
+func TestMapPinnedUsesInYAML(t *testing.T) {
+	checkout := getActionPin("actions/checkout")
+	upload := getActionPin("actions/upload-artifact")
+	version := latestActionVersionForRepo(t, "actions/checkout")
+	sha := strings.SplitN(strings.TrimPrefix(checkout, "actions/checkout@"), " ", 2)[0]
+	input := "      - name: Checkout\n        uses: " + checkout + "\n" +
+		"      - name: Upload\n        uses: " + upload + "\n" +
+		"        run: |\n          uses: " + checkout + "\n"
+	mapped, err := mapPinnedUsesInYAML(input,
+		map[string]string{"actions/checkout@" + version: "internal/checkout@" + sha},
+		map[string]string{"actions/": "mirror/actions-"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(mapped, "\n        uses: actions/") {
+		t.Fatalf("unmapped action remains in generated steps:\n%s", mapped)
+	}
+
+	if !strings.Contains(mapped, "        uses: internal/checkout@"+sha) {
+		t.Fatalf("exact mapping should take precedence:\n%s", mapped)
+	}
+	if !strings.Contains(mapped, "        uses: "+strings.Replace(upload, "actions/upload-artifact@", "mirror/actions-upload-artifact@", 1)) {
+		t.Fatalf("prefix should preserve SHA and version comment:\n%s", mapped)
+	}
+	if !strings.Contains(mapped, "          uses: "+checkout) {
+		t.Fatalf("run script must not be changed:\n%s", mapped)
+	}
+}
+
+func TestMapPinnedUsesPreservesExactMappingWithinPrefix(t *testing.T) {
+	checkout := getActionPin("actions/checkout")
+	node := getActionPin("actions/setup-node")
+	nodeSHA, _, _ := strings.Cut(strings.TrimPrefix(node, "actions/setup-node@"), " ")
+	checkoutVersion := latestActionVersionForRepo(t, "actions/checkout")
+	mappings := map[string]string{"actions/checkout@" + checkoutVersion: "actions/setup-node@" + nodeSHA}
+	content := "      - uses: " + checkout + "\n        uses: " + node + "\n" +
+		"        uses: " + getActionPin("docker/setup-buildx-action") + "\n"
+	mapped, err := mapPinnedUsesInYAML(content, mappings,
+		map[string]string{"actions/": "mirror/actions-", "docker/": "mirror/docker-"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(mapped, "uses: mirror/docker-setup-buildx-action@") {
+		t.Fatalf("docker action was not redirected: %s", mapped)
+	}
+	if !strings.Contains(mapped, "uses: mirror/actions-setup-node@") {
+		t.Fatalf("unrelated setup-node step should use the prefix: %s", mapped)
+	}
+	if !strings.Contains(mapped, "uses: actions/setup-node@"+nodeSHA) {
+		t.Fatalf("exact target missing: %s", mapped)
+	}
+}
+
+func TestMapPinnedUsesQuotedScalars(t *testing.T) {
+	const sha = "0123456789012345678901234567890123456789"
+	for _, quote := range []string{"'", `"`} {
+		for _, indentation := range []string{"        uses: ", "      - uses: "} {
+			t.Run(quote+indentation, func(t *testing.T) {
+				input := indentation + quote + "actions/upload-artifact@" + sha + quote + " # v7.0.1 (source v4)\n"
+				mapped, err := mapPinnedUsesInYAML(input, nil,
+					map[string]string{"actions/": "mirror/actions-"}, nil, nil)
+				require.NoError(t, err)
+				require.Equal(t, indentation+"'mirror/actions-upload-artifact@"+sha+"' # v7.0.1 (source v4)\n", mapped)
+
+				mapped, err = mapPinnedUsesInYAML(input,
+					map[string]string{"actions/upload-artifact@v4": "internal/artifacts@" + sha},
+					map[string]string{"actions/": "mirror/actions-"}, nil, nil)
+				require.NoError(t, err)
+				require.Equal(t, indentation+"'internal/artifacts@"+sha+"'\n", mapped)
+
+				input = indentation + quote + "actions/upload-artifact@" + sha + quote + "\t#\tkeep this comment\n"
+				mapped, err = mapPinnedUsesInYAML(input, nil,
+					map[string]string{"actions/": "mirror/actions-"}, nil, nil)
+				require.NoError(t, err)
+				require.Equal(t, indentation+"'mirror/actions-upload-artifact@"+sha+"'\t#\tkeep this comment\n", mapped)
+
+				input = indentation + quote + "actions/upload-artifact@" + sha + quote + "\n"
+				mapped, err = mapPinnedUsesInYAML(input, nil,
+					map[string]string{"actions/": "mirror/actions-"}, nil, nil)
+				require.NoError(t, err)
+				require.Equal(t, indentation+"'mirror/actions-upload-artifact@"+sha+"'\n", mapped)
+			})
+		}
+	}
+}
+
+func TestMapPinnedUsesRejectsUnsafePins(t *testing.T) {
+	const sha = "0123456789012345678901234567890123456789"
+	for _, quote := range []string{"", "'", `"`} {
+		for _, indentation := range []string{"        uses: ", "      - uses: "} {
+			t.Run(quote+indentation, func(t *testing.T) {
+				input := indentation + quote + "actions/upload-artifact@" + sha + quote + " # v7\n"
+				for _, prefix := range []string{"mirror/\nrun: injected\n", "${{ github.token }}/"} {
+					mapped, err := mapPinnedUsesInYAML(input, nil, map[string]string{"actions/": prefix}, nil, nil)
+					require.ErrorContains(t, err, "invalid action pin")
+					require.Equal(t, input, mapped)
+				}
+				for _, resolvedPin := range []string{
+					"sha\nrun: injected",
+					"${{ github.token }}",
+					"sha # v1\nrun: injected",
+					"sha # ${{ github.token }}",
+				} {
+					mapped, err := mapPinnedUsesInYAML(input,
+						map[string]string{"actions/upload-artifact@v7": "internal/artifacts@v1"}, nil,
+						nil, unsafeActionPinResolver(resolvedPin))
+					require.ErrorContains(t, err, "invalid action pin")
+					require.Equal(t, input, mapped)
+				}
+			})
+		}
+	}
+}
+
+func TestMapPinnedUsesQuotesMappedYAMLSyntax(t *testing.T) {
+	const sha = "0123456789012345678901234567890123456789"
+	for _, quote := range []string{"", "'", `"`} {
+		for _, prefix := range []string{"mirror: injected/", "mirror # injected/", "mirror'quoted/"} {
+			t.Run(quote+prefix, func(t *testing.T) {
+				input := "        uses: " + quote + "actions/upload-artifact@" + sha + quote + " # v7\n"
+				mapped, err := mapPinnedUsesInYAML(input, nil, map[string]string{"actions/": prefix}, nil, nil)
+				require.NoError(t, err)
+				require.Equal(t, "        uses: '"+strings.ReplaceAll(prefix, "'", "''")+"upload-artifact@"+sha+"' # v7\n", mapped)
+			})
+		}
+	}
+}
+
+func TestMapPinnedUsesMatchesExactMappingSourceVersion(t *testing.T) {
+	const sha = "0123456789012345678901234567890123456789"
+	input := "        uses: actions/upload-artifact@" + sha + " # v7.0.1 (source v4)\n"
+	mapped, err := mapPinnedUsesInYAML(input,
+		map[string]string{"actions/upload-artifact@v4": "internal/artifacts@" + sha},
+		map[string]string{"actions/": "mirror/actions-"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(mapped, "uses: internal/artifacts@"+sha) {
+		t.Fatalf("exact mapping should use the source version before applying prefixes:\n%s", mapped)
+	}
+}
+
+func TestMapPinnedUsesResolvesMirrorTag(t *testing.T) {
+	checkout := getActionPin("actions/checkout")
+	version := latestActionVersionForRepo(t, "actions/checkout")
+	input := "        uses: " + checkout + "\n"
+	mappings := map[string]string{"actions/checkout@" + version: "internal/checkout@v4"}
+	if _, err := mapPinnedUsesInYAML(input, mappings, nil, nil, nil); err == nil {
+		t.Fatal("unresolvable mirror tag must not leave an unmapped public action")
+	}
+	cache := NewActionCache(t.TempDir())
+	sha := strings.Repeat("a", 40)
+	cache.Set("internal/checkout", "v4", sha)
+	output, err := mapPinnedUsesInYAML(input, mappings, nil, nil, NewActionResolver(cache))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output, "uses: internal/checkout@"+sha) {
+		t.Fatalf("mirror tag was not resolved through the action cache: %s", output)
+	}
+}
+
+func TestMapPinnedUsesPreservesExactMappingPerStepThroughSanitization(t *testing.T) {
+	setupNode := getActionPin("actions/setup-node")
+	input := "steps:\n" +
+		"- name: Mapped__gh_aw_exact_pin__\n" +
+		"  uses: " + setupNode + "\n" +
+		"- name: Ordinary\n" +
+		"  uses: " + setupNode + "\n" +
+		"- name: Script\n" +
+		"  run: echo \"${{ github.event.issue.title }}\"\n"
+	sanitized, _, err := sanitizeCustomStepsYAML(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(sanitized, "Mapped__gh_aw_exact_pin__") {
+		t.Fatalf("sanitization dropped the exact-mapping provenance:\n%s", sanitized)
+	}
+
+	mapped, err := mapPinnedUsesInYAML(
+		"      - name: Mapped"+exactPinMappingMarker+"\n"+
+			"        uses: "+setupNode+" "+exactPinMappingMarker+"\n"+
+			"      - name: Ordinary\n"+
+			"        uses: "+setupNode+"\n",
+		map[string]string{"actions/setup-node@v1": "internal/setup-node@v1"},
+		map[string]string{"actions/": "mirror/actions-"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(mapped, exactPinMappingMarker) {
+		t.Fatalf("internal mapping marker leaked into output:\n%s", mapped)
+	}
+	if !strings.Contains(mapped, "uses: "+setupNode) {
+		t.Fatalf("exact-mapped step was prefix-rewritten:\n%s", mapped)
+	}
+	if !strings.Contains(mapped, "uses: "+strings.Replace(setupNode, "actions/setup-node@", "mirror/actions-setup-node@", 1)) {
+		t.Fatalf("ordinary step using the same reference was not prefix-rewritten:\n%s", mapped)
+	}
+}
+
+func TestApplyActionPinToTypedStepRejectsUnresolvedExactMapping(t *testing.T) {
+	data := &WorkflowData{
+		ActionPinMappings: map[string]string{
+			"actions/github-script@v9": "internal/missing@v1",
+		},
+	}
+	step := &WorkflowStep{Uses: "actions/github-script@v9"}
+
+	_, err := applyActionPinToTypedStep(step, data)
+	if err == nil {
+		t.Fatal("expected unresolved exact mapping to fail")
+	}
+	if !strings.Contains(err.Error(), "action pin mapping") {
+		t.Fatalf("expected mapping error, got: %v", err)
 	}
 }

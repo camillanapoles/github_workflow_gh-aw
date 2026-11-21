@@ -18,7 +18,7 @@ func NewInitCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "init",
 		Short: "Initialize the repository for agentic workflows",
-		Long: `Initialize the repository for agentic workflows by configuring .gitattributes and creating the dispatcher skill file.
+		Long: `Initialize the repository for agentic workflows by configuring repository settings.
 
 This command performs non-interactive repository setup and does not prompt for
 engine selection or secret configuration.
@@ -26,12 +26,16 @@ engine selection or secret configuration.
 This command:
 - Configures .gitattributes to mark .lock.yml files as generated
 - Creates the dispatcher skill at .github/skills/agentic-workflows/SKILL.md
-- Creates the custom agent at .github/agents/agentic-workflows.md
 - Removes old prompt files from .github/prompts/ if they exist
 - Configures VSCode settings (.vscode/settings.json)
-- Generates/updates .github/workflows/agentics-maintenance.yml if any workflows use expires field for discussions or issues
+- Generates/updates .github/workflows/agentics-maintenance.yml if any workflows use the expires field for discussions or issues
+- Discovers local connector declarations/imports and consumer golden examples for offline setup guidance
+- Does not install connectors, select their tools/native methods, configure credentials, widen grants/network or enable webhook ingress
 
-By default (without --no-mcp):
+With --engine copilot:
+- Creates the custom agent at .github/agents/agentic-workflows.md
+
+With --engine copilot (without --no-mcp):
 - Creates .github/workflows/copilot-setup-steps.yml with gh-aw installation steps
 - Creates .github/mcp.json with gh-aw MCP server configuration
 
@@ -46,10 +50,10 @@ With --no-agent flag:
 
 With --codespaces flag:
 - Updates existing .devcontainer/devcontainer.json if present, otherwise creates new file at default location
-- Configures permissions for current repo: actions:write, contents:write, discussions:read, issues:read, pull-requests:write, workflows:write
+- Configures permissions for current repo: actions:write, contents:write, discussions:write, issues:write, pull-requests:write, workflows:write
 - Configures permissions for additional repos (in same org): actions:read, contents:read, discussions:read, issues:read, pull-requests:read, workflows:read
 - Adds GitHub Copilot extensions and gh aw CLI installation
-- Use with an empty value (--codespaces "") for current repo only, or with comma-separated repos (--codespaces repo1,repo2)
+- Use without a value (--codespaces) for current repo only, or with comma-separated repos (--codespaces=repo1,repo2)
 
 With --completions flag:
 - Automatically detects your shell (bash, zsh, fish, or PowerShell)
@@ -57,20 +61,20 @@ With --completions flag:
 - Provides instructions for enabling completions in your shell
 
 After running this command, you can:
-- Use GitHub Copilot Chat or coding agent tools with the agentic-workflows skill to get started with workflow tasks
-- The dispatcher skill will route your request to the appropriate specialized prompt
 - Add workflows from the catalog with: ` + string(constants.CLIExtensionPrefix) + ` add <workflow-name>
 - Create new workflows from scratch with: ` + string(constants.CLIExtensionPrefix) + ` new <workflow-name>`,
 		Example: `  ` + string(constants.CLIExtensionPrefix) + ` init                                # Initialize repository with defaults
   ` + string(constants.CLIExtensionPrefix) + ` init -v                             # Initialize with verbose output
-  ` + string(constants.CLIExtensionPrefix) + ` init --engine claude                # Skip Copilot-specific artifacts
+  ` + string(constants.CLIExtensionPrefix) + ` init --engine copilot               # Add Copilot MCP and agent files
+  ` + string(constants.CLIExtensionPrefix) + ` init --engine claude                # Initialize for the Claude engine
   ` + string(constants.CLIExtensionPrefix) + ` init --no-mcp                       # Skip MCP configuration
   ` + string(constants.CLIExtensionPrefix) + ` init --no-skill                     # Skip dispatcher skill creation
   ` + string(constants.CLIExtensionPrefix) + ` init --no-agent                     # Skip custom agent creation
-  ` + string(constants.CLIExtensionPrefix) + ` init --codespaces ""                # Configure Codespaces for current repo only
-  ` + string(constants.CLIExtensionPrefix) + ` init --codespaces repo1,repo2       # Codespaces with additional repos
+  ` + string(constants.CLIExtensionPrefix) + ` init --codespaces                   # Configure Codespaces for current repo only
+  ` + string(constants.CLIExtensionPrefix) + ` init --codespaces=repo1,repo2       # Codespaces with additional repos
   ` + string(constants.CLIExtensionPrefix) + ` init --completions                  # Install shell completions
-  ` + string(constants.CLIExtensionPrefix) + ` init --create-pull-request          # Initialize and create a pull request`,
+  ` + string(constants.CLIExtensionPrefix) + ` init --create-pull-request          # Initialize and create a pull request
+  ` + string(constants.CLIExtensionPrefix) + ` init --create-pull-request --auto-merge  # Initialize and enable pull request auto-merge`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			verbose, _ := cmd.Flags().GetBool("verbose")
 			mcpFlag, _ := cmd.Flags().GetBool("mcp")
@@ -84,6 +88,10 @@ After running this command, you can:
 			createPRFlag, _ := cmd.Flags().GetBool("create-pull-request")
 			prFlagAlias, _ := cmd.Flags().GetBool("pr")
 			createPR := createPRFlag || prFlagAlias // Support both --create-pull-request and --pr
+			autoMerge, _ := cmd.Flags().GetBool("auto-merge")
+			if err := requireAutoMergePR(autoMerge, createPR); err != nil {
+				return err
+			}
 
 			if engineOverride != "" {
 				registry := workflow.GetGlobalEngineRegistry()
@@ -102,7 +110,9 @@ After running this command, you can:
 				mcp = mcpFlag
 			}
 
-			// Trim the codespace repos string (explicit value required; use --codespaces "" for current repo only)
+			// Trim the codespace repos string after parsing. With NoOptDefVal set, bare
+			// --codespaces becomes the current-repo sentinel while explicit values use
+			// --codespaces=<repo1,repo2>.
 			codespaceReposStr = strings.TrimSpace(codespaceReposStr)
 
 			// Parse codespace repos from comma-separated string
@@ -127,6 +137,8 @@ After running this command, you can:
 				CodespaceEnabled: codespaceEnabled,
 				Completions:      completions,
 				CreatePR:         createPR,
+				AutoMerge:        autoMerge,
+				PRMessage:        cmd.Flag("pr-message").Value.String(),
 				RootCmd:          cmd.Root(),
 			}
 			if err := InitRepository(opts); err != nil {
@@ -141,13 +153,20 @@ After running this command, you can:
 	addEngineFlag(cmd)
 	cmd.Flags().Bool("no-mcp", false, "Skip configuring gh-aw MCP server integration for GitHub Copilot Agent")
 	cmd.Flags().Bool("no-skill", false, "Skip creating the agentic-workflows dispatcher skill")
-	cmd.Flags().Bool("no-agent", false, "Skip creating the Agentic Workflows custom agent")
-	cmd.Flags().String("codespaces", "", "Create devcontainer.json for GitHub Codespaces with agentic workflows support. Specify comma-separated repository names in the same organization (e.g., repo1,repo2), or use with an empty value for the current repo only")
+	cmd.Flags().Bool("no-agent", false, "Skip creating the agentic-workflows custom agent")
+	cmd.Flags().String("codespaces", "", "Create devcontainer.json for GitHub Codespaces with agentic workflow support. Specify comma-separated repository names in the same organization (e.g., repo1,repo2), or use without a value for the current repo only")
+	// Allow --codespaces without a value (e.g. "gh aw init --codespaces").
+	// pflag treats NoOptDefVal="" as "flag requires a value", so we use a single space as
+	// the no-value sentinel. The existing strings.TrimSpace call in RunE normalises it to ""
+	// (current repo only), while still distinguishing flag-present from flag-absent via Changed.
+	cmd.Flags().Lookup("codespaces").NoOptDefVal = " "
 	cmd.Flags().Bool("completions", false, "Install shell completion for the detected shell (bash, zsh, fish, or PowerShell)")
 	cmd.Flags().Bool("create-pull-request", false, "Create a pull request with the initialization changes")
+	addPRMessageFlag(cmd)
 	cmd.Flags().Bool("pr", false, "Alias for --create-pull-request")
+	cmd.Flags().Bool("auto-merge", false, "Enable auto-merge on the created pull request (requires --create-pull-request)")
 	_ = cmd.Flags().MarkHidden("pr") // Hide the short alias from help output
-	cmd.Flags().Bool("mcp", false, "Configure GitHub Copilot Agent MCP server integration (deprecated, MCP is enabled by default)")
+	cmd.Flags().Bool("mcp", false, "Configure GitHub Copilot Agent MCP server integration (deprecated; use --engine copilot)")
 	// Hide the deprecated --mcp flag from help (kept for backward compatibility)
 	_ = cmd.Flags().MarkHidden("mcp")
 

@@ -9,11 +9,10 @@
 const { getErrorMessage } = require("./error_helpers.cjs");
 const { resolveTargetRepoConfig, resolveAndValidateRepo } = require("./repo_helpers.cjs");
 const { logStagedPreviewInfo } = require("./staged_preview.cjs");
-const { isStagedMode, checkRequiredFilter } = require("./safe_output_helpers.cjs");
+const { isStagedMode, checkRequiredFilter, resolveTarget } = require("./safe_output_helpers.cjs");
 const { createAuthenticatedGitHubClient } = require("./handler_auth.cjs");
 const { resolveSafeOutputIssueTarget } = require("./temporary_id.cjs");
-const { hasIssueIntentsRuntimeFeature, normalizeIssueIntentMetadata } = require("./issue_intents.cjs");
-const { ERR_VALIDATION } = require("./error_codes.cjs");
+const { normalizeIssueIntentMetadata } = require("./issue_intents.cjs");
 
 /** @type {string} Safe output type handled by this module */
 const HANDLER_TYPE = "set_issue_type";
@@ -79,40 +78,8 @@ async function setIssueTypeById(githubClient, issueNodeId, issueTypeId, intentMe
     {
       issueId: issueNodeId,
       issueType,
-      headers: { "GraphQL-Features": "update_issue_suggestions" },
     }
   );
-}
-
-/**
- * @param {{ rationale?: string, confidence?: "LOW"|"MEDIUM"|"HIGH", suggest?: boolean }} intentMetadata Intent metadata in GraphQL format.
- * @returns {{ rationale?: string, confidence?: "low"|"medium"|"high", suggest?: boolean }} Intent metadata formatted for REST.
- */
-function toRestIssueIntentMetadata(intentMetadata) {
-  /** @type {{ rationale?: string, confidence?: "low"|"medium"|"high", suggest?: boolean }} */
-  const restMetadata = {};
-  if (intentMetadata.rationale) {
-    restMetadata.rationale = intentMetadata.rationale;
-  }
-  if (intentMetadata.suggest) {
-    restMetadata.suggest = true;
-  }
-  if (intentMetadata.confidence) {
-    switch (intentMetadata.confidence) {
-      case "LOW":
-        restMetadata.confidence = "low";
-        break;
-      case "MEDIUM":
-        restMetadata.confidence = "medium";
-        break;
-      case "HIGH":
-        restMetadata.confidence = "high";
-        break;
-      default:
-        throw new Error(`${ERR_VALIDATION}: Invalid confidence ${JSON.stringify(intentMetadata.confidence)}. Expected one of: LOW, MEDIUM, HIGH.`);
-    }
-  }
-  return restMetadata;
 }
 
 /**
@@ -197,25 +164,6 @@ function mapInvalidIssueTypeError(error, issueTypeName) {
 }
 
 /**
- * @param {boolean} isClear
- * @param {string} issueTypeName
- * @param {{ rationale?: string, confidence?: "LOW"|"MEDIUM"|"HIGH", suggest?: boolean }} intentMetadata
- * @returns {string | { value: string, rationale?: string, confidence?: "low"|"medium"|"high", suggest?: boolean }}
- */
-function buildIssueTypeValue(isClear, issueTypeName, intentMetadata) {
-  if (isClear) {
-    return "";
-  }
-  if (!hasIssueIntentsRuntimeFeature()) {
-    return issueTypeName;
-  }
-  return {
-    value: issueTypeName,
-    ...toRestIssueIntentMetadata(intentMetadata),
-  };
-}
-
-/**
  * Main handler factory for set_issue_type
  * Returns a message handler function that processes individual set_issue_type messages
  * @type {HandlerFactoryFunction}
@@ -224,6 +172,7 @@ async function main(config = {}) {
   // Extract configuration
   const allowedTypes = config.allowed || [];
   const maxCount = config.max || 5;
+  const targetConfig = config.target || "triggering";
   const { defaultTargetRepo, allowedRepos } = resolveTargetRepoConfig(config);
   const githubClient = await createAuthenticatedGitHubClient(config);
 
@@ -233,6 +182,7 @@ async function main(config = {}) {
   core.info(`Set issue type configuration: max=${maxCount}`);
   const requiredLabels = Array.isArray(config.required_labels) ? config.required_labels : [];
   const requiredTitlePrefix = config.required_title_prefix || "";
+  const issueIntentEnabled = config.issue_intent !== false;
   if (requiredLabels.length > 0) core.info(`Required labels (all): ${requiredLabels.join(", ")}`);
   if (requiredTitlePrefix) core.info(`Required title prefix: ${requiredTitlePrefix}`);
   if (allowedTypes.length > 0) {
@@ -278,24 +228,30 @@ async function main(config = {}) {
     const { repo: itemRepo, repoParts } = repoResult;
     core.info(`Target repository: ${itemRepo}`);
 
-    // Determine target issue number, with temporary ID support
-    const targetResult = resolveSafeOutputIssueTarget({ message: item, resolvedTemporaryIds, repoParts, handlerType: HANDLER_TYPE, aliases: ["issue_number"] });
-    if (!targetResult.success) return targetResult;
-    let issueNumber;
-    if (targetResult.number !== null) {
-      issueNumber = targetResult.number;
-      core.info(`Resolved issue number: #${issueNumber}`);
-    } else {
-      const contextIssueNumber = context.payload?.issue?.number;
-      if (!contextIssueNumber) {
-        core.warning("No issue_number provided and not in issue context");
-        return {
-          success: false,
-          error: "No issue number available",
-        };
+    let targetItem = item;
+    if (targetConfig === "*") {
+      const explicitTarget = resolveSafeOutputIssueTarget({ message: item, resolvedTemporaryIds, repoParts, handlerType: HANDLER_TYPE, aliases: ["issue_number"] });
+      if (!explicitTarget.success) return explicitTarget;
+      if (explicitTarget.number !== null) {
+        targetItem = { ...item, issue_number: explicitTarget.number };
       }
-      issueNumber = contextIssueNumber;
     }
+    const targetResult = resolveTarget({
+      targetConfig,
+      item: targetItem,
+      context,
+      itemType: HANDLER_TYPE,
+      supportsIssue: true,
+    });
+    if (!targetResult.success) {
+      if (targetResult.shouldFail === false) {
+        core.warning(targetResult.error);
+        return { success: false, skipped: true, reason: targetResult.error, error: targetResult.error };
+      }
+      return { success: false, error: targetResult.error };
+    }
+    const issueNumber = targetResult.number;
+    core.info(`Resolved issue number: #${issueNumber}`);
 
     const filterResult = await checkRequiredFilter(githubClient, repoParts, issueNumber, requiredLabels, requiredTitlePrefix, HANDLER_TYPE);
     if (filterResult) return filterResult;
@@ -334,34 +290,42 @@ async function main(config = {}) {
 
     try {
       const { owner, repo } = repoParts;
-      const intentMetadata = normalizeIssueIntentMetadata(item);
+      const intentMetadata = issueIntentEnabled ? normalizeIssueIntentMetadata(item) : {};
 
-      if (hasIssueIntentsRuntimeFeature() && !isClear) {
-        // GraphQL intent path: resolve the type's node ID from org issue types, then
-        // call setIssueTypeById with IssueTypeUpdateInput + the GraphQL-Features header.
-        core.info(`Using GraphQL intent path (issue_intents runtime feature enabled)`);
-        core.info(`Fetching issue node ID for issue #${issueNumber}`);
-        const issueNodeId = await getIssueNodeId(githubClient, owner, repo, issueNumber);
-        core.info(`Fetching issue types for repo ${owner}/${repo}`);
-        const issueTypes = await fetchIssueTypesForRepo(githubClient, owner, repo);
-        core.info(`Found ${issueTypes.length} issue type(s) for repo ${owner}/${repo}`);
-        const typeNode = issueTypes.find(t => t.name.toLowerCase() === resolvedIssueTypeName.toLowerCase());
-        if (!typeNode) {
-          const availableNames = issueTypes.map(t => t.name).join(", ");
-          const error = availableNames ? `Issue type ${JSON.stringify(resolvedIssueTypeName)} not found. Available types: ${availableNames}` : NO_ISSUE_TYPES_AVAILABLE_ERROR;
-          core.error(`Failed to set issue type on issue #${issueNumber}: ${error}`);
-          return { success: false, error };
+      if (!isClear) {
+        if (issueIntentEnabled) {
+          // GraphQL intent path: resolve the type's node ID from org issue types, then
+          // call setIssueTypeById with IssueTypeUpdateInput.
+          core.info("Using GraphQL intent path with IssueTypeUpdateInput");
+          core.info(`Fetching issue node ID for issue #${issueNumber}`);
+          const issueNodeId = await getIssueNodeId(githubClient, owner, repo, issueNumber);
+          core.info(`Fetching issue types for repo ${owner}/${repo}`);
+          const issueTypes = await fetchIssueTypesForRepo(githubClient, owner, repo);
+          core.info(`Found ${issueTypes.length} issue type(s) for repo ${owner}/${repo}`);
+          const typeNode = issueTypes.find(t => t.name.toLowerCase() === resolvedIssueTypeName.toLowerCase());
+          if (!typeNode) {
+            const availableNames = issueTypes.map(t => t.name).join(", ");
+            const error = availableNames ? `Issue type ${JSON.stringify(resolvedIssueTypeName)} not found. Available types: ${availableNames}` : NO_ISSUE_TYPES_AVAILABLE_ERROR;
+            core.error(`Failed to set issue type on issue #${issueNumber}: ${error}`);
+            return { success: false, error };
+          }
+          core.info(`Resolved issue type ${JSON.stringify(resolvedIssueTypeName)} to node ID ${typeNode.id}`);
+          await setIssueTypeById(githubClient, issueNodeId, typeNode.id, intentMetadata);
+        } else {
+          await githubClient.rest.issues.update({
+            owner,
+            repo,
+            issue_number: issueNumber,
+            type: resolvedIssueTypeName,
+          });
         }
-        core.info(`Resolved issue type ${JSON.stringify(resolvedIssueTypeName)} to node ID ${typeNode.id}`);
-        await setIssueTypeById(githubClient, issueNodeId, typeNode.id, intentMetadata);
       } else {
-        // REST path: used for the clear case and when the issue_intents feature is off.
-        const typeValue = buildIssueTypeValue(isClear, resolvedIssueTypeName, intentMetadata);
+        // REST path: preserve the existing clear behavior.
         await githubClient.rest.issues.update({
           owner,
           repo,
           issue_number: issueNumber,
-          type: typeValue,
+          type: "",
         });
       }
 

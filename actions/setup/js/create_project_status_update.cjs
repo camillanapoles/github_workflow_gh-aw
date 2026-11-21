@@ -10,6 +10,8 @@ const { isTemporaryId, normalizeTemporaryId } = require("./temporary_id.cjs");
 const { ERR_CONFIG, ERR_NOT_FOUND, ERR_PARSE, ERR_VALIDATION } = require("./error_codes.cjs");
 const { logGraphQLError } = require("./github_api_helpers.cjs");
 const { resolveAllowedMentionsFromPayload } = require("./resolve_mentions_from_payload.cjs");
+const { parseIntTemplatable } = require("./templatable.cjs");
+const { appendConfiguredBodyFooter } = require("./body_footer.cjs");
 
 /**
  * @typedef {import('./types/handler-factory').HandlerFactoryFunction} HandlerFactoryFunction
@@ -187,7 +189,8 @@ async function resolveProjectV2(projectInfo, projectNumberInt) {
     // Both direct query and fallback list query failed - this could be a transient API error
     const who = projectInfo.scope === "orgs" ? `org ${projectInfo.ownerLogin}` : `user ${projectInfo.ownerLogin}`;
     throw new Error(
-      `${ERR_NOT_FOUND}: Unable to resolve project #${projectNumberInt} for ${who}. Both direct projectV2 query and fallback projectsV2 list query failed. This may be a transient GitHub API error. Error: ${getErrorMessage(fallbackError)}`
+      `${ERR_NOT_FOUND}: Unable to resolve project #${projectNumberInt} for ${who}. Both direct projectV2 query and fallback projectsV2 list query failed. This may be a transient GitHub API error. Error: ${getErrorMessage(fallbackError)}`,
+      { cause: fallbackError }
     );
   }
 
@@ -272,6 +275,7 @@ async function main(config = {}, githubClient = null) {
   if (!github) {
     throw new Error(`${ERR_CONFIG}: GitHub client is required but not provided. Either pass a github client to main() or ensure global.github is set by github-script action.`);
   }
+  const maxMentions = parseIntTemplatable(config.mentions?.max, 50);
   let allowedMentionAliases = [];
   if (Array.isArray(config.allowedMentionAliases)) {
     allowedMentionAliases = config.allowedMentionAliases;
@@ -366,7 +370,7 @@ async function main(config = {}, githubClient = null) {
       const status = validateStatus(output.status);
       const startDate = formatDate(output.start_date);
       const targetDate = formatDate(output.target_date);
-      const body = sanitizeContent(String(output.body), { allowedAliases: allowedMentionAliases });
+      const body = appendConfiguredBodyFooter(sanitizeContent(String(output.body), { allowedAliases: allowedMentionAliases, maxMentions }), config.body_footer, { allowedMentions: allowedMentionAliases });
 
       core.info(`Creating status update: ${status} (${startDate} → ${targetDate})`);
       core.info(`Body preview: ${body.substring(0, 100)}${body.length > 100 ? "..." : ""}`);

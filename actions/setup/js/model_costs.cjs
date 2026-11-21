@@ -2,16 +2,13 @@
 /// <reference types="@actions/github-script" />
 
 const fs = require("fs");
-const path = require("path");
-
-const DEFAULT_MODELS_PATH = path.join(__dirname, "models.json");
 
 /** @type {Array<{id: string, provider: string, model: string, pricing: Record<string, number>}> | null | undefined} */
 let _catalog = undefined;
 
 function getModelsPath() {
   const override = process.env.GH_AW_MODELS_JSON_PATH;
-  return override && override.trim() ? override : DEFAULT_MODELS_PATH;
+  return override && override.trim() ? override : null;
 }
 
 /**
@@ -35,8 +32,10 @@ function loadCatalog() {
     return _catalog || [];
   }
 
+  const modelsPath = getModelsPath();
+  if (!modelsPath) return [];
   try {
-    const raw = fs.readFileSync(getModelsPath(), "utf8");
+    const raw = fs.readFileSync(modelsPath, "utf8");
     const parsed = JSON.parse(raw);
     const providers = parsed?.providers && typeof parsed.providers === "object" ? parsed.providers : {};
     _catalog = Object.entries(providers).flatMap(([providerName, providerData]) => {
@@ -107,6 +106,21 @@ function providerIncludesCacheReadsInInput(provider) {
     default:
       return false;
   }
+}
+
+/**
+ * Resolve input-token totals using the same cache semantics as AI-credit pricing.
+ * @param {{provider: string, inputTokens: number, cacheReadTokens: number, cacheWriteTokens: number, inputTokensIncludeCache?: boolean}} usage
+ * @returns {number | undefined}
+ */
+function computeInclusiveInputTokens({ provider, inputTokens, cacheReadTokens, cacheWriteTokens, inputTokensIncludeCache }) {
+  if ([inputTokens, cacheReadTokens, cacheWriteTokens].some(value => typeof value !== "number" || !Number.isFinite(value) || value < 0)) {
+    return undefined;
+  }
+  if (inputTokensIncludeCache === true) return inputTokens;
+  if (inputTokensIncludeCache === false) return inputTokens + cacheReadTokens + cacheWriteTokens;
+  if (providerIncludesCacheReadsInInput(provider)) return Math.max(inputTokens - cacheReadTokens, 0) + cacheReadTokens + cacheWriteTokens;
+  return inputTokens + cacheReadTokens + cacheWriteTokens;
 }
 
 /**
@@ -190,9 +204,10 @@ function usdToAIC(usd) {
  * @param {number} params.cacheReadTokens
  * @param {number} params.cacheWriteTokens
  * @param {number} [params.reasoningTokens]
+ * @param {boolean} [params.inputTokensIncludeCache]
  * @returns {number}
  */
-function computeInferenceCostUSD({ provider, model, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens = 0 }) {
+function computeInferenceCostUSD({ provider, model, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens = 0, inputTokensIncludeCache }) {
   const pricing = findModelPricing(provider, model);
   if (!pricing) return 0;
 
@@ -201,7 +216,12 @@ function computeInferenceCostUSD({ provider, model, inputTokens, outputTokens, c
   const cacheRead = cacheReadTokens || 0;
   const cacheWrite = cacheWriteTokens || 0;
   const reasoning = reasoningTokens || 0;
-  const effectiveInput = providerIncludesCacheReadsInInput(provider) ? Math.max(input - cacheRead, 0) : input;
+  let effectiveInput = input;
+  if (inputTokensIncludeCache === true) {
+    effectiveInput = Math.max(input - cacheRead - cacheWrite, 0);
+  } else if (typeof inputTokensIncludeCache !== "boolean" && providerIncludesCacheReadsInInput(provider)) {
+    effectiveInput = Math.max(input - cacheRead, 0);
+  }
 
   const promptPrice = pricing.input || 0;
   const completionPrice = pricing.output || 0;
@@ -221,6 +241,7 @@ function computeInferenceCostUSD({ provider, model, inputTokens, outputTokens, c
  * @param {number} params.cacheReadTokens
  * @param {number} params.cacheWriteTokens
  * @param {number} [params.reasoningTokens]
+ * @param {boolean} [params.inputTokensIncludeCache]
  * @returns {number}
  */
 function computeInferenceAIC(params) {
@@ -250,15 +271,49 @@ function formatAIC(value) {
   return value.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
 }
 
+/**
+ * Whole-credit footer estimates intentionally omit compact K/M notation.
+ * @param {number} value
+ * @returns {string}
+ */
+function formatEstimatedAIC(value) {
+  if (!Number.isFinite(value) || value <= 0) return "";
+  const nearestInteger = Math.round(value);
+  // Normalize arithmetic noise only for display, without rounding tiny costs to zero.
+  const normalized = nearestInteger > 0 && Math.abs(value - nearestInteger) <= Number.EPSILON * value ? nearestInteger : value;
+  return `~${Math.ceil(normalized)}`;
+}
+
 /** @type {Record<string, unknown> | null | undefined} */
 let _modelsJson = undefined;
 
 /**
- * Load and return the raw parsed models.json catalog object.
+ * Parse a models.json file at the given path.
+ * Returns the parsed object, or null if the file does not exist or is not a plain object.
+ *
+ * @param {string} filePath
+ * @returns {Record<string, unknown> | null}
+ */
+function parseModelsJsonFile(filePath) {
+  try {
+    const raw = fs.readFileSync(filePath, "utf8");
+    const parsed = JSON.parse(raw);
+    const isPlainObject = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed);
+    return isPlainObject ? /** @type {Record<string, unknown>} */ parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Load and return an explicitly configured models.json overlay.
  *
  * Returns the full JSON object (including `provider_type` fields per model entry)
  * so callers can perform custom lookups like provider-type resolution.
  * The result is cached after the first successful read.
+ *
+ * Without a readable GH_AW_MODELS_JSON_PATH, callers use AWF metadata and
+ * reported costs rather than a local default pricing catalog.
  *
  * @returns {Record<string, unknown> | null}
  */
@@ -266,14 +321,8 @@ function loadModelsJson() {
   if (_modelsJson !== undefined) {
     return _modelsJson ?? null;
   }
-  try {
-    const raw = fs.readFileSync(getModelsPath(), "utf8");
-    const parsed = JSON.parse(raw);
-    const isPlainObject = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed);
-    _modelsJson = isPlainObject ? /** @type {Record<string, unknown>} */ parsed : null;
-  } catch {
-    _modelsJson = null;
-  }
+  const modelsPath = getModelsPath();
+  _modelsJson = modelsPath ? parseModelsJsonFile(modelsPath) : null;
   return _modelsJson ?? null;
 }
 
@@ -283,10 +332,12 @@ function _resetModelCostsCache() {
 }
 
 module.exports = {
+  computeInclusiveInputTokens,
   computeInferenceAIC,
   computeInferenceCostUSD,
   findModelPricing,
   formatAIC,
+  formatEstimatedAIC,
   getModelsPath,
   loadCatalog,
   loadModelsJson,

@@ -52,6 +52,7 @@ describe("add_workflow_run_comment", () => {
     delete process.env.GITHUB_WORKFLOW;
     delete process.env.GH_AW_TRACKER_ID;
     delete process.env.GH_AW_LOCK_FOR_AGENT;
+    delete process.env.GH_AW_WORKFLOW_EMOJI;
     delete process.env.GITHUB_SERVER_URL;
     delete process.env.GH_AW_SAFE_OUTPUT_MESSAGES;
 
@@ -101,6 +102,46 @@ describe("add_workflow_run_comment", () => {
     return import("./add_workflow_run_comment.cjs?test=" + importCounter);
   }
 
+  it.each([0, 1, 2])("keeps trusted activation reporting on the native triggering issue with %i queue Claims", async count => {
+    const assignment = {
+      version: 3,
+      dispatch_id: "d1",
+      request_id: "r1",
+      commit_id: "commit1",
+      policy_epoch: "e1",
+      pool: "default",
+      worker_profile: "worker",
+      claims: Array.from({ length: count }, (_, index) => ({ handle: `h${index + 1}`, claim_id: `c${index + 1}`, work_id: `w${index + 1}`, work: { issue_number: 999 }, result_refs: [] })),
+    };
+    vi.stubEnv("GH_AW_WORK_QUEUE_ENABLED", count ? "true" : "false");
+    vi.stubEnv("GH_AW_WORK_QUEUE_ROLE", "worker");
+    global.context.payload.inputs = { work_queue_assignment: count ? JSON.stringify(assignment) : "stray malformed assignment" };
+    try {
+      const { main } = await importAddWorkflowRunComment();
+      await main();
+      expect(mockGithub.request).toHaveBeenCalledOnce();
+      expect(mockGithub.request).toHaveBeenCalledWith(
+        "POST /repos/{owner}/{repo}/issues/{issue_number}/comments",
+        expect.objectContaining({ owner: "testowner", repo: "testrepo", issue_number: 123, body: expect.stringContaining("/actions/runs/12345") })
+      );
+      expect(mockCore.setOutput).toHaveBeenCalledWith("comment-id", "67890");
+      expect(mockCore.setFailed).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  describe("discussion endpoint validation", () => {
+    it("rejects malformed and non-positive discussion endpoint numbers", async () => {
+      const { parseDiscussionEndpoint } = await importAddWorkflowRunComment();
+
+      for (const endpoint of ["discussion:12junk", "discussion:0", "discussion:12:extra"]) {
+        expect(() => parseDiscussionEndpoint(endpoint, "discussion")).toThrow("Invalid discussion endpoint");
+      }
+      expect(() => parseDiscussionEndpoint("discussion_comment:5junk:2", "discussion_comment")).toThrow("Invalid discussion endpoint");
+    });
+  });
+
   // Helper function to run the script
   async function runScript() {
     const { main } = await importAddWorkflowRunComment();
@@ -118,6 +159,10 @@ describe("add_workflow_run_comment", () => {
     await addCommentWithWorkflowLink(endpoint, runUrl, eventName);
   }
 
+  // Typed route endpoint used across addCommentWithWorkflowLink tests
+  const issuesCommentEndpoint123 = { route: "POST /repos/{owner}/{repo}/issues/{issue_number}/comments", params: { owner: "testowner", repo: "testrepo", issue_number: 123 } };
+  const issuesCommentEndpoint101 = { route: "POST /repos/{owner}/{repo}/issues/{issue_number}/comments", params: { owner: "testowner", repo: "testrepo", issue_number: 101 } };
+
   describe("main() - issues event", () => {
     it("should create comment on an issue", async () => {
       global.context = {
@@ -133,7 +178,7 @@ describe("add_workflow_run_comment", () => {
       await runScript();
 
       expect(mockGithub.request).toHaveBeenCalledWith(
-        expect.stringContaining("POST /repos/testowner/testrepo/issues/456/comments"),
+        "POST /repos/{owner}/{repo}/issues/{issue_number}/comments",
         expect.objectContaining({
           body: expect.stringContaining("https://github.com/testowner/testrepo/actions/runs/12345"),
         })
@@ -174,7 +219,7 @@ describe("add_workflow_run_comment", () => {
       await runScript();
 
       expect(mockGithub.request).toHaveBeenCalledWith(
-        expect.stringContaining("POST /repos/testowner/testrepo/issues/789/comments"),
+        "POST /repos/{owner}/{repo}/issues/{issue_number}/comments",
         expect.objectContaining({
           body: expect.any(String),
         })
@@ -201,7 +246,7 @@ describe("add_workflow_run_comment", () => {
       await runScript();
 
       expect(mockGithub.request).toHaveBeenCalledWith(
-        expect.stringContaining("POST /repos/targetowner/targetrepo/issues/789/comments"),
+        "POST /repos/{owner}/{repo}/issues/{issue_number}/comments",
         expect.objectContaining({
           body: expect.stringContaining("https://github.com/sideowner/siderepo/actions/runs/12345"),
         })
@@ -544,7 +589,7 @@ describe("add_workflow_run_comment", () => {
 
       expect(result?.id).toBe("67890");
       expect(mockGithub.request).toHaveBeenCalledWith(
-        expect.stringContaining("POST /repos/targetowner/targetrepo/issues/101/comments"),
+        "POST /repos/{owner}/{repo}/issues/{issue_number}/comments",
         expect.objectContaining({
           body: expect.stringContaining("has started processing this pull request comment"),
         })
@@ -596,7 +641,7 @@ describe("add_workflow_run_comment", () => {
       await runScript();
 
       expect(mockGithub.request).toHaveBeenCalledWith(
-        expect.stringContaining("POST /repos/testowner/testrepo/issues/101/comments"),
+        "POST /repos/{owner}/{repo}/issues/{issue_number}/comments",
         expect.objectContaining({
           body: expect.any(String),
         })
@@ -634,7 +679,7 @@ describe("add_workflow_run_comment", () => {
       await runScript();
 
       expect(mockGithub.request).toHaveBeenCalledWith(
-        expect.stringContaining("POST /repos/testowner/testrepo/issues/202/comments"),
+        "POST /repos/{owner}/{repo}/issues/{issue_number}/comments",
         expect.objectContaining({
           body: expect.any(String),
         })
@@ -672,7 +717,7 @@ describe("add_workflow_run_comment", () => {
       await runScript();
 
       expect(mockGithub.request).toHaveBeenCalledWith(
-        expect.stringContaining("POST /repos/testowner/testrepo/issues/303/comments"),
+        "POST /repos/{owner}/{repo}/issues/{issue_number}/comments",
         expect.objectContaining({
           body: expect.any(String),
         })
@@ -815,7 +860,7 @@ describe("add_workflow_run_comment", () => {
     it("should include workflow-id marker when GITHUB_WORKFLOW is set", async () => {
       process.env.GITHUB_WORKFLOW = "test-workflow.yml";
 
-      await runAddCommentWithWorkflowLink("/repos/testowner/testrepo/issues/123/comments", "https://github.com/testowner/testrepo/actions/runs/12345", "issues");
+      await runAddCommentWithWorkflowLink(issuesCommentEndpoint123, "https://github.com/testowner/testrepo/actions/runs/12345", "issues");
 
       expect(mockGithub.request).toHaveBeenCalledWith(
         expect.stringContaining("POST"),
@@ -828,7 +873,7 @@ describe("add_workflow_run_comment", () => {
     it("should include tracker-id marker when GH_AW_TRACKER_ID is set", async () => {
       process.env.GH_AW_TRACKER_ID = "tracker-123";
 
-      await runAddCommentWithWorkflowLink("/repos/testowner/testrepo/issues/123/comments", "https://github.com/testowner/testrepo/actions/runs/12345", "issues");
+      await runAddCommentWithWorkflowLink(issuesCommentEndpoint123, "https://github.com/testowner/testrepo/actions/runs/12345", "issues");
 
       expect(mockGithub.request).toHaveBeenCalledWith(
         expect.stringContaining("POST"),
@@ -839,7 +884,7 @@ describe("add_workflow_run_comment", () => {
     });
 
     it("should always include reaction comment type marker", async () => {
-      await runAddCommentWithWorkflowLink("/repos/testowner/testrepo/issues/123/comments", "https://github.com/testowner/testrepo/actions/runs/12345", "issues");
+      await runAddCommentWithWorkflowLink(issuesCommentEndpoint123, "https://github.com/testowner/testrepo/actions/runs/12345", "issues");
 
       expect(mockGithub.request).toHaveBeenCalledWith(
         expect.stringContaining("POST"),
@@ -854,7 +899,7 @@ describe("add_workflow_run_comment", () => {
     it("should add lock notice for issues event when GH_AW_LOCK_FOR_AGENT=true", async () => {
       process.env.GH_AW_LOCK_FOR_AGENT = "true";
 
-      await runAddCommentWithWorkflowLink("/repos/testowner/testrepo/issues/123/comments", "https://github.com/testowner/testrepo/actions/runs/12345", "issues");
+      await runAddCommentWithWorkflowLink(issuesCommentEndpoint123, "https://github.com/testowner/testrepo/actions/runs/12345", "issues");
 
       expect(mockGithub.request).toHaveBeenCalledWith(
         expect.stringContaining("POST"),
@@ -867,7 +912,7 @@ describe("add_workflow_run_comment", () => {
     it("should not add lock notice for pull_request events", async () => {
       process.env.GH_AW_LOCK_FOR_AGENT = "true";
 
-      await runAddCommentWithWorkflowLink("/repos/testowner/testrepo/issues/101/comments", "https://github.com/testowner/testrepo/actions/runs/12345", "pull_request");
+      await runAddCommentWithWorkflowLink(issuesCommentEndpoint101, "https://github.com/testowner/testrepo/actions/runs/12345", "pull_request");
 
       expect(mockGithub.request).toHaveBeenCalledWith(
         expect.stringContaining("POST"),
@@ -880,7 +925,7 @@ describe("add_workflow_run_comment", () => {
 
   describe("addCommentWithWorkflowLink() - outputs", () => {
     it("should set all required outputs (comment-id, comment-url, comment-repo)", async () => {
-      await runAddCommentWithWorkflowLink("/repos/testowner/testrepo/issues/123/comments", "https://github.com/testowner/testrepo/actions/runs/12345", "issues");
+      await runAddCommentWithWorkflowLink(issuesCommentEndpoint123, "https://github.com/testowner/testrepo/actions/runs/12345", "issues");
 
       expect(mockCore.setOutput).toHaveBeenCalledWith("comment-id", "67890");
       expect(mockCore.setOutput).toHaveBeenCalledWith("comment-url", expect.stringContaining("issuecomment-67890"));
@@ -928,7 +973,7 @@ describe("add_workflow_run_comment", () => {
     it("should use GH_AW_WORKFLOW_NAME in the comment body", async () => {
       process.env.GH_AW_WORKFLOW_NAME = "My Custom Workflow";
 
-      await runAddCommentWithWorkflowLink("/repos/testowner/testrepo/issues/123/comments", "https://github.com/testowner/testrepo/actions/runs/12345", "issues");
+      await runAddCommentWithWorkflowLink(issuesCommentEndpoint123, "https://github.com/testowner/testrepo/actions/runs/12345", "issues");
 
       expect(mockGithub.request).toHaveBeenCalledWith(
         expect.stringContaining("POST"),
@@ -941,7 +986,7 @@ describe("add_workflow_run_comment", () => {
     it("should fall back to GITHUB_WORKFLOW when GH_AW_WORKFLOW_NAME is not set", async () => {
       process.env.GITHUB_WORKFLOW = "Agentic Commands";
 
-      await runAddCommentWithWorkflowLink("/repos/testowner/testrepo/issues/123/comments", "https://github.com/testowner/testrepo/actions/runs/12345", "issues");
+      await runAddCommentWithWorkflowLink(issuesCommentEndpoint123, "https://github.com/testowner/testrepo/actions/runs/12345", "issues");
 
       expect(mockGithub.request).toHaveBeenCalledWith(
         expect.stringContaining("POST"),
@@ -953,10 +998,37 @@ describe("add_workflow_run_comment", () => {
   });
 
   describe("buildCommentBody()", () => {
+    it("imports workflow names as text rather than Markdown template syntax", async () => {
+      const { buildCommentBody } = await importAddWorkflowRunComment();
+      const body = buildCommentBody("issues", "https://github.com/testowner/testrepo/actions/runs/99", "name](https://github.com/forged/repo)\n\n### Forged heading");
+      expect(body).not.toContain("\n### Forged heading");
+      expect(body).toContain("\\#\\#\\# Forged heading");
+      expect(body.match(/(?<!\\)\]\(https:/g)).toHaveLength(1);
+    });
+
+    it("closes a template fence before appending lock notices and metadata", async () => {
+      process.env.GH_AW_SAFE_OUTPUT_MESSAGES = JSON.stringify({ runStarted: "```markdown\nStarted" });
+      process.env.GH_AW_LOCK_FOR_AGENT = "true";
+      process.env.GITHUB_WORKFLOW = "test-workflow";
+      const { buildCommentBody } = await importAddWorkflowRunComment();
+      const body = buildCommentBody("issues", "https://github.com/testowner/testrepo/actions/runs/99");
+      expect(body).toMatch(/```markdown\nStarted\n```\n\n🔒/);
+      expect(body.indexOf("<!-- gh-aw-workflow-id: test-workflow -->")).toBeGreaterThan(body.indexOf("🔒"));
+      expect(body).toMatch(/<!-- gh-aw-comment-type: reaction -->$/);
+    });
+
     it("should include the run URL in the comment body", async () => {
       const { buildCommentBody } = await importAddWorkflowRunComment();
       const body = buildCommentBody("issues", "https://github.com/testowner/testrepo/actions/runs/99");
       expect(body).toContain("https://github.com/testowner/testrepo/actions/runs/99");
+    });
+
+    it("should use workflow emoji from environment in the started status line", async () => {
+      process.env.GH_AW_WORKFLOW_EMOJI = "🤖";
+      const { buildCommentBody } = await importAddWorkflowRunComment();
+      const body = buildCommentBody("issues", "https://github.com/testowner/testrepo/actions/runs/99");
+      expect(body).toContain("🤖 [");
+      expect(body).not.toContain("🚀 [");
     });
 
     it("should always include reaction comment type marker", async () => {
@@ -975,14 +1047,14 @@ describe("add_workflow_run_comment", () => {
     it("should use GITHUB_WORKFLOW as workflow name when GH_AW_WORKFLOW_NAME is not set", async () => {
       process.env.GITHUB_WORKFLOW = "Agentic Commands";
       const { buildCommentBody } = await importAddWorkflowRunComment();
-      const body = buildCommentBody("issue_comment", "https://example.com/run/1");
+      const body = buildCommentBody("issue_comment", "https://github.com/testowner/testrepo/actions/runs/99");
       expect(body).toContain("[Agentic Commands]");
     });
 
     it("should prefer explicit workflow name override over environment defaults", async () => {
       process.env.GH_AW_WORKFLOW_NAME = "Agentic Commands";
       const { buildCommentBody } = await importAddWorkflowRunComment();
-      const body = buildCommentBody("issue_comment", "https://example.com/run/1", "archie");
+      const body = buildCommentBody("issue_comment", "https://github.com/testowner/testrepo/actions/runs/99", "archie");
       expect(body).toContain("[archie]");
       expect(body).not.toContain("[Agentic Commands]");
     });

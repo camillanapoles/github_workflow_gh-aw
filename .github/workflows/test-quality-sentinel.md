@@ -14,12 +14,27 @@ permissions:
   contents: read
   pull-requests: read
   copilot-requests: write
+model: router/economy
 engine:
   id: copilot
-  model: "${{ needs.activation.outputs.model_size }}"
   max-continuations: 15
+skip-if-decision:
+  - >-
+    Do @/tmp/gh-aw/agent/pr-meta.json, @/tmp/gh-aw/agent/test-diff.txt, and
+    @/tmp/gh-aw/agent/missing-build-tags.txt conclusively establish that no
+    supported Go or JavaScript behavioral test changed and no hard guideline
+    violation exists, so the act-vs-noop rubric requires no review? Abstain
+    for unavailable, stale, or truncated evidence, any hard violation, or any
+    behavioral test change; clean behavioral tests still require approval.
+cache:
+  key: pr-test-prefetch-${{ github.event.pull_request.head.sha || github.event.issue.number }}
+  path: /tmp/gh-aw/agent
+  restore-keys:
+    - pr-test-prefetch-${{ github.event.pull_request.number || github.event.issue.number }}-
 tools:
   cli-proxy: true
+  github:
+    mode: gh-proxy
   bash:
     - "git diff:*"
     - "grep:*"
@@ -29,29 +44,79 @@ steps:
   - name: Pre-fetch PR data
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       EXPR_GITHUB_EVENT_PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
     run: |
-      set -euo pipefail
+      set -uo pipefail
       mkdir -p /tmp/gh-aw/agent
+      write_prefetch_fallback() {
+        local reason="$1"
+        echo "::warning::Test Quality Sentinel pre-fetch unavailable: ${reason}"
+        printf '%s\n' "$reason" > /tmp/gh-aw/agent/test-prefetch-unavailable.txt
+        printf '{}\n' > /tmp/gh-aw/agent/pr-meta.json
+        for file in /tmp/gh-aw/agent/test-files.txt \
+                    /tmp/gh-aw/agent/test-diff.txt \
+                    /tmp/gh-aw/agent/diff-numstat.txt \
+                    /tmp/gh-aw/agent/go-new-test-funcs.txt \
+                    /tmp/gh-aw/agent/js-new-test-funcs.txt \
+                    /tmp/gh-aw/agent/go-modified-test-funcs.txt \
+                    /tmp/gh-aw/agent/js-changed-test-files.txt \
+                    /tmp/gh-aw/agent/missing-build-tags.txt \
+                    /tmp/gh-aw/agent/go-test-stats.txt \
+                    /tmp/gh-aw/agent/js-test-stats.txt \
+                    /tmp/gh-aw/agent/go-testmain-funcs.txt \
+                    /tmp/gh-aw/agent/go-goleak-entries.txt; do
+          : > "$file"
+        done
+        rm -f /tmp/gh-aw/agent/changed-files.txt /tmp/gh-aw/agent/test-diff-full.txt
+        rm -f /tmp/gh-aw/agent/test-data-head-sha.txt
+      }
+      CURRENT_HEAD_SHA="${PR_HEAD_SHA:-}"
+      if [ -z "$CURRENT_HEAD_SHA" ]; then
+        CURRENT_HEAD_SHA=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)
+      fi
+      CACHE_HEAD_SHA=""
+      if [ -f /tmp/gh-aw/agent/test-data-head-sha.txt ]; then
+        CACHE_HEAD_SHA="$(tr -d '\n' < /tmp/gh-aw/agent/test-data-head-sha.txt)"
+      fi
+      if [ -n "$CURRENT_HEAD_SHA" ] && [ "$CURRENT_HEAD_SHA" = "$CACHE_HEAD_SHA" ] && \
+         [ -f /tmp/gh-aw/agent/pr-meta.json ] && \
+         [ -f /tmp/gh-aw/agent/test-files.txt ] && \
+         [ -f /tmp/gh-aw/agent/test-diff.txt ] && \
+         [ -f /tmp/gh-aw/agent/diff-numstat.txt ]; then
+        echo "Cache hit: using pre-fetched test data for head ${CURRENT_HEAD_SHA}"
+        rm -f /tmp/gh-aw/agent/test-prefetch-unavailable.txt
+        exit 0
+      fi
 
       # PR metadata
-      gh pr view "$PR_NUMBER" \
-        --json files,additions,deletions,baseRefName,headRefName \
-        > /tmp/gh-aw/agent/pr-meta.json
+      if ! gh pr view "$PR_NUMBER" \
+        --json files,additions,deletions,baseRefName,headRefName,headRefOid \
+        > /tmp/gh-aw/agent/pr-meta.json; then
+        write_prefetch_fallback "unable to fetch PR metadata"
+        exit 0
+      fi
 
       # List of changed test files
-      gh pr diff "$PR_NUMBER" \
-        --name-only | grep -E '(_test\.go|\.test\.cjs|\.test\.js)$' \
-        > /tmp/gh-aw/agent/test-files.txt || true
+      if ! gh pr diff "$PR_NUMBER" --name-only > /tmp/gh-aw/agent/changed-files.txt; then
+        write_prefetch_fallback "unable to fetch PR file list"
+        exit 0
+      fi
+      grep -E '(_test\.go|\.test\.cjs|\.test\.js)$' \
+        /tmp/gh-aw/agent/changed-files.txt > /tmp/gh-aw/agent/test-files.txt || true
 
       # Diff for test files only; capped at 40 KB to control cache token costs
       if [ -s /tmp/gh-aw/agent/test-files.txt ]; then
         # shellcheck disable=SC2046
-        gh pr diff "$PR_NUMBER" \
+        if ! gh pr diff "$PR_NUMBER" \
           -- $(tr '\n' ' ' < /tmp/gh-aw/agent/test-files.txt) \
-          | head -c 40000 \
-          > /tmp/gh-aw/agent/test-diff.txt 2>/dev/null || true
+          > /tmp/gh-aw/agent/test-diff-full.txt 2>/dev/null; then
+          write_prefetch_fallback "unable to fetch test file diff"
+          exit 0
+        fi
+        head -c 40000 /tmp/gh-aw/agent/test-diff-full.txt > /tmp/gh-aw/agent/test-diff.txt
+        rm -f /tmp/gh-aw/agent/test-diff-full.txt
       else
         touch /tmp/gh-aw/agent/test-diff.txt
       fi
@@ -61,10 +126,28 @@ steps:
 
       # Extract new/modified test function signatures from the diff
       if [ -s /tmp/gh-aw/agent/test-diff.txt ]; then
+        # Behavioral test functions only — exclude TestMain (infrastructure, not a test case)
         grep -E "^\+func Test" /tmp/gh-aw/agent/test-diff.txt \
+          | grep -v "^\+func TestMain\b" \
           > /tmp/gh-aw/agent/go-new-test-funcs.txt || true
+        # Modified Go behavioral test functions (hunk headers catch body-only edits)
+        grep -E "^@@ .*func Test" /tmp/gh-aw/agent/test-diff.txt \
+          | grep -v "func TestMain\b" \
+          > /tmp/gh-aw/agent/go-modified-test-funcs.txt || true
+        # TestMain infrastructure entries (separate from behavioral tests; include body-only edits)
+        {
+          grep -E "^\+func TestMain\b" /tmp/gh-aw/agent/test-diff.txt || true
+          grep -E "^@@ .*func TestMain\b" /tmp/gh-aw/agent/test-diff.txt || true
+        } \
+          > /tmp/gh-aw/agent/go-testmain-funcs.txt || true
+        # Goroutine-leak guard detection (goleak.VerifyTestMain calls)
+        grep -E "goleak\.VerifyTestMain" /tmp/gh-aw/agent/test-diff.txt \
+          > /tmp/gh-aw/agent/go-goleak-entries.txt || true
         grep -E "^\+(it|test|describe)\(" /tmp/gh-aw/agent/test-diff.txt \
           > /tmp/gh-aw/agent/js-new-test-funcs.txt || true
+        # Any changed JS test file disqualifies infrastructure-only mode
+        grep -E '(\.test\.cjs|\.test\.js)$' /tmp/gh-aw/agent/test-files.txt \
+          > /tmp/gh-aw/agent/js-changed-test-files.txt || true
         # Check for new Go test files missing mandatory build tags
         git diff "$EXPR_GITHUB_EVENT_PULL_REQUEST_BASE_SHA...HEAD" \
           --diff-filter=A --name-only 2>/dev/null \
@@ -74,10 +157,12 @@ steps:
             fi
           done > /tmp/gh-aw/agent/missing-build-tags.txt || true
         # Go test structural stats (assertions, error checks, table-driven, forbidden mocks)
+        # TestMain is excluded: it is infrastructure, not a behavioral test case
         awk '
           /^\+func Test/ {
             if (test_name) print test_name, "assertions=" assertions, "errors=" errors, "table_driven=" table_driven, "forbidden_mocks=" forbidden_mocks
             match($0, /func (Test[^(]+)/, arr); test_name=arr[1]; assertions=0; errors=0; table_driven=0; forbidden_mocks=0
+            if (test_name == "TestMain") test_name=""
           }
           test_name && /^\+.*(assert\.|require\.)/ { assertions++ }
           test_name && /^\+.*t\.(Error|Errorf|Fatal|Fatalf)\(/ { assertions++; errors++ }
@@ -102,16 +187,29 @@ steps:
       else
         touch /tmp/gh-aw/agent/go-new-test-funcs.txt \
               /tmp/gh-aw/agent/js-new-test-funcs.txt \
+              /tmp/gh-aw/agent/go-modified-test-funcs.txt \
+              /tmp/gh-aw/agent/js-changed-test-files.txt \
               /tmp/gh-aw/agent/missing-build-tags.txt \
               /tmp/gh-aw/agent/go-test-stats.txt \
-              /tmp/gh-aw/agent/js-test-stats.txt
+              /tmp/gh-aw/agent/js-test-stats.txt \
+              /tmp/gh-aw/agent/go-testmain-funcs.txt \
+              /tmp/gh-aw/agent/go-goleak-entries.txt
       fi
+      if [ -z "$CURRENT_HEAD_SHA" ]; then
+        CURRENT_HEAD_SHA="$(jq -r '.headRefOid // empty' /tmp/gh-aw/agent/pr-meta.json)"
+      fi
+      if [ -n "$CURRENT_HEAD_SHA" ]; then
+        printf '%s\n' "$CURRENT_HEAD_SHA" > /tmp/gh-aw/agent/test-data-head-sha.txt
+      else
+        rm -f /tmp/gh-aw/agent/test-data-head-sha.txt
+      fi
+      rm -f /tmp/gh-aw/agent/test-prefetch-unavailable.txt
 
       echo "Pre-fetched $(grep -c . /tmp/gh-aw/agent/test-files.txt || echo 0) test files"
 safe-outputs:
   add-comment:
     max: 1
-    hide-older-comments: true
+    replace-older-comments: true
   submit-pull-request-review:
     max: 1
   noop:
@@ -126,24 +224,16 @@ imports:
   - shared/otlp.md
 features:
   gh-aw-detection: true
-experiments:
-  model_size:
-    variants: [claude-haiku-4.5, claude-sonnet-4.6]
-    description: "Tests whether a smaller model can preserve test-review decision quality at lower cost versus a larger reasoning-capable model."
-    hypothesis: "H0: model-size variant does not improve review usefulness acceptance rate. H1: a larger reasoning-capable model improves review usefulness acceptance rate by >=15 percentage points without materially increasing false-positive change requests."
-    metric: review_usefulness_acceptance_rate
-    secondary_metrics: [ai_credits_total, false_positive_change_request_rate]
-    guardrail_metrics:
-      - name: false_positive_change_request_rate
-        threshold: "<=0.20"
-      - name: run_success_rate
-        threshold: ">=0.90"
-    min_samples: 70
-    weight: [50, 50]
-    start_date: "2026-07-05"
+evals:
+  - id: review_decision_consistent
+    question: Did the agent either post a Test Quality Score with an APPROVE or REQUEST_CHANGES decision that matches the tests and guideline violations it flagged, or call noop with a scope reason the workflow's act-vs-noop rubric allows (pre-fetch unavailable, no changed or only unsupported-language test files, or no behavioral test change and no hard violation)? Return UNKNOWN when the output records a skip-if-decision no-op before agent execution.
+
 ---
 
 # Test Quality Sentinel 🧪
+
+The AWF decision gate follows the act-vs-noop rubric before invocation.
+Behavioral changes, hard violations, and uncertain evidence preserve execution.
 
 You are the Test Quality Sentinel. Analyze new and changed tests in this PR to produce a **Test Quality Score** (0–100) and flag tests that create false comfort without genuine behavioral coverage.
 
@@ -155,12 +245,22 @@ High test counts can create an illusion of safety. The real signal is whether te
 
 ## Step 1: Load Pre-fetched PR Data and Identify Test Files
 
+First check whether `/tmp/gh-aw/agent/test-prefetch-unavailable.txt` exists. If it exists, read the reason from that file and immediately call `noop` with the reason:
+
+```json
+{"noop": {"message": "Test Quality Sentinel skipped because pre-fetch PR data was unavailable: <reason>"}}
+```
+
+Do not analyze the empty fallback files when this marker exists.
+
 PR data has already been fetched before the agent started. Read from:
 
 - `/tmp/gh-aw/agent/pr-meta.json` — PR metadata (files, additions, deletions, branch names)
 - `/tmp/gh-aw/agent/test-files.txt` — list of changed test files
 - `/tmp/gh-aw/agent/test-diff.txt` — diff for test files only _(capped at 40 KB; if truncated, prioritize newly added `func Test*` functions)_
 - `/tmp/gh-aw/agent/diff-numstat.txt` — numstat for all changed files
+- `/tmp/gh-aw/agent/go-testmain-funcs.txt` — newly added `TestMain` infrastructure entries _(separate from behavioral tests)_
+- `/tmp/gh-aw/agent/go-goleak-entries.txt` — `goleak.VerifyTestMain` calls added in this PR _(goroutine-leak guard signal)_
 
 Then identify all **new and modified test files** in the diff:
 
@@ -185,7 +285,16 @@ For each test, collect:
 - **Test body** (assertions, setup, mocking calls)
 - **File path and approximate line number**
 
-New Go test function signatures (lines matching `+func Test*`) are pre-extracted to `/tmp/gh-aw/agent/go-new-test-funcs.txt`. New JavaScript test blocks (`it(`, `test(`, `describe(`) are in `/tmp/gh-aw/agent/js-new-test-funcs.txt`. Use these as a starting point, then read `test-diff.txt` for full function bodies.
+New Go behavioral test function signatures (lines matching `+func Test*`, excluding `TestMain`) are pre-extracted to `/tmp/gh-aw/agent/go-new-test-funcs.txt`. Modified Go behavioral tests detected from hunk headers (`@@ ... func Test...`) are in `/tmp/gh-aw/agent/go-modified-test-funcs.txt`. New JavaScript test blocks (`it(`, `test(`, `describe(`) are in `/tmp/gh-aw/agent/js-new-test-funcs.txt`. Changed JS test files are in `/tmp/gh-aw/agent/js-changed-test-files.txt`. Use these as a starting point, then read `test-diff.txt` for full function bodies.
+
+**Infrastructure vs. behavioral**: `TestMain(m *testing.M)` entries in `go-testmain-funcs.txt` are test infrastructure, not behavioral test cases. Do not score them as test functions. Instead, note them separately in the report and credit any `goleak.VerifyTestMain` usage (see `go-goleak-entries.txt`) as a goroutine-leak design invariant.
+
+If all of the following hold, this is an **infrastructure-only PR** — see the scoring guidance in Step 6:
+- `go-new-test-funcs.txt` is empty
+- `go-modified-test-funcs.txt` is empty
+- `js-new-test-funcs.txt` is empty
+- `js-changed-test-files.txt` is empty
+- `go-testmain-funcs.txt` is non-empty
 
 Also check `/tmp/gh-aw/agent/missing-build-tags.txt` — any newly added Go test files missing the mandatory `//go:build` tag on line 1 are listed there.
 
@@ -223,10 +332,25 @@ Red flags (mark **suspicious** when present):
 7. No assertions
 8. Go assertion lacks descriptive failure context
 
+**Goroutine-leak guards**: `TestMain` with `goleak.VerifyTestMain(m)` enforces that no goroutines are leaked after each test run. Classify each such entry as `behavioral_contract`, `high_value`, `design_test` — this is a package-level design invariant that protects all future tests. Do not penalize its absence of traditional assertions. If `go-goleak-entries.txt` is non-empty, note it as a positive quality signal in the report.
+
+### Act-vs-noop rubric
+
+Decide whether there is a reviewable signal before drafting a report. Do not use `noop` to avoid reporting a concrete red flag, and do not manufacture a finding merely because a test changed.
+
+| Evidence after the scoped review | Required outcome |
+|---|---|
+| Pre-fetch unavailable, no changed test files, or only unsupported-language tests | Call `noop` immediately with the specific scope reason; do not post a report. |
+| Recognized test files changed but no behavioral test case changed and no hard violation exists | Call `noop` with the specific scope reason; do not post a report. |
+| A hard violation exists, or the implementation-test ratio exceeds 30% | Act: include each concrete file, test, and evidence in the report, then request changes. |
+| A red flag exists but does not meet the failure threshold | Act: flag only the evidenced test in the report; do not escalate a speculative concern. |
+| Behavioral tests were reviewed and no red flags or violations exist | Act: report the clean result and approve; a clean review is not a reason to invent a finding. |
+
 Scope for this step:
 - Analyze only new/changed Go (`*_test.go`) and JavaScript (`*.test.cjs`, `*.test.js`) tests; note other languages without scoring.
 - Treat Go mocking with `gomock`, `testify/mock`, `.EXPECT()`, or `.On()` as a hard violation.
 - JavaScript vitest mocks for external I/O are acceptable unless business logic is mocked without output assertions.
+- Do not score `TestMain(m *testing.M)` entries as behavioral tests; they are infrastructure.
 
 ## Step 5: Count Lines in Test Files vs. Production Files
 
@@ -238,7 +362,7 @@ For each **Go and JavaScript** test file, find the corresponding production file
 - `foo.test.cjs` → `foo.cjs` (primary in `actions/setup/js/`)
 - `foo.test.js` → `foo.js` (used in `scripts/`)
 
-If the ratio of new lines added to the test file vs. the production file exceeds 2:1, flag it as potential **test inflation**.
+If the ratio of new lines added to the test file vs. the production file exceeds 2:1, flag it as potential **test inflation**. Inflation scoring does not apply to `TestMain`-only files (pure infrastructure).
 
 ## Step 6: Calculate Test Quality Score
 
@@ -254,6 +378,8 @@ score = max(0, min(100, score))
 
 Thresholds: `>=80 ✅ Excellent`, `60-79 ⚠️ Acceptable`, `40-59 🔶 Needs improvement`, `<40 ❌ Poor`.
 
+**Infrastructure-only PRs**: If `go-new-test-funcs.txt`, `go-modified-test-funcs.txt`, `js-new-test-funcs.txt`, and `js-changed-test-files.txt` are all empty (no behavioral tests added/modified) and `go-testmain-funcs.txt` is non-empty (only `TestMain` infrastructure changed), skip the numeric score formula and assign **Score: N/A — Infrastructure**. Do not fail the PR on implementation ratio (there are no behavioral tests to evaluate). Still flag hard violations (missing build tags, go mock library usage). If `go-goleak-entries.txt` is non-empty, report it as a quality improvement and approve.
+
 Fail if either condition is true:
 - `implementation_tests / total_new_tests > 0.30`
 - Any coding-guideline violation exists (Go mock library usage, or new Go test missing required build tag)
@@ -262,7 +388,35 @@ Guideline violations always force `REQUEST_CHANGES` regardless of numeric score.
 
 ## Step 7: Post PR Comment with Results
 
-Post using `add-comment` (not bash; omit `item_number` — runtime infers the PR). Use this template:
+Read the `test-report-templates` skill and post the report using `add-comment` (not bash; omit `item_number` — runtime infers the PR). Use the standard template, or the infrastructure-only template when the PR contains only `TestMain`/setup changes.
+
+## Step 8: Submit PR Review Based on Result
+
+After posting the comment, submit exactly one safe-output action based on the analysis outcome:
+- When no tests required action: `{"noop": {"message": "No action needed: [brief explanation]"}}`
+- When quality passes (`implementation_tests / total <= 30%` and no violations): `{"event": "APPROVE", "body": "✅ Test Quality Sentinel: {SCORE}/100. {IMPL_PCT}% implementation tests (threshold: 30%)."}`
+- When this is an infrastructure-only PR (only `TestMain` changes, no behavioral tests) with no violations: `{"event": "APPROVE", "body": "✅ Test Quality Sentinel: Infrastructure only. {GOLEAK_NOTE} No violations."}`
+- When quality fails (ratio `> 30%` **or** any guideline violation): `{"event": "REQUEST_CHANGES", "body": "❌ Test Quality Sentinel: {SCORE}/100. {FAIL_REASON} Review flagged tests in the comment above."}`
+
+## Guidelines
+
+Calibration rules:
+- **Edge-case credit is generous**: one valid error assertion is enough (`assert.Error`, `t.Fatalf` on error, `.toThrow`, `.rejects`, etc.)
+- **Table-driven tests**: count each row as a scenario; credit error/edge rows individually
+- **Behavioral credit is strict**: mark `design_test` only when assertions verify user-visible behavior
+- **Go assertion messages required**: flag assertions without descriptive failure context
+- **Duplicate detection threshold**: report duplicates only when 3+ tests share the same pattern with trivial constant changes
+- **Goroutine-leak guards**: `TestMain` with `goleak.VerifyTestMain` is a strong design invariant; in infrastructure-only PRs with no hard violations, approve and note it as a positive quality signal
+- **Infrastructure-only PRs**: PRs adding only `TestMain` and test setup infrastructure carry no behavioral test ratio and must not be failed on that basis; evaluate only hard violations (build tags, mock libraries)
+
+**Token Budget**: Analyze at most **50 test functions** per run. If more exist, prioritize newly added functions over modified ones; add a sampling note in the PR comment. Keep individual test analysis concise — 2–3 sentences per test in the flagged section. Always wrap the per-test classification table and flagged-test details in `<details>` tags.
+
+## skill: `test-report-templates`
+---
+description: PR comment templates for the Test Quality Sentinel report (standard and infrastructure-only).
+---
+
+Standard report template:
 
 ```markdown
 ### 🧪 Test Quality Sentinel Report
@@ -302,20 +456,27 @@ Post using `add-comment` (not bash; omit `item_number` — runtime infers the PR
 > {✅/❌} **{passed/failed}.** {IMPL_PCT}% implementation tests (threshold: 30%).
 ```
 
-## Step 8: Submit PR Review Based on Result
+Infrastructure-only report template (no numeric score or ratio fields):
 
-After posting the comment, submit exactly one safe-output action based on the analysis outcome:
-- When no tests required action: `{"noop": {"message": "No action needed: [brief explanation]"}}`
-- When quality passes (`implementation_tests / total <= 30%` and no violations): `{"event": "APPROVE", "body": "✅ Test Quality Sentinel: {SCORE}/100. {IMPL_PCT}% implementation tests (threshold: 30%)."}`
-- When quality fails (ratio `> 30%` **or** any guideline violation): `{"event": "REQUEST_CHANGES", "body": "❌ Test Quality Sentinel: {SCORE}/100. {FAIL_REASON} Review flagged tests in the comment above."}`
+```markdown
+### 🧪 Test Quality Sentinel Report
 
-## Guidelines
+✅ **Test Quality Score: N/A — Infrastructure**
 
-Calibration rules:
-- **Edge-case credit is generous**: one valid error assertion is enough (`assert.Error`, `t.Fatalf` on error, `.toThrow`, `.rejects`, etc.)
-- **Table-driven tests**: count each row as a scenario; credit error/edge rows individually
-- **Behavioral credit is strict**: mark `design_test` only when assertions verify user-visible behavior
-- **Go assertion messages required**: flag assertions without descriptive failure context
-- **Duplicate detection threshold**: report duplicates only when 3+ tests share the same pattern with trivial constant changes
+> Infrastructure-only change detected (`TestMain` / setup only). No behavioral tests were added or modified.
 
-**Token Budget**: Analyze at most **50 test functions** per run. If more exist, prioritize newly added functions over modified ones; add a sampling note in the PR comment. Keep individual test analysis concise — 2–3 sentences per test in the flagged section. Always wrap the per-test classification table and flagged-test details in `<details>` tags.
+<details>
+<summary>📊 Infrastructure Signals</summary>
+
+| Signal | Value |
+|---|---|
+| `TestMain` entries | {TESTMAIN_COUNT} |
+| `goleak.VerifyTestMain` entries | {GOLEAK_COUNT} |
+| 🚨 Violations | {VIOLATIONS} |
+
+</details>
+
+### Verdict
+
+> ✅ **passed.** Infrastructure-only PR; behavioral test ratio not applicable.
+```

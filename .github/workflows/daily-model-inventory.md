@@ -2,7 +2,7 @@
 private: true
 emoji: "📦"
 name: Daily Model Inventory Checker
-description: Queries model lists from OpenAI, Anthropic, and Google APIs daily, uses AWF /reflect for Copilot models, then analyzes the combined inventory to propose updates to the builtin model alias mapping
+description: Queries model lists from OpenAI, Anthropic, and Google APIs daily, uses AWF /reflect for Copilot models, audits workflow model pins from live source files, then analyzes the combined inventory to propose updates to the builtin model alias mapping
 on:
   schedule:
     - cron: daily
@@ -10,6 +10,8 @@ on:
 
 permissions:
   contents: read
+  actions: read
+  copilot-requests: write
   issues: read
   pull-requests: read
 
@@ -18,6 +20,16 @@ engine:
   id: copilot
   copilot-sdk: true
   driver: .github/drivers/copilot_sdk_driver_sample_node.cjs
+skip-if-decision:
+  - >-
+    Do @/tmp/gh-aw/agent/model-inventory/inventory.json,
+    @/tmp/gh-aw/agent/model-inventory/reflect.json,
+    @/tmp/gh-aw/agent/model-inventory/model-pins.json, and
+    @pkg/workflow/data/model_aliases.json conclusively establish that no
+    built-in alias update or workflow model-pin correction remains? Abstain
+    until this run's live Copilot reflect and source-based pin audit are
+    complete, or if provider evidence is unavailable, stale, or incomplete.
+max-tool-denials: 3
 strict: true
 timeout-minutes: 30
 network:
@@ -28,7 +40,7 @@ network:
 
 # Supply pricing for a private/enterprise model not yet in the models.dev catalog.
 # Cost values are per-token USD in scientific notation (e.g. 3e-06 = $3 per million tokens).
-# Entries are merged with the built-in models.json at runtime and fill gaps for unknown models.
+# Entries are passed to AWF as explicit pricing overrides for unknown models.
 models:
   providers:
     openai:
@@ -62,6 +74,7 @@ jobs:
             echo "status=skipped" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # runner-guard:ignore RGS-012 -- the OpenAI API key is sent only to the official OpenAI models endpoint.
           HTTP_STATUS=$(curl -sf -o "$OUT/raw.json" -w "%{http_code}" \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             https://api.openai.com/v1/models) || true
@@ -82,9 +95,14 @@ jobs:
             echo "status=error" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Log raw response
+        if: always()
+        shell: bash
+        run: cat /tmp/gh-aw/agent/model-inventory/openai/raw.json 2>/dev/null || echo "(no raw.json)"
+
       - name: Upload OpenAI artifacts
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: openai-models
           path: |
@@ -114,6 +132,7 @@ jobs:
             echo "status=skipped" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # runner-guard:ignore RGS-012 -- the Anthropic API key is sent only to the official Anthropic models endpoint.
           HTTP_STATUS=$(curl -sf -o "$OUT/raw.json" -w "%{http_code}" \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
@@ -136,9 +155,14 @@ jobs:
             echo "status=error" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Log raw response
+        if: always()
+        shell: bash
+        run: cat /tmp/gh-aw/agent/model-inventory/anthropic/raw.json 2>/dev/null || echo "(no raw.json)"
+
       - name: Upload Anthropic artifacts
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: anthropic-models
           path: |
@@ -168,8 +192,10 @@ jobs:
             echo "status=skipped" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # runner-guard:ignore RGS-012 -- the Gemini API key is sent only to the official Google models endpoint.
           HTTP_STATUS=$(curl -sf -o "$OUT/raw.json" -w "%{http_code}" \
-            "https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}") || true
+            -H "x-goog-api-key: ${GEMINI_API_KEY}" \
+            "https://generativelanguage.googleapis.com/v1beta/models") || true
           if [ "${HTTP_STATUS:-0}" = "200" ]; then
             jq '{
               provider: "gemini",
@@ -191,9 +217,14 @@ jobs:
             echo "status=error" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Log raw response
+        if: always()
+        shell: bash
+        run: cat /tmp/gh-aw/agent/model-inventory/gemini/raw.json 2>/dev/null || echo "(no raw.json)"
+
       - name: Upload Gemini artifacts
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: gemini-models
           path: |
@@ -208,7 +239,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Create placeholder for Copilot billing models
+      - name: Create placeholder for GitHub Copilot billing models
         id: fetch
         shell: bash
         run: |
@@ -225,27 +256,88 @@ jobs:
             > "$OUT/models.json"
           echo "status=placeholder" >> "$GITHUB_OUTPUT"
 
-      - name: Upload Copilot billing models artifact
+      - name: Log placeholder
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        shell: bash
+        run: cat /tmp/gh-aw/agent/model-inventory/copilot-billing/models.json 2>/dev/null || echo "(no models.json)"
+
+      - name: Upload GitHub Copilot billing models artifact
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: copilot-billing-models
           path: /tmp/gh-aw/agent/model-inventory/copilot-billing/models.json
           if-no-files-found: error
           retention-days: 7
 
+  collect_copilot_sdk_models:
+    runs-on: ubuntu-latest
+    needs: [activation]
+    permissions:
+      contents: read
+    steps:
+      - name: Install GitHub Copilot SDK with bundled GitHub Copilot CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_DIR="$RUNNER_TEMP/copilot-sdk"
+          mkdir -p "$SDK_DIR"
+          npm install --prefix "$SDK_DIR" --no-save @github/copilot-sdk@1.0.13
+
+      - name: Fetch GitHub Copilot SDK model billing information
+        shell: bash
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          OUT="/tmp/gh-aw/agent/model-inventory/copilot-sdk"
+          mkdir -p "$OUT"
+          cd "$RUNNER_TEMP/copilot-sdk"
+          node --input-type=module > "$OUT/models.json" <<'EOF'
+          import { CopilotClient } from "@github/copilot-sdk";
+
+          const client = new CopilotClient({
+            gitHubToken: process.env.COPILOT_GITHUB_TOKEN,
+            logLevel: "error",
+          });
+
+          await client.start();
+          try {
+            const models = await client.listModels();
+            process.stdout.write(`${JSON.stringify({ provider: "copilot-sdk", models }, null, 2)}\n`);
+          } finally {
+            await client.stop();
+          }
+          EOF
+
+      - name: Log models
+        if: always()
+        shell: bash
+        run: cat /tmp/gh-aw/agent/model-inventory/copilot-sdk/models.json 2>/dev/null || echo "(no models.json)"
+
+      - name: Upload GitHub Copilot SDK models artifact
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: copilot-sdk-models
+          path: /tmp/gh-aw/agent/model-inventory/copilot-sdk/models.json
+          if-no-files-found: error
+          retention-days: 7
+
 steps:
   - name: Download all model artifacts
-    uses: actions/download-artifact@v8.0.1
+    uses: actions/download-artifact@v8.0.2
     with:
       path: /tmp/gh-aw/agent/model-inventory/artifacts
 
-  - name: Predownload models.dev API index
+  - name: Pre-download models.dev API index
     shell: bash
+    # runner-guard:ignore RGS-012 -- unauthenticated GET from a public read-only model index; no secrets are sent.
     run: |
       set -euo pipefail
       OUT="/tmp/gh-aw/agent/model-inventory/models-dev"
       mkdir -p "$OUT"
+      # runner-guard:ignore RGS-012 -- unauthenticated GET from a public read-only model index; no secrets are sent.
       curl -fsS https://models.dev/api.json -o "$OUT/api.json"
       echo "Downloaded models.dev API index to $OUT/api.json"
 
@@ -257,33 +349,68 @@ steps:
       echo "Combined inventory written to $INVENTORY"
       cat "$INVENTORY"
 
+post-steps:
+  - name: Add live workflow model audit to step summary
+    if: always()
+    shell: bash
+    run: |
+      set -euo pipefail
+      REPORT="/tmp/gh-aw/agent/model-inventory/model-pins-summary.md"
+      if [ -s "$REPORT" ]; then
+        cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+      else
+        echo "### Workflow model pin audit unavailable" >> "$GITHUB_STEP_SUMMARY"
+        echo "The agent did not produce a source-based model pin audit." >> "$GITHUB_STEP_SUMMARY"
+      fi
+
+  - name: Upload live workflow model audit
+    if: always()
+    uses: actions/upload-artifact@v7.0.2
+    with:
+      name: model-pins
+      path: |
+        /tmp/gh-aw/agent/model-inventory/model-pins.json
+        /tmp/gh-aw/agent/model-inventory/model-pins-summary.md
+      if-no-files-found: warn
+      retention-days: 30
+
 sandbox:
   agent:
-    sudo: false
+    id: awf
 tools:
   cli-proxy: true
   playwright:
-    mode: cli
   bash:
     - "*"
   github:
     toolsets: [default]
+  agentic-workflows: true
 
 safe-outputs:
-  create-issue:
+  create-pull-request:
+    exclude-lock-yml: true
     expires: 7d
     title-prefix: "[model-inventory] "
     labels: [automation, models]
     max: 1
-    close-older-issues: true
+    close-older-pull-requests: true
 
 imports:
+  - shared/lock-safe-pull-request.md
   - shared/otlp.md
 features:
   gh-aw-detection: true
+evals:
+  - id: model_lists_queried
+    question: Did the agent query model inventories from OpenAI, Anthropic, Google, and Copilot APIs? Return UNKNOWN when the output records a skip-if-decision no-op before agent execution.
+  - id: updates_proposed_or_noop
+    question: Were updates to the builtin model alias mapping proposed, or was noop used when no changes were needed?
 ---
 
 # Daily Model Inventory Checker
+
+The AWF decision gate abstains until the agent has collected live Copilot reflect
+and pin-check evidence. Later invocations may skip only when no correction remains.
 
 You are an AI model catalog analyst for `${{ github.repository }}`.
 
@@ -300,6 +427,8 @@ them into:
 - Individual provider files: `/tmp/gh-aw/agent/model-inventory/artifacts/<provider>-models/models.json`
 - Raw provider responses: `/tmp/gh-aw/agent/model-inventory/artifacts/<provider>-models/raw.json`
 - Predownloaded models.dev API index: `/tmp/gh-aw/agent/model-inventory/models-dev/api.json`
+- Copilot SDK models: `/tmp/gh-aw/agent/model-inventory/artifacts/copilot-sdk-models/models.json`
+  (fetched through the Copilot CLI SDK; use each model's `billing` fields for pricing validation)
 - Copilot live provider metadata: `/tmp/gh-aw/agent/model-inventory/reflect.json` (generated in
   Step 0 below; filter `.endpoints[] | select(.provider == "copilot") | .models`). If the
   file contains an `error` field, treat Copilot data as unavailable for this run and
@@ -396,6 +525,30 @@ done < <(jq -c '.endpoints[]? | select(.configured == true and .models == null a
 echo "Copilot reflect metadata written to $OUT"
 ```
 
+### Step 0.5: Check Workflow Model Pins
+
+Call the `status` tool on the `gh-aw` agentic-workflows MCP with no pattern and use its workflow
+list as the inventory. The tool lists workflow names and status, not model configuration; read
+the corresponding Markdown source files in the current checkout and follow local imports and
+inline agent blocks. For remote imports, use the repository-scoped GitHub MCP read tools. Do not
+read `.lock.yml` manifests or assume they contain model inventory data.
+
+Compare Copilot model pins with `/tmp/gh-aw/agent/model-inventory/reflect.json` and aliases in
+`pkg/workflow/data/model_aliases.json`. Record exact live IDs, resolvable aliases, unavailable
+models, expressions, inherited/automatic selections, and non-Copilot providers separately.
+Mark the audit incomplete if any workflow, imported source, or required catalogue data could not
+be inspected; do not treat incomplete coverage as zero unresolvable pins.
+
+Write `/tmp/gh-aw/agent/model-inventory/model-pins.json` with `audit_complete`, `counts`, `pins`,
+and `errors`, and write a concise Markdown issue section to
+`/tmp/gh-aw/agent/model-inventory/model-pins-summary.md`. Include source file and field for each
+pin. `counts` must include `total`, `exact`, `alias`, `unresolvable`, and `not_checked`. For a
+remote import, honor its pinned ref; if no immutable ref is specified, resolve one with the
+GitHub MCP before reading. Mark the audit incomplete when a remote source cannot be read. Begin
+the summary with `### Action required` when any pin is unresolvable, otherwise
+`### Workflow model pins`. The post-agent steps append that summary to the Actions step summary
+and upload both files as the `model-pins` artifact.
+
 ### Step 1: Load and Validate the Inventory
 
 Read the combined inventory from `/tmp/gh-aw/agent/model-inventory/inventory.json`. Then read
@@ -487,74 +640,21 @@ mkdir -p "$(dirname "$OUT")"
 If playwright extraction fails or returns an empty `models` array, note this in the issue report and
 continue — treat billing multiplier validation as skipped for this run (same behaviour as before).
 
-### Step 3: Validate models.json pricing data
+### Step 3: Cross-check AWF pricing evidence
 
-Read the current built-in pricing payloads from:
+AWF owns the model pricing catalog. Do not create, refresh, or modify a pricing catalog
+in this repository.
 
-- `pkg/cli/data/models.json`
-- `actions/setup/js/models.json`
-
-Treat these two files as a mirrored pair: proposed updates must keep them identical.
-
-The Copilot pricing table is now in:
-
-- `/tmp/gh-aw/agent/model-inventory/artifacts/copilot-billing-models/models.json`
-
-This file was populated in Step 2.5 from:
-`https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing`.
-
-Use the Copilot reflect endpoint (`billing.multiplier`) and the docs pricing table as validation
-sources for `models.json` pricing fields. Prefer reflect data when available for Copilot model
-multiplier validation, and use docs table values as a secondary cross-check.
-
-Also validate Copilot SDK routing metadata in `models.json` for `github-copilot` models:
-- `provider_type` (for SDK provider selection)
-- `wire_api` when present (`responses` or `completions`, for OpenAI/Azure-compatible transport selection)
-
-When updating `models.json`, preserve or add `wire_api` for Copilot models where source data
-provides it. Keep `wire_api` absent for models/providers where it is not applicable.
+Cross-check the live Copilot SDK `billing` fields in
+`/tmp/gh-aw/agent/model-inventory/artifacts/copilot-sdk-models/models.json` against
+AWF reflect `billing.multiplier` fields in `/tmp/gh-aw/agent/model-inventory/reflect.json`.
+Use the documentation table in
+`/tmp/gh-aw/agent/model-inventory/artifacts/copilot-billing-models/models.json`
+as a secondary source. Report discrepancies with their source evidence as AWF follow-up
+items, not local pricing changes. Do not infer prices from model names or context limits.
 
 Treat `gpt-4o-mini`, `gpt-4.1`, `gpt-4o`, and `gpt-5.4-nano` as intentionally deprecated
-Copilot-facing model IDs. Keep ignoring them even if they appear in the reflect data, docs table,
-`models.dev`, or live provider inventories: do not propose adding or restoring them in
-`pkg/cli/data/models.json` (or `actions/setup/js/models.json`), and exclude them from
-missing/discrepancy tables.
-
-Use `models.dev/api.json` as the refresh source for the baseline `models.json` payload.
-When pricing updates are required, first run:
-
-```bash
-make refresh-models-json
-```
-
-Then validate/adjust pricing entries against reflect and docs-derived data.
-
-For each provider's enriched data, validate pricing/model coverage for each model:
-
-1. **Copilot reflect data** — use the `copilot` endpoint's `models` list from
-   `/tmp/gh-aw/agent/model-inventory/reflect.json` as the primary source. For each model, use
-   the `billing.multiplier` field as the authoritative ET multiplier value. Compare against the
-   matching `github/<model-id>` entry in `models.json`, and list discrepancies or missing models.
-   Cross-reference against the docs table as a secondary validation source.
-
-2. **Gemini API** — use `inputTokenLimit` / `outputTokenLimit` as an approximate proxy for model
-   complexity (this is an inference heuristic, not a definitive billing mapping).
-   Large-context, high-output-limit models typically correspond to higher-priced tiers; smaller
-   Flash models to lower-priced tiers. Flag any models whose limits suggest a pricing-tier change
-   versus what is currently in `models.json`.
-
-3. **OpenAI API** — use `owned_by` and model-ID naming conventions (e.g. `-mini`, `-nano`, `o1`,
-   `o3`) to cross-check current pricing tiers. Flag missing models or likely mismatches.
-
-4. **Anthropic API** — use `display_name` family grouping (haiku/sonnet/opus) to validate
-   current pricing tiers. Flag any new model IDs not yet in `models.json`.
-
-Produce a consolidated pricing gap table listing:
-- Models present in the live inventory but **missing** from `models.json` — include
-  the provider name for each model (e.g. "openai", "anthropic", "gemini", "copilot")
-- Models in `models.json` that are **not currently returned** by live APIs; keep these
-  in the payload as historical entries (do not propose automatic removals)
-- Models where the **inferred pricing tier or multiplier signal** differs from the stored pricing
+Copilot-facing model IDs and exclude them from missing/discrepancy tables.
 
 ### Step 4: Identify New or Updated Model Families
 
@@ -591,20 +691,26 @@ Focus on aliases that provide genuine value to workflow authors. Prioritize:
 - Adding new semantic task-oriented aliases
 - Updating patterns that are stale
 
-### Step 6: Create Issue
+### Step 6: Implement Updates and Create a Pull Request
 
-If you found any meaningful updates to propose, create a GitHub issue using `create_issue`.
+Implement evidence-backed alias, pricing, or unresolvable model-pin corrections. Preserve historical model entries and do not guess replacement pins. Validate the changed mappings and compile any changed workflow Markdown, commit locally, then call `create_pull_request`. If the source-based workflow audit is incomplete, report the missing coverage with `report_incomplete` instead of claiming no issues.
 
-**Issue title format**: `Model alias inventory update - YYYY-MM-DD`
+**Pull request title format**: `Model alias inventory update - YYYY-MM-DD`
 
-**Issue body structure** (use h3 `###` or lower — never h1/h2):
+**Workflow model pins**: start the pull request body with the contents of
+`/tmp/gh-aw/agent/model-inventory/model-pins-summary.md` from Step 0.5, copied verbatim (it
+begins with `### Action required` when any pin is unresolvable). Do not edit, reorder or summarize
+it. If `counts.unresolvable` in `model-pins.json` is greater than 0,
+the title must be `Model alias inventory - action required - YYYY-MM-DD`. Implement only replacements supported by live evidence; if none can be validated, report the blocker rather than creating an empty pull request.
+
+**Pull request body structure** (use h3 `###` or lower — never h1/h2):
 
 ```markdown
 ### Summary
 
 Brief description of what was found.
 
-- Providers queried: OpenAI, Anthropic, Gemini, Copilot
+- Providers queried: OpenAI, Anthropic, Gemini, Copilot SDK, Copilot (reflect)
 - Total models found: <count>
 - Proposed alias changes: <count>
 - Pricing gaps found: <count>
@@ -616,32 +722,18 @@ Brief description of what was found.
 | openai   | 42              | ✅ ok  |
 | anthropic | 15             | ✅ ok  |
 | gemini   | 28              | ✅ ok  |
-| copilot  | 35              | ✅ ok  |
+| copilot-sdk | 35          | ✅ ok  |
+| copilot (reflect) | 35    | ✅ ok  |
 
 ### Raw API Fields Discovered
 
 For each provider, list noteworthy fields found in the raw response that are now captured
 in the enriched `models.json` artifact (context limits, capabilities, billing fields, etc.).
 
-### models.json Pricing Analysis
+### AWF Pricing Follow-up
 
-#### Missing from models.json
-
-| Model ID | Provider | Inferred Pricing | Basis |
-|----------|----------|-----------------:|-------|
-| ...      | ...      | ...              | ...   |
-
-#### Historical entries not currently returned
-
-List model IDs that appear in `models.json` but are absent from all live inventories.
-Treat these as historical records that should remain in the payload unless a human explicitly
-decides to delete them.
-
-#### Inferred vs stored pricing discrepancies
-
-| Model ID | Stored Pricing | Inferred Pricing | Inferred From |
-|----------|---------------:|-----------------:|---------------|
-| ...      | ...            | ...              | ...           |
+List discrepancies between AWF reflect, Copilot SDK billing, and documentation pricing
+with their source evidence. Pricing catalog changes belong in AWF, not this repository.
 
 ### Proposed Alias Updates
 
@@ -663,9 +755,8 @@ Any caveats, historical entries retained, or aliases that are already well-cover
 ```
 
 If no updates are needed (all live models are already covered by existing aliases, all
-`models.json` pricing entries are up to date, and no new task-oriented aliases are warranted), create an issue with
-title `Model alias inventory - no changes needed - YYYY-MM-DD` and a brief summary confirming
-coverage is up to date.
+no new task-oriented aliases are warranted, and
+`audit_complete` is true with `counts.unresolvable` in `model-pins.json` equal to 0), call `noop` with a brief summary confirming coverage is up to date. Do not create a report-only pull request. Never report no changes needed when any workflow model pin is unresolvable.
 
 
 ### Output Format

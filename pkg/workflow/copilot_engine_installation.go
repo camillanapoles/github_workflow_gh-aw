@@ -3,11 +3,10 @@
 // This file contains functions for generating GitHub Actions steps to install
 // the GitHub Copilot CLI and related sandbox infrastructure (AWF or SRT).
 //
-// Installation order:
+// Installation includes:
 //  1. Secret validation (COPILOT_GITHUB_TOKEN) — runs in the activation job
-//  2. Node.js setup
-//  3. Sandbox installation (SRT or AWF, if needed)
-//  4. Copilot CLI installation
+//  2. Sandbox installation (SRT or AWF, if needed)
+//  3. Copilot CLI installation
 //
 // The installation strategy differs based on sandbox mode:
 //   - Standard mode: Global installation using official installer script
@@ -17,6 +16,7 @@
 package workflow
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 
@@ -30,9 +30,21 @@ type copilotSDKInstallSpec struct {
 	runtimeID string
 	stepName  string
 	command   string
+	// runLines, if non-empty, generates a "run: |" multiline step instead of "run: <command>".
+	runLines []string
 }
 
 const workspaceCommandPrefix = `cd "${GITHUB_WORKSPACE}" && `
+const copilotSDKNodeTargetDir = constants.GhAwRootDirShell + "/engine-cli/copilot-sdk"
+const copilotSDKNodeInstallCommand = `npm install --prefix "` + copilotSDKNodeTargetDir + `" --ignore-scripts --no-save `
+const copilotSDKPythonTargetDir = `${GITHUB_WORKSPACE}/.gh-aw/copilot-sdk/python`
+const copilotSDKWebFetchDependency = "undici@6.28.0"
+
+// inlineMavenVersion is the pinned Maven version used to bootstrap Maven for inline Java drivers
+// on runners that don't have it pre-installed (e.g. self-hosted). GitHub-hosted runners already
+// have Maven, so the bootstrap is a no-op there. The binary is fetched from repo.maven.apache.org
+// which is already in the Java ecosystem firewall allowlist.
+const inlineMavenVersion = "3.9.9"
 
 // getWorkspaceCommandPrefixFor returns the shell cd prefix for engine command generation.
 // When engine.cwd is configured it returns a prefix that changes to ${GH_AW_ENGINE_CWD}
@@ -48,89 +60,122 @@ func getWorkspaceCommandPrefixFor(config *EngineConfig) string {
 // GetSecretValidationStep returns the secret validation step for the Copilot engine.
 // Returns an empty step if:
 //   - permissions.copilot-requests is set to write (uses GitHub Actions token instead), or
-//   - COPILOT_PROVIDER_BASE_URL, COPILOT_PROVIDER_API_KEY, or COPILOT_PROVIDER_BEARER_TOKEN is set in engine.env
+//   - COPILOT_PROVIDER_BASE_URL, COPILOT_PROVIDER_API_KEY, or COPILOT_PROVIDER_BEARER_TOKEN is set to a non-empty value in engine.env
 //     (BYOK mode — the external provider handles authentication, so COPILOT_GITHUB_TOKEN
 //     is not required for model routing).
 func (e *CopilotEngine) GetSecretValidationStep(workflowData *WorkflowData) GitHubActionStep {
 	provider := e.ResolveLLMProvider(workflowData)
-	if provider == LLMProviderGitHub && hasCopilotRequestsWritePermission(workflowData) {
-		copilotInstallLog.Print("Skipping secret validation step: permissions.copilot-requests=write enabled, using GitHub Actions token")
-		return GitHubActionStep{}
+	return BuildEngineSecretValidationStep(workflowData, EngineSecretValidationConfig{
+		SecretNames: llmProviderSecretNames(provider),
+		EngineName:  "GitHub Copilot CLI",
+		DocsURL:     llmProviderDocsURL(provider),
+		Skip: func(workflowData *WorkflowData) bool {
+			if provider == LLMProviderGitHub && hasCopilotRequestsWritePermission(workflowData) {
+				copilotInstallLog.Print("Skipping secret validation step: permissions.copilot-requests=write enabled, using GitHub Actions token")
+				return true
+			}
+			if engineEnvHasNonEmptyValue(workflowData, constants.CopilotProviderBaseURL) ||
+				engineEnvHasNonEmptyValue(workflowData, constants.CopilotProviderAPIKey) ||
+				engineEnvHasNonEmptyValue(workflowData, constants.CopilotProviderBearerToken) {
+				copilotInstallLog.Print("Skipping COPILOT_GITHUB_TOKEN validation: BYOK provider credentials are configured")
+				return true
+			}
+			return false
+		},
+	})
+}
+
+// GetSecretFailureMessage returns a Copilot-specific guidance message shown in the agentic
+// failure issue when the COPILOT_GITHUB_TOKEN secret validation step fails. The message
+// explains the permissions: copilot-requests: write alternative that avoids the need for a
+// personal access token when an organization Copilot subscription is available.
+//
+// When the workflow uses a non-GitHub provider (engine.model-provider: openai or anthropic),
+// the copilot-requests: write permission does not apply and an empty string is returned instead.
+func (e *CopilotEngine) GetSecretFailureMessage(workflowData *WorkflowData) string {
+	if e.ResolveLLMProvider(workflowData) != LLMProviderGitHub {
+		return ""
 	}
-	if engineEnvHasKey(workflowData, constants.CopilotProviderBaseURL) ||
-		engineEnvHasKey(workflowData, constants.CopilotProviderAPIKey) ||
-		engineEnvHasKey(workflowData, constants.CopilotProviderBearerToken) {
-		copilotInstallLog.Print("Skipping COPILOT_GITHUB_TOKEN validation: BYOK provider credentials are configured")
-		return GitHubActionStep{}
-	}
-	return BuildDefaultSecretValidationStep(
-		workflowData,
-		llmProviderSecretNames(provider),
-		"GitHub Copilot CLI",
-		llmProviderDocsURL(provider),
-	)
+	return "**Alternative**: If your organization has a Copilot subscription, you can avoid the need for a personal access token by adding a top-level `permissions` block to your workflow file. " +
+		"This enables Copilot inference through the org using the built-in GitHub Actions token.\n" +
+		"\n```yaml\npermissions:\n  copilot-requests: write\n```\n" +
+		"\nSee: https://github.github.com/gh-aw/reference/engines/#github-copilot-default"
 }
 
 // GetInstallationSteps generates the complete installation workflow for Copilot CLI.
 // This includes Node.js setup, sandbox installation (SRT or AWF), and Copilot CLI installation.
 // Secret validation is handled separately in the activation job via GetSecretValidationStep.
-// The installation order is:
-// 1. Node.js setup
-// 2. Sandbox installation (AWF, if needed)
-// 3. Copilot CLI installation
+// The generated steps include Copilot CLI installation and sandbox installation
+// (AWF, if needed).
 //
 // If a custom command is specified in the engine configuration, this function skips
 // standard Copilot CLI installation. When firewall is enabled, it still returns AWF
 // runtime installation steps required for harness execution.
 func (e *CopilotEngine) GetInstallationSteps(workflowData *WorkflowData) []GitHubActionStep {
 	copilotInstallLog.Printf("Generating installation steps for Copilot engine: workflow=%s", workflowData.Name)
+	inlineDriverWriteStep := buildInlineCopilotSDKDriverWriteStep(workflowData)
 	sdkInstallStep := buildCopilotSDKInstallStep(workflowData)
 
 	// Skip standard Copilot CLI installation if custom command is specified.
 	if workflowData.EngineConfig != nil && workflowData.EngineConfig.Command != "" {
-		// Keep firewall runtime installation when firewall is enabled, since the
-		// custom engine command still runs inside the AWF harness.
-		if isFirewallEnabled(workflowData) {
-			copilotInstallLog.Printf("Skipping Copilot CLI installation: custom command specified (%s); keeping AWF runtime installation because firewall is enabled", workflowData.EngineConfig.Command)
-			var steps []GitHubActionStep
-			if len(sdkInstallStep) > 0 {
-				steps = append(steps, sdkInstallStep)
-			}
-			return appendCopilotLSPInstallSteps(BuildNpmEngineInstallStepsWithAWF(steps, workflowData), workflowData)
-		}
-		if len(sdkInstallStep) > 0 {
-			copilotInstallLog.Printf("Skipping Copilot CLI installation: custom command specified (%s); keeping Copilot SDK install step", workflowData.EngineConfig.Command)
-			return appendCopilotLSPInstallSteps([]GitHubActionStep{sdkInstallStep}, workflowData)
-		}
-		copilotInstallLog.Printf("Skipping installation steps: custom command specified (%s)", workflowData.EngineConfig.Command)
-		return appendCopilotLSPInstallSteps([]GitHubActionStep{}, workflowData)
+		return getCustomCopilotCommandInstallationSteps(workflowData, inlineDriverWriteStep, sdkInstallStep)
 	}
 
-	// Copilot CLI is pinned to the default version constant.
-	copilotVersion := string(constants.DefaultCopilotVersion)
+	// Keep EngineConfig unchanged so detection/eval clones resolve the same default.
+	// The shared installer generator binds an omitted version to the compiler's
+	// reviewed default version and checksum instead of resolving it at runtime.
+	copilotVersion := ""
 	if workflowData.EngineConfig != nil {
 		if workflowData.EngineConfig.Version != "" {
-			copilotInstallLog.Printf("Ignoring pinned engine.version (%s): Copilot CLI install version is pinned to %s", workflowData.EngineConfig.Version, copilotVersion)
+			copilotVersion = workflowData.EngineConfig.Version
+			copilotInstallLog.Printf("Using engine.version for Copilot CLI installation: %s", copilotVersion)
+		} else {
+			copilotInstallLog.Printf("No engine.version specified; using compiler default version and checksum")
 		}
-		// Normalize engine config version to effective installed version so
-		// downstream checks that consult EngineConfig.Version stay consistent.
-		// This applies even when the original version was empty (unset), so all
-		// downstream consumers observe the effective installed value.
-		// This mutates workflowData by design because subsequent generation steps
-		// in the same compile flow should observe the effective installed version.
-		// Callers that reuse the same WorkflowData instance should expect this
-		// field to be rewritten after installation-step generation.
-		workflowData.EngineConfig.Version = copilotVersion
 	}
 
 	// Use the installer script for global installation
 	copilotInstallLog.Print("Using new installer script for Copilot installation")
-	npmSteps := GenerateCopilotInstallerSteps(copilotVersion, "Install GitHub Copilot CLI")
+	// Unprivileged native runners and ARC/DinD runners may not have sudo.
+	// Pass --rootless so the script installs to ~/.local/bin without sudo.
+	// The "Copy Copilot CLI to daemon-visible path" step in nodejs.go then copies from
+	// the rootless location to ${RUNNER_TEMP}/gh-aw/bin/copilot where AWF expects it.
+	rootless := useRootlessCLIInstallation(workflowData)
+	compiledVersion := workflowData.CompiledVersion
+	checksumsSHA256 := ""
+	if workflowData.EngineConfig != nil {
+		checksumsSHA256 = workflowData.EngineConfig.ChecksumsSHA256
+	}
+	npmSteps := generateCopilotInstallerSteps(copilotVersion, "Install GitHub Copilot CLI", rootless, compiledVersion, string(constants.CopilotSessionIDMinVersion), getNVXGuestLibc(workflowData), checksumsSHA256, resolveEngineCooldownDays(workflowData))
+	if len(inlineDriverWriteStep) > 0 {
+		npmSteps = append(npmSteps, inlineDriverWriteStep)
+	}
 	if len(sdkInstallStep) > 0 {
 		npmSteps = append(npmSteps, sdkInstallStep)
 	}
-	steps := BuildNpmEngineInstallStepsWithAWF(npmSteps, workflowData)
+	steps := buildNpmEngineInstallStepsWithAWF(npmSteps, workflowData, true)
 
+	return appendCopilotLSPInstallSteps(steps, workflowData)
+}
+
+func getCustomCopilotCommandInstallationSteps(workflowData *WorkflowData, inlineDriverWriteStep, sdkInstallStep GitHubActionStep) []GitHubActionStep {
+	var steps []GitHubActionStep
+	if len(inlineDriverWriteStep) > 0 {
+		steps = append(steps, inlineDriverWriteStep)
+	}
+	if len(sdkInstallStep) > 0 {
+		steps = append(steps, sdkInstallStep)
+	}
+
+	if isFirewallEnabled(workflowData) {
+		copilotInstallLog.Printf("Skipping Copilot CLI installation: custom command specified (%s); keeping AWF runtime installation because firewall is enabled", workflowData.EngineConfig.Command)
+		return appendCopilotLSPInstallSteps(buildNpmEngineInstallStepsWithAWF(steps, workflowData, false), workflowData)
+	}
+	if len(sdkInstallStep) > 0 {
+		copilotInstallLog.Printf("Skipping Copilot CLI installation: custom command specified (%s); keeping Copilot SDK install step", workflowData.EngineConfig.Command)
+	} else {
+		copilotInstallLog.Printf("Skipping installation steps: custom command specified (%s)", workflowData.EngineConfig.Command)
+	}
 	return appendCopilotLSPInstallSteps(steps, workflowData)
 }
 
@@ -151,6 +196,11 @@ func buildCopilotSDKInstallStep(workflowData *WorkflowData) GitHubActionStep {
 	if workflowData == nil || workflowData.EngineConfig == nil || !workflowData.EngineConfig.CopilotSDK {
 		return GitHubActionStep{}
 	}
+	if inlineRuntimeID := copilotSDKInlineDriverRuntimeID(workflowData); inlineRuntimeID != "" {
+		spec := getInlineCopilotSDKInstallSpec(inlineRuntimeID)
+		copilotInstallLog.Printf("copilot-sdk enabled with inline driver; runtime=%s; install command=%s", spec.runtimeID, spec.command)
+		return specToInstallStep(spec, resolveEngineCooldownDays(workflowData))
+	}
 	// When a custom SDK driver is configured without a custom engine command, use the driver's
 	// file extension to determine which language SDK to install. This ensures the correct SDK
 	// package manager command is generated (e.g., pip for .py drivers, ruby/gem for .rb drivers).
@@ -160,16 +210,49 @@ func buildCopilotSDKInstallStep(workflowData *WorkflowData) GitHubActionStep {
 	}
 	spec := getCopilotSDKInstallSpec(command)
 	copilotInstallLog.Printf("copilot-sdk enabled; runtime=%s; install command=%s", spec.runtimeID, spec.command)
-	return GitHubActionStep{
+	return specToInstallStep(spec, resolveEngineCooldownDays(workflowData))
+}
+
+// specToInstallStep converts a copilotSDKInstallSpec into a GitHubActionStep.
+// When the spec has runLines set it emits a "run: |" multi-line block; otherwise
+// it emits a single "run: <command>" line.
+func specToInstallStep(spec copilotSDKInstallSpec, cooldownDays int) GitHubActionStep {
+	installCommand := spec.command
+	if len(spec.runLines) > 0 {
+		installCommand = strings.Join(spec.runLines, "\n")
+	}
+	usesNpm := strings.Contains(installCommand, "npm install ")
+	if len(spec.runLines) > 0 {
+		step := GitHubActionStep{
+			"      - name: " + spec.stepName,
+			"        run: |",
+		}
+		for _, line := range spec.runLines {
+			step = append(step, "          "+line)
+		}
+		if usesNpm {
+			step = append(step,
+				"        env:",
+				fmt.Sprintf("          NPM_CONFIG_MIN_RELEASE_AGE: '%d'", cooldownDays),
+			)
+		}
+		return step
+	}
+	step := GitHubActionStep{
 		"      - name: " + spec.stepName,
 		"        run: " + spec.command,
 	}
+	if usesNpm {
+		step = append(step, "        env:", fmt.Sprintf("          NPM_CONFIG_MIN_RELEASE_AGE: '%d'", cooldownDays))
+	}
+	return step
 }
 
 // sdkDriverInstallCommand returns a synthetic command string for the given driver filename
 // that can be passed to getCopilotSDKInstallSpec/detectRuntimeFromCopilotCommand to select
-// the correct SDK package manager. Only non-JS language extensions need special handling;
-// JS drivers and arbitrary commands (no extension) fall back to the Node.js default.
+// the correct SDK package manager. Python and Ruby extensions need special handling;
+// JS, TypeScript, and arbitrary commands (no extension) fall back to the Node.js default.
+// TypeScript uses Node.js native support (Node 24+) so no extra toolchain install is needed.
 func sdkDriverInstallCommand(driverName string) string {
 	ext := strings.ToLower(filepath.Ext(driverName))
 	switch ext {
@@ -177,10 +260,8 @@ func sdkDriverInstallCommand(driverName string) string {
 		return "python3 " + driverName
 	case ".rb":
 		return "ruby " + driverName
-	case ".ts", ".mts":
-		return "ts-node " + driverName
 	default:
-		// .js/.cjs/.mjs and no-extension (arbitrary commands) default to Node.js.
+		// .js/.cjs/.mjs, .ts/.mts, and no-extension (arbitrary commands) default to Node.js.
 		return ""
 	}
 }
@@ -192,16 +273,20 @@ func getCopilotSDKInstallSpec(command string) copilotSDKInstallSpec {
 	spec := copilotSDKInstallSpec{
 		runtimeID: runtimeID,
 		stepName:  "Install GitHub Copilot SDK (Node.js)",
-		command:   workspaceCommandPrefix + "npm install --ignore-scripts --no-save @github/copilot-sdk@" + version,
+		command:   copilotSDKNodeInstallCommand + "@github/copilot-sdk@" + version + " " + copilotSDKWebFetchDependency,
 	}
 
 	switch runtimeID {
 	case "python":
 		spec.stepName = "Install GitHub Copilot SDK (Python)"
-		spec.command = workspaceCommandPrefix + "python3 -m pip install --disable-pip-version-check github-copilot-sdk==" + version
+		spec.command = workspaceCommandPrefix + fmt.Sprintf(
+			`mkdir -p "%[1]s" && python3 -m pip install --disable-pip-version-check --target "%[1]s" github-copilot-sdk==%[2]s`,
+			copilotSDKPythonTargetDir,
+			version,
+		)
 	case "typescript":
 		spec.stepName = "Install GitHub Copilot SDK (TypeScript)"
-		spec.command = workspaceCommandPrefix + "npm install --ignore-scripts --no-save @github/copilot-sdk@" + version + " ts-node typescript"
+		spec.command = copilotSDKNodeInstallCommand + "@github/copilot-sdk@" + version + " " + copilotSDKWebFetchDependency + " ts-node@10.9.2 typescript@5.8.3"
 	case "go":
 		spec.stepName = "Install GitHub Copilot SDK (Go)"
 		spec.command = workspaceCommandPrefix + "go get github.com/github/copilot-sdk/go@v" + version
@@ -214,6 +299,61 @@ func getCopilotSDKInstallSpec(command string) copilotSDKInstallSpec {
 	case "java":
 		spec.stepName = "Install GitHub Copilot SDK (Java)"
 		spec.command = workspaceCommandPrefix + "mvn -q org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get -Dartifact=com.github:copilot-sdk-java:" + version
+	}
+
+	return spec
+}
+
+func getInlineCopilotSDKInstallSpec(runtimeID string) copilotSDKInstallSpec {
+	version := string(constants.DefaultCopilotSDKVersion)
+
+	spec := copilotSDKInstallSpec{
+		runtimeID: runtimeID,
+		stepName:  "Install GitHub Copilot SDK (Node.js)",
+		command:   copilotSDKNodeInstallCommand + "@github/copilot-sdk@" + version + " " + copilotSDKWebFetchDependency,
+	}
+
+	switch runtimeID {
+	case "python":
+		spec.stepName = "Install GitHub Copilot SDK (Python)"
+		spec.command = workspaceCommandPrefix + fmt.Sprintf(
+			`mkdir -p "%[1]s" && python3 -m pip install --disable-pip-version-check --target "%[1]s" github-copilot-sdk==%[2]s`,
+			copilotSDKPythonTargetDir,
+			version,
+		)
+	case "go":
+		spec.stepName = "Install GitHub Copilot SDK (Go)"
+		// Fetch the SDK and compile the driver to a binary in one step.
+		// Using a pre-compiled binary eliminates per-invocation `go run` recompilation
+		// and removes the Go toolchain requirement from the agent's runtime path.
+		goSrcFile := inlineCopilotSDKDriverGoPath[strings.LastIndex(inlineCopilotSDKDriverGoPath, "/")+1:]
+		goBinFile := inlineCopilotSDKDriverGoBinPath[strings.LastIndex(inlineCopilotSDKDriverGoBinPath, "/")+1:]
+		spec.command = fmt.Sprintf(
+			`mkdir -p "${GITHUB_WORKSPACE}/%[1]s" && cd "${GITHUB_WORKSPACE}/%[1]s" && go get github.com/github/copilot-sdk/go@v%[2]s && go build -o "%[4]s" "./%[3]s"`,
+			inlineCopilotSDKDriverDir,
+			version,
+			goSrcFile,
+			goBinFile,
+		)
+	case "java":
+		spec.stepName = "Install GitHub Copilot SDK (Java)"
+		classpathFile := inlineCopilotSDKDriverJavaClassPath[strings.LastIndex(inlineCopilotSDKDriverJavaClassPath, "/")+1:]
+		spec.runLines = []string{
+			`# Bootstrap Maven if not already available (e.g. self-hosted runners).`,
+			`# GitHub-hosted runners have Maven pre-installed; this is a no-op there.`,
+			`if ! command -v mvn >/dev/null 2>&1; then`,
+			`  MAVEN_HOME="${RUNNER_TEMP:-/tmp}/apache-maven-` + inlineMavenVersion + `"`,
+			`  if [ ! -d "${MAVEN_HOME}" ]; then`,
+			`    curl -fsSL "https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/` + inlineMavenVersion + `/apache-maven-` + inlineMavenVersion + `-bin.tar.gz" \`,
+			`      | tar -xzf - -C "${RUNNER_TEMP:-/tmp}"`,
+			`  fi`,
+			`  export PATH="${MAVEN_HOME}/bin:${PATH}"`,
+			`fi`,
+			fmt.Sprintf(`cd "${GITHUB_WORKSPACE}/%s" && mvn -q dependency:build-classpath -Dmdep.outputFile="%s"`,
+				inlineCopilotSDKDriverDir,
+				classpathFile,
+			),
+		}
 	}
 
 	return spec
@@ -246,7 +386,11 @@ func firstCommandToken(command string) string {
 	if len(fields) == 0 {
 		return ""
 	}
-	token := normalizeCommandToken(fields[0])
+	token := ""
+	for _, field := range fields {
+		token = normalizeCommandToken(field)
+		break
+	}
 	if token != "env" {
 		return token
 	}
@@ -297,12 +441,18 @@ func generateAWFInstallationStep(version string, agentConfig *AgentSandboxConfig
 	}
 
 	installCmd := "bash \"${RUNNER_TEMP}/gh-aw/actions/install_awf_binary.sh\" " + version
-	// When sudo is false (network isolation mode), AWF runs rootless: pass --rootless
-	// so the install script installs into $HOME/.local/{bin,lib/awf} (always writable,
-	// even on standard GitHub-hosted runners where /usr/local is root-owned) and exports
+	if agentConfig != nil && agentConfig.ChecksumsSHA256 != "" {
+		installCmd += " --checksums-sha256 " + agentConfig.ChecksumsSHA256
+	}
+	// Rootless runtime profiles run AWF as the runner user: pass --rootless so the
+	// install script installs into $HOME/.local/{bin,lib/awf} (always writable, even on
+	// standard GitHub-hosted runners where /usr/local is root-owned) and exports
 	// $GITHUB_PATH so the bare awf invocation in later steps resolves correctly.
-	// Also check Disabled to match isAWFNetworkIsolationEnabled() behavior.
-	if agentConfig != nil && agentConfig.NetworkIsolation && !agentConfig.Disabled {
+	//
+	// Exceptions: the docker-sudo-iptables and cloud-hypervisor profiles use privileged
+	// AWF invocations, so the binary must be installed to /usr/local/bin to be on
+	// sudo's secure_path.
+	if agentConfig != nil && !agentConfig.Disabled && resolveSandboxRuntimeProfile(agentConfig).Rootless {
 		installCmd += " --rootless"
 	}
 
@@ -314,76 +464,121 @@ func generateAWFInstallationStep(version string, agentConfig *AgentSandboxConfig
 	return GitHubActionStep(stepLines)
 }
 
+// Docker enclaves keep the orchestrator rootless and delegate storage operations
+// only to the authenticated, version-matched upstream helper.
+const dockerEnclaveHelperInstallerSHA = "cff7d304f9a3fa7240dda32a101aef1bf2dad828759f8d1ecddea22ea2798cb7"
+
+func generateDockerEnclaveStorageHelperInstallStep(version string, agentConfig *AgentSandboxConfig) GitHubActionStep {
+	if agentConfig != nil && agentConfig.Command != "" {
+		return GitHubActionStep{}
+	}
+	if version == "" {
+		version = string(constants.DefaultFirewallVersion)
+	}
+	version = "v" + strings.TrimPrefix(version, "v")
+	if !versionAtLeast(version, string(constants.DefaultFirewallVersion), string(constants.AWFDockerEnclaveSetupMinVersion)) {
+		return GitHubActionStep{}
+	}
+	step := GitHubActionStep{
+		"      - name: Install authenticated Docker enclave storage helper",
+		"        shell: bash",
+		"        env:",
+		"          AWF_HELPER_VERSION: " + version,
+	}
+	if agentConfig != nil && agentConfig.ChecksumsSHA256 != "" {
+		step = append(step, "          AWF_HELPER_CHECKSUMS_SHA256: "+agentConfig.ChecksumsSHA256)
+	}
+	step = append(step, "        run: |")
+	step = append(step, dockerEnclaveStorageHelperSetupLines()...)
+	step = append(step, dockerEnclaveStorageHelperReleaseLines()...)
+	step = append(step, dockerEnclaveStorageHelperInstallLines()...)
+	step = append(step, dockerEnclaveStorageHelperProbeLines()...)
+	return step
+}
+
+func dockerEnclaveStorageHelperSetupLines() []string {
+	return []string{
+		`          set -euo pipefail`,
+		`          test "$(/usr/bin/id -u)" -ne 0`,
+		`          test -x /usr/bin/python3`,
+		`          test -x /usr/bin/sudo`,
+		`          test -x /usr/sbin/visudo`,
+		`          source "${RUNNER_TEMP}/gh-aw/actions/release_integrity.sh"`,
+		`          checksums_sha256=$(release_artifact_sha256 github/gh-aw-firewall "$AWF_HELPER_VERSION" checksums.txt "${AWF_HELPER_CHECKSUMS_SHA256:-}")`,
+		`          install_dir="${RUNNER_TEMP}/awf-helper-install-$$-${RANDOM}"`,
+		`          mkdir -m 700 "$install_dir"`,
+		`          installer_dir=""`,
+		`          cleanup() {`,
+		`            rm -f "$install_dir/checksums.txt" "$install_dir/enclave-storage-helper.py"`,
+		`            rmdir "$install_dir"`,
+		`            if [[ -n "$installer_dir" ]]; then /usr/bin/sudo -n /usr/bin/rm -rf -- "$installer_dir"; fi`,
+		`          }`,
+		`          trap cleanup EXIT`,
+	}
+}
+
+func dockerEnclaveStorageHelperReleaseLines() []string {
+	return []string{
+		`          curl --proto '=https' --proto-redir '=https' -fsSL --retry 8 --retry-max-time 180 --connect-timeout 15 --max-time 60 \`,
+		`            "https://github.com/github/gh-aw-firewall/releases/download/$AWF_HELPER_VERSION/checksums.txt" \`,
+		`            -o "$install_dir/checksums.txt"`,
+		`          verify_release_digest "$install_dir/checksums.txt" "$checksums_sha256"`,
+		`          helper_sha256=$(awk '$2 == "enclave-storage-helper.py" { count++; digest = $1 } END { if (count != 1 || digest !~ /^[0-9a-f]{64}$/) exit 1; print digest }' "$install_dir/checksums.txt")`,
+		`          curl --proto '=https' --proto-redir '=https' -fsSL --retry 8 --retry-max-time 180 --connect-timeout 15 --max-time 60 \`,
+		`            "https://github.com/github/gh-aw-firewall/releases/download/$AWF_HELPER_VERSION/enclave-storage-helper.py" \`,
+		`            -o "$install_dir/enclave-storage-helper.py"`,
+		`          verify_release_digest "$install_dir/enclave-storage-helper.py" "$helper_sha256"`,
+	}
+}
+
+func dockerEnclaveStorageHelperInstallLines() []string {
+	return []string{
+		`          installer_dir=$(/usr/bin/sudo -n /usr/bin/mktemp -d /var/lib/awf-helper-install.XXXXXX)`,
+		`          [[ "$installer_dir" == /var/lib/awf-helper-install.* ]]`,
+		`          installer_path="$installer_dir/install_awf_enclave_helper.py"`,
+		`          /usr/bin/sudo -n /usr/bin/install -o root -g root -m 0500 -- "${RUNNER_TEMP}/gh-aw/actions/install_awf_enclave_helper.py" "$installer_path"`,
+		`          installer_sha256=$(/usr/bin/sudo -n /usr/bin/sha256sum "$installer_path")`,
+		`          [[ "${installer_sha256%% *}" == "` + dockerEnclaveHelperInstallerSHA + `" ]]`,
+		`          runner_uid=$(/usr/bin/id -u)`,
+		`          /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C /usr/bin/sudo -n -- /usr/bin/python3 -I "$installer_path" "$install_dir/checksums.txt" "$install_dir/enclave-storage-helper.py" "$checksums_sha256" "$helper_sha256" "${AWF_HELPER_VERSION#v}" "$runner_uid"`,
+	}
+}
+
+func dockerEnclaveStorageHelperProbeLines() []string {
+	return []string{
+		`          /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C /usr/bin/sudo -n -- \`,
+		`            /usr/bin/python3 -I /var/lib/awf/enclave-storage-helper.py probe "${AWF_HELPER_VERSION#v}" \`,
+		`            | /usr/bin/python3 -I -c 'import json, os, sys; p = json.load(sys.stdin); assert p == {"version": sys.argv[1], "uid": os.getuid(), "maxBytes": 4 * 1024**3, "stateRoot": "/var/lib/awf/enclave-storage/" + str(os.getuid()) + "/host-state"}, p' "${AWF_HELPER_VERSION#v}"`,
+	}
+}
+
 // generateDockerComposeInstallStep creates a step that installs the Docker Compose
 // CLI plugin. ARC/DinD runners may not have Docker Compose pre-installed, but AWF
 // requires it to orchestrate the squid-proxy, agent, and api-proxy containers.
 func generateDockerComposeInstallStep() GitHubActionStep {
 	return GitHubActionStep([]string{
 		"      - name: Install Docker Compose plugin",
+		"        shell: bash",
 		"        run: |",
+		`          set -euo pipefail`,
 		`          export DOCKER_CONFIG="${DOCKER_CONFIG:-$HOME/.docker}"`,
 		`          mkdir -p "$DOCKER_CONFIG/cli-plugins"`,
 		`          arch="$(uname -m)"`,
-		`          case "$arch" in x86_64|amd64) arch="x86_64" ;; aarch64|arm64) arch="aarch64" ;; *) echo "Unsupported architecture for docker compose plugin: $arch" >&2; exit 1 ;; esac`,
-		`          curl -fsSL "https://github.com/docker/compose/releases/download/v2.36.2/docker-compose-linux-$arch" -o "$DOCKER_CONFIG/cli-plugins/docker-compose"`,
-		`          chmod +x "$DOCKER_CONFIG/cli-plugins/docker-compose"`,
+		`          case "$arch" in x86_64|amd64) arch="x86_64"; digest="9040bd35b2cc0783ce6c5de491de7e52e24d4137dbfc5de8a524f718fc23556c" ;; aarch64|arm64) arch="aarch64"; digest="d1148609319706a57b755ff0f61d604a63a8cf57adb24c17535baa766ff14b4f" ;; *) echo "Unsupported architecture for docker compose plugin: $arch" >&2; exit 1 ;; esac`,
+		`          download="$(mktemp)"`,
+		`          trap 'rm -f "$download"' EXIT`,
+		`          curl --proto '=https' --proto-redir '=https' -fsSL "https://github.com/docker/compose/releases/download/v2.36.2/docker-compose-linux-$arch" -o "$download"`,
+		`          if command -v sha256sum >/dev/null 2>&1; then`,
+		`            actual="$(sha256sum "$download")"`,
+		`          elif command -v shasum >/dev/null 2>&1; then`,
+		`            actual="$(shasum -a 256 "$download")"`,
+		`          else`,
+		`            echo "ERROR: No sha256sum or shasum found" >&2; exit 1`,
+		`          fi`,
+		`          if [[ "${actual%% *}" != "$digest" ]]; then`,
+		`            echo "ERROR: Trusted SHA256 verification failed for Docker Compose; refusing installation" >&2; exit 1`,
+		`          fi`,
+		`          install -m 0755 "$download" "$DOCKER_CONFIG/cli-plugins/docker-compose"`,
 		`          docker compose version`,
-	})
-}
-
-// generateGVisorInstallStep creates a GitHub Actions step that downloads, installs,
-// and verifies the gVisor (runsc) container runtime. This step must run BEFORE the
-// AWF invocation step so that Docker can start the agent container under runsc.
-//
-// Key implementation notes:
-//   - Pins to constants.DefaultGVisorVersion rather than "latest" for reproducible,
-//     verifiable installs. Each binary is verified against its official SHA-512 file
-//     before being installed with root privileges, matching the pattern used by the
-//     adjacent AWF installer.
-//   - Uses uname -m directly (x86_64, aarch64) — gVisor download URLs use raw arch names.
-//   - Restarts Docker with `systemctl restart` (NOT reload): Docker's SIGHUP reload does
-//     not call setHostGatewayIP(), which breaks --add-host host.docker.internal:host-gateway.
-//   - Downloads both runsc and containerd-shim-runsc-v1; the shim is required for Docker's
-//     containerd integration.
-func generateGVisorInstallStep() GitHubActionStep {
-	version := constants.DefaultGVisorVersion
-	return GitHubActionStep([]string{
-		"      - name: Install gVisor (runsc)",
-		"        run: |",
-		"          set -euo pipefail",
-		"",
-		`          echo "::group::Install gVisor (runsc)"`,
-		`          ARCH=$(uname -m)`,
-		`          URL="https://storage.googleapis.com/gvisor/releases/release/` + version + `/${ARCH}"`,
-		`          echo "Downloading runsc ` + version + ` for ${ARCH}..."`,
-		`          curl -fsSL "${URL}/runsc" -o /tmp/runsc`,
-		`          curl -fsSL "${URL}/runsc.sha512" -o /tmp/runsc.sha512`,
-		`          echo "Verifying SHA-512 for runsc..."`,
-		`          (cd /tmp && sha512sum -c runsc.sha512)`,
-		`          curl -fsSL "${URL}/containerd-shim-runsc-v1" -o /tmp/containerd-shim-runsc-v1`,
-		`          curl -fsSL "${URL}/containerd-shim-runsc-v1.sha512" -o /tmp/containerd-shim-runsc-v1.sha512`,
-		`          echo "Verifying SHA-512 for containerd-shim-runsc-v1..."`,
-		`          (cd /tmp && sha512sum -c containerd-shim-runsc-v1.sha512)`,
-		`          sudo install -m 755 /tmp/runsc /usr/local/bin/runsc`,
-		`          sudo install -m 755 /tmp/containerd-shim-runsc-v1 /usr/local/bin/containerd-shim-runsc-v1`,
-		`          runsc --version`,
-		`          echo "::endgroup::"`,
-		"",
-		`          echo "::group::Register runsc as Docker runtime"`,
-		`          sudo runsc install`,
-		`          # IMPORTANT: Must use restart (not reload).`,
-		`          # Docker's SIGHUP reload does NOT call setHostGatewayIP(), so`,
-		`          # --add-host host.docker.internal:host-gateway breaks for any`,
-		`          # container started after a reload-only config change.`,
-		`          sudo systemctl restart docker`,
-		`          echo "Docker runtimes:"`,
-		`          docker info --format '{{.Runtimes}}' || docker info | grep -i runtime`,
-		`          echo "::endgroup::"`,
-		"",
-		`          echo "::group::Verify gVisor works"`,
-		`          docker pull hello-world`,
-		`          docker run --rm --runtime=runsc hello-world`,
-		`          echo "✅ gVisor runtime verified"`,
-		`          echo "::endgroup::"`,
 	})
 }

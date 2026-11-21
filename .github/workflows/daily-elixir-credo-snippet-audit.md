@@ -10,11 +10,14 @@ on:
 max-daily-ai-credits: 10000
 permissions:
   contents: read
+  copilot-requests: write
   issues: read
   pull-requests: read
 tracker-id: daily-elixir-credo-snippet-audit
+model: router/economy
 engine:
   id: claude
+  model-provider: github
 timeout-minutes: 45
 strict: true
 runtimes:
@@ -29,7 +32,7 @@ network:
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [default]
   bash:
     - "*"
@@ -43,7 +46,7 @@ imports:
       reviewers: [copilot]
 sandbox:
   agent:
-    sudo: false
+    id: awf
 steps:
   - name: Install Credo tooling project
     run: |
@@ -84,6 +87,11 @@ steps:
       MIX_ENV=dev mix credo --version
 features:
   gh-aw-detection: true
+evals:
+  - id: elixir_snippets_linted
+    question: Did the agent use Credo to lint Elixir snippets found in repository markdown files?
+  - id: fixes_proposed_or_noop
+    question: Were fixes proposed in a PR or issue, or was noop used when no linting violations were found?
 ---
 
 {{#runtime-import? .github/shared-instructions.md}}

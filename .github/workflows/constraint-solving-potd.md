@@ -10,13 +10,14 @@ timeout-minutes: 30
 permissions:
   models: read
 
+model: router/economy
 engine:
   id: copilot
-  model: claude-haiku-4.5
   bare: true
 
 imports:
   - shared/otlp.md
+  - shared/reporting.md
 tools:
   cli-proxy: true
   cache-memory: true
@@ -33,9 +34,13 @@ safe-outputs:
     expires: 7d
 features:
   gh-aw-detection: true
-sandbox:
-  agent:
-    sudo: false
+evals:
+  - id: discussion-created
+    question: Did the agent create a constraint solving problem of the day discussion?
+  - id: problem-stated
+    question: Does the agent output include a clear problem statement with constraints?
+  - id: solution-provided
+    question: Does the agent output include a solution or answer to the problem?
 ---
 
 # Constraint Solving — Problem of the Day
@@ -54,9 +59,9 @@ You are an expert in constraint solving, combinatorial optimization, and mathema
    - **Emerging topics**: constraint learning, hybrid CP/ML, quantum-inspired CP
 
 2. **Do NOT repeat** recently covered problems. Before selecting a problem:
-   - **Read the cache** at `/tmp/gh-aw/cache-memory/` for a file named `covered-topics.json`. This file tracks all previously covered problems with their dates and categories.
+   - **Read the cache** at `/tmp/gh-aw/cache-memory/covered-topics.json`. This file tracks all previously covered problems with their dates and categories. Report `Cache hit` after a successful read, or `Cache miss` if missing and initialize an empty array.
    - If the file exists, parse it and avoid any problem already listed.
-   - After posting the discussion, **update `covered-topics.json`** by appending the new entry with the problem name, category, and today's date.
+   - After submitting the discussion, **update `/tmp/gh-aw/cache-memory/covered-topics.json`** by appending the new entry with the problem name, category, and today's date. Preserve previous entries and read the file back to verify the write. On a skipped run, preserve and verify the history before `noop`; never record an unpublished problem as covered.
    - Use filesystem-safe filenames only (no colons or special characters).
 
    Example `covered-topics.json` format:

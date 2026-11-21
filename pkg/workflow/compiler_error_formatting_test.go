@@ -9,6 +9,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/github/gh-aw/pkg/validationerror"
 )
 
 // TestFormatCompilerError tests the formatCompilerError helper function
@@ -129,8 +131,8 @@ func TestFormatCompilerError_ErrorVsWarning(t *testing.T) {
 	require.Error(t, errorErr)
 	require.Error(t, warningErr)
 
-	assert.Contains(t, errorErr.Error(), "error", "Error type should be present")
-	assert.Contains(t, warningErr.Error(), "warning", "Warning type should be present")
+	require.ErrorContains(t, errorErr, "error", "Error type should be present")
+	require.ErrorContains(t, warningErr, "warning", "Warning type should be present")
 
 	// Ensure they produce different outputs
 	assert.NotEqual(t, errorErr.Error(), warningErr.Error(), "Error and warning should have different outputs")
@@ -194,8 +196,8 @@ func TestFormatCompilerError_ErrorWrapping(t *testing.T) {
 	require.ErrorIs(t, wrappedErr, underlyingErr, "Should preserve error chain with %w")
 
 	// Verify formatted message is in the error string
-	assert.Contains(t, wrappedErr.Error(), "test.md")
-	assert.Contains(t, wrappedErr.Error(), "validation failed")
+	require.ErrorContains(t, wrappedErr, "test.md")
+	require.ErrorContains(t, wrappedErr, "validation failed")
 	// Verify the formatted string does NOT include the cause text (no duplication)
 	assert.NotContains(t, wrappedErr.Error(), "underlying validation error", "Error() should not duplicate cause text")
 }
@@ -228,8 +230,8 @@ func TestFormatCompilerError_NilCause(t *testing.T) {
 	require.Error(t, err)
 
 	// Verify error message contains expected content
-	assert.Contains(t, err.Error(), "test.md")
-	assert.Contains(t, err.Error(), "validation error")
+	require.ErrorContains(t, err, "test.md")
+	require.ErrorContains(t, err, "validation error")
 
 	// Verify it's a new error (not wrapping anything)
 	// This is a validation error, so it should not wrap
@@ -242,7 +244,7 @@ func TestFormatCompilerError_NilCause(t *testing.T) {
 // to 1:1.
 func TestFormatCompilerError_UsesLocationFromValidationError(t *testing.T) {
 	t.Run("uses line and column from validation error", func(t *testing.T) {
-		vErr := &WorkflowValidationError{Field: "engine", Value: "copiliot", Reason: "not a valid engine", Suggestion: "Did you mean 'copilot'?", File: "workflow.md", Line: 15, Column: 3}
+		vErr := &WorkflowValidationError{Payload: validationerror.Payload{Field: "engine", Value: "copiliot", Reason: "not a valid engine", Suggestion: "Did you mean 'copilot'?"}, File: "workflow.md", Line: 15, Column: 3}
 
 		wrapped := formatCompilerError("workflow.md", "error", vErr.Error(), vErr)
 		require.Error(t, wrapped)
@@ -256,7 +258,7 @@ func TestFormatCompilerError_UsesLocationFromValidationError(t *testing.T) {
 	})
 
 	t.Run("uses file from validation error when different from filePath", func(t *testing.T) {
-		vErr := &WorkflowValidationError{Field: "concurrency", Value: "invalid", Reason: "reason", File: "actual-source.md", Line: 7, Column: 1}
+		vErr := &WorkflowValidationError{Payload: validationerror.Payload{Field: "concurrency", Value: "invalid", Reason: "reason"}, File: "actual-source.md", Line: 7, Column: 1}
 
 		wrapped := formatCompilerError("other.md", "error", vErr.Error(), vErr)
 		require.Error(t, wrapped)

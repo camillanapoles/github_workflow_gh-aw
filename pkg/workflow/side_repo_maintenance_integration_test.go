@@ -114,6 +114,9 @@ This workflow operates on a separate repository.
 		"generated workflow should set a 20-minute timeout for the activity_report logs download step")
 	assert.Contains(t, contentStr, "${GH_AW_CMD_PREFIX} logs",
 		"generated workflow should run gh aw logs directly")
+	assert.Contains(t, contentStr, `${GH_AW_CMD_PREFIX} logs \
+            --repo "my-org/target-repo" \`,
+		"generated workflow should preserve the multi-line gh aw logs command formatting")
 	assert.Contains(t, contentStr, "--start-date -1w",
 		"generated workflow should download 7 days of logs for activity_report")
 	assert.Contains(t, contentStr, "--count 500",
@@ -126,7 +129,7 @@ This workflow operates on a separate repository.
 		"generated workflow should include activity_report issue generation step after cache save")
 	assert.Contains(t, contentStr, "title: '[aw] agentic status report'",
 		"generated workflow should create the activity_report issue with the expected title")
-	assert.Contains(t, contentStr, "actions: read\n      contents: read\n      issues: write",
+	assert.Regexp(t, `actions: read[^\n]*\n      contents: read[^\n]*\n      issues: write`, contentStr,
 		"activity_report job should include contents: read with explicit permissions")
 	assert.Contains(t, contentStr, "timeout-minutes: 120",
 		"activity_report job should include a 2 hour timeout")
@@ -263,7 +266,8 @@ permissions:
 engine: copilot
 checkout:
   repository: ${{ inputs.target_repo }}
-  current: true
+  path: targets
+  allowed-repos: ["my-org/*"]
 ---
 
 # Dynamic repository workflow.

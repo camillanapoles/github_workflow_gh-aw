@@ -30,10 +30,12 @@ import (
 
 	"github.com/goccy/go-yaml"
 
+	"github.com/github/gh-aw/pkg/actionpins"
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/logger"
 )
 
-var importedStepsValidationLog = newValidationLogger("imported_steps")
+var importedStepsValidationLog = logger.New("workflow:imported_steps_validation")
 
 // validateImportedStepsNoAgenticSecrets validates that engine steps don't use agentic engine secrets
 // This validation is now a no-op since custom engine support has been removed.
@@ -91,10 +93,21 @@ func (c *Compiler) validateCheckoutPersistCredentials(frontmatter map[string]any
 		return nil
 	}
 
+	checkoutVersion := "v4"
+	if pin, ok := actionpins.GetLatestActionPinByRepo("actions/checkout"); ok && pin.Version != "" {
+		checkoutVersion = pin.Version
+	}
+
+	persistCredentialsExample := fmt.Sprintf(`      # example (keep your existing "uses:" ref):
+      - uses: actions/checkout@%s
+        with:
+          persist-credentials: false`, checkoutVersion)
+
 	msg := fmt.Sprintf(
 		"actions/checkout step(s) without 'persist-credentials: false' detected in the agent job: %s. "+
 			"Without this setting the git token is stored in .git/config and leaked to the agent. "+
-			"Add 'persist-credentials: false' to the 'with:' block of each checkout step. "+
+			"Add 'persist-credentials: false' to the 'with:' block of each checkout step, for example:\n"+
+			persistCredentialsExample+"\n"+
 			"See: https://github.github.com/gh-aw/reference/steps/",
 		strings.Join(offendingStepNames, ", "),
 	)

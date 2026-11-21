@@ -28,12 +28,13 @@ func NewDeployCommand(validateEngine func(string) error) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "deploy <workflow>...",
 		Short: "Deploy agentic workflows to a target repository using a pull request",
-		Long: `Deploy one or more workflows to a target repository by combining clone, update, add, compile, and pull request creation.
+		Long: `Deploy one or more workflows to a target repository by cloning the target repository, updating existing workflows, adding specified workflows, compiling lock files, and opening a pull request.
 
-The command clones the target repository, updates existing workflows from source, adds the specified workflows, recompiles lock files with purge enabled, and opens a pull request.`,
+The command clones the target repository, updates existing workflows from source, adds the specified workflows, recompiles lock files with purge enabled, and opens a pull request. This command always creates a pull request. The --create-pull-request and --pr flags are compatibility aliases and do not change this behavior; one is required with --auto-merge to explicitly enable auto-merge on the created pull request.`,
 		Example: `  ` + string(constants.CLIExtensionPrefix) + ` deploy githubnext/agentics/ci-doctor --repo owner/repo
   ` + string(constants.CLIExtensionPrefix) + ` deploy githubnext/agentics/repo-assist githubnext/agentics/ci-doctor --repo owner/repo --force
   ` + string(constants.CLIExtensionPrefix) + ` deploy ./my-workflow.md --repo owner/repo
+  ` + string(constants.CLIExtensionPrefix) + ` deploy ./my-workflow.md --repo owner/repo --create-pull-request --auto-merge
   ` + string(constants.CLIExtensionPrefix) + ` deploy githubnext/agentics/ci-doctor --org my-org --yes
   ` + string(constants.CLIExtensionPrefix) + ` deploy githubnext/agentics/ci-doctor --org my-org --repos '*-service' --yes`,
 		Args: validateDeployArgs,
@@ -62,6 +63,11 @@ func runDeploy(ctx context.Context, targetRepo string, workflows []string, addOp
 		return fmt.Errorf("failed to change directory to checkout %s: %w", checkoutDir, err)
 	}
 
+	summary, err := newUpdatePRSummary(ctx, addOpts.WorkflowDir)
+	if err != nil {
+		return err
+	}
+
 	if err := runDeployUpdatePass(ctx, addOpts, coolDown); err != nil {
 		return err
 	}
@@ -74,7 +80,11 @@ func runDeploy(ctx context.Context, targetRepo string, workflows []string, addOp
 		return err
 	}
 
-	if err := createDeployPR(resolvedWorkflows, targetRepo, addOpts.Verbose); err != nil {
+	details, err := summary.body(ctx, "deploy")
+	if err != nil {
+		return err
+	}
+	if err := createDeployPR(ctx, resolvedWorkflows, targetRepo, addOpts.Verbose, addOpts.AutoMerge, details, addOpts.PRMessage); err != nil {
 		return err
 	}
 
@@ -84,7 +94,7 @@ func runDeploy(ctx context.Context, targetRepo string, workflows []string, addOp
 
 func validateDeployArgs(cmd *cobra.Command, args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("missing workflow specification\n\nUsage:\n  %s <workflow>...\n\nExamples:\n  %[1]s githubnext/agentics/ci-doctor --repo owner/repo\n\nRun '%[1]s --help' for more information", cmd.CommandPath())
+		return fmt.Errorf("missing workflow specification\n\nUsage:\n  %s <workflow>...\n\nExamples:\n  %[1]s githubnext/agentics/ci-doctor --repo owner/repo\n\nRun '%[1]s --help' for more information", cliCommandPath(cmd))
 	}
 	return nil
 }
@@ -94,14 +104,17 @@ func registerDeployFlags(cmd *cobra.Command) {
 	cmd.Flags().StringP("name", "n", "", "Specify name for the added workflow (without .md extension)")
 	addEngineFlag(cmd)
 	cmd.Flags().BoolP("force", "f", false, "Overwrite existing workflow files without confirmation")
-	cmd.Flags().String("append", "", "Append extra content to the end of agentic workflow on installation")
+	cmd.Flags().Bool("create-pull-request", false, "Create a pull request (always enabled for deploy)")
+	addPRMessageFlag(cmd)
+	cmd.Flags().Bool("pr", false, "Alias for --create-pull-request")
+	_ = cmd.Flags().MarkHidden("pr")
+	cmd.Flags().Bool("auto-merge", false, "Enable auto-merge on the deployment pull request (requires --create-pull-request)")
+	cmd.Flags().String("append", "", "Append extra content to the end of the agentic workflow on installation")
 	cmd.Flags().Bool("no-gitattributes", false, "Skip updating .gitattributes file")
 	cmd.Flags().StringP("dir", "d", "", "Workflow directory (default: $GH_AW_WORKFLOWS_DIR or .github/workflows)")
 	cmd.Flags().Bool("no-stop-after", false, "Remove any stop-after field from the workflow")
 	cmd.Flags().String("stop-after", "", "Override stop-after value in the workflow (e.g., '+48h', '2025-12-31 23:59:59')")
-	cmd.Flags().Bool("no-security-scanner", false, "Skip security scanning of workflow markdown content")
-	cmd.Flags().Bool("disable-security-scanner", false, "Skip security scanning of workflow markdown content")
-	_ = cmd.Flags().MarkDeprecated("disable-security-scanner", "use --no-security-scanner instead")
+	addSecurityScannerFlag(cmd)
 	cmd.Flags().String("cool-down", defaultDeployCooldown, coolDownFlagUsage)
 	cmd.Flags().String("org", "", "Deploy workflows across repositories in an organization")
 	cmd.Flags().StringSlice("repos", nil, "Limit --org mode to repositories matching one or more glob patterns")
@@ -143,15 +156,19 @@ func parseDeployCommandOptions(cmd *cobra.Command, workflows []string, validateE
 	engineOverride, _ := cmd.Flags().GetString("engine")
 	nameFlag, _ := cmd.Flags().GetString("name")
 	forceFlag, _ := cmd.Flags().GetBool("force")
+	autoMerge, _ := cmd.Flags().GetBool("auto-merge")
+	createPRFlag, _ := cmd.Flags().GetBool("create-pull-request")
+	prFlagAlias, _ := cmd.Flags().GetBool("pr")
+	if err := requireAutoMergePR(autoMerge, createPRFlag || prFlagAlias); err != nil {
+		return AddOptions{}, 0, err
+	}
 	appendText, _ := cmd.Flags().GetString("append")
 	verbose, _ := cmd.Flags().GetBool("verbose")
 	noGitattributes, _ := cmd.Flags().GetBool("no-gitattributes")
 	workflowDir, _ := cmd.Flags().GetString("dir")
 	noStopAfter, _ := cmd.Flags().GetBool("no-stop-after")
 	stopAfter, _ := cmd.Flags().GetString("stop-after")
-	disableSecurityScanner, _ := cmd.Flags().GetBool("no-security-scanner")
-	disableSecurityScannerLegacy, _ := cmd.Flags().GetBool("disable-security-scanner")
-	disableSecurityScanner = disableSecurityScanner || disableSecurityScannerLegacy
+	disableSecurityScanner := resolveDeprecatedBoolFlag(cmd, "no-security-scanner", "disable-security-scanner")
 	coolDownStr, _ := cmd.Flags().GetString("cool-down")
 
 	if nameFlag != "" && len(workflows) > 1 {
@@ -171,6 +188,8 @@ func parseDeployCommandOptions(cmd *cobra.Command, workflows []string, validateE
 		EngineOverride:         engineOverride,
 		Name:                   nameFlag,
 		Force:                  forceFlag,
+		AutoMerge:              autoMerge,
+		PRMessage:              cmd.Flag("pr-message").Value.String(),
 		AppendText:             appendText,
 		NoGitattributes:        noGitattributes,
 		WorkflowDir:            workflowDir,
@@ -237,6 +256,9 @@ func runDeployAddPass(ctx context.Context, resolvedWorkflows []string, addOpts A
 		return nil
 	}
 
+	// Deploy creates its PR after all update, add, and compile passes complete.
+	addOpts.CreatePR = false
+	addOpts.AutoMerge = false
 	if _, err := AddWorkflows(ctx, workflowsToAdd, addOpts); err != nil {
 		return fmt.Errorf("failed to add workflows: %w", err)
 	}
@@ -256,9 +278,11 @@ func runDeployCompilePass(ctx context.Context, addOpts AddOptions) error {
 	return nil
 }
 
-func createDeployPR(resolvedWorkflows []string, targetRepo string, verbose bool) error {
+func createDeployPR(ctx context.Context, resolvedWorkflows []string, targetRepo string, verbose bool, autoMerge bool, details, prMessage string) error {
 	prTitle, prBody := buildDeployPRMetadata(resolvedWorkflows, targetRepo)
-	_, err := CreatePRWithChanges("deploy-workflows", deployCommitMessage, prTitle, prBody, verbose)
+	prBody = appendPRMessage(prBody, details)
+	prBody = appendPRMessage(prBody, prMessage)
+	_, err := createPRWithChanges(ctx, "deploy-workflows", deployCommitMessage, prTitle, prBody, verbose, autoMerge)
 	if err != nil {
 		return fmt.Errorf("failed to create deploy pull request: %w", err)
 	}
@@ -287,8 +311,16 @@ func buildDeployPRMetadata(workflows []string, targetRepo string) (string, strin
 	if len(workflows) > 1 {
 		workflowDescription = fmt.Sprintf("%d workflows", len(workflows))
 	}
-	body := fmt.Sprintf("Deploy %s to %s.\n\nThis PR was created by `gh aw deploy` after running update, add, and compile --purge in the target repository.", workflowDescription, targetRepo)
-	return deployCommitMessage, body
+	var body strings.Builder
+	body.WriteString("## Summary\n\nDeploy " + markdownText(workflowDescription) + " to " + markdownText(targetRepo) + ".\n\n")
+	body.WriteString("## Workflows requested\n\n")
+	for _, spec := range workflows {
+		if isLocalWorkflowPath(spec) {
+			spec = filepath.Base(spec)
+		}
+		body.WriteString("- " + summaryCode(spec) + "\n")
+	}
+	return deployCommitMessage, body.String()
 }
 
 func excludeExistingSourcedWorkflows(workflows []string, addOpts AddOptions) ([]string, []string, error) {

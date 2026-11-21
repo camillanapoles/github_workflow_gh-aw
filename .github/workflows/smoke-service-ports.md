@@ -3,6 +3,7 @@ private: true
 emoji: "🧪"
 description: Smoke test to validate --allow-host-service-ports with Redis service container
 on:
+  schedule: every 2 days
   slash_command:
     name: smoke-service-ports
     strategy: centralized
@@ -10,15 +11,24 @@ on:
   workflow_dispatch:
   status-comment: true
 permissions:
+  copilot-requests: write
   contents: read
   issues: read
   pull-requests: read
 name: Smoke Service Ports
-engine: copilot
+engine:
+  id: pi
+  fallback-models:
+    - copilot/gpt-5.6-luna
+    - copilot/claude-haiku-5.5
+model: copilot/gpt-5.3-codex
 strict: true
+sandbox:
+  agent:
+    runtime: docker-sudo-iptables
 services:
   redis:
-    image: redis:7
+    image: redis:7@sha256:44960b3100c48159a66d28c18b0588c193492e25f7551d60e51dd464fc3eca5b
     ports:
       - 6379:6379
     options: >-
@@ -33,6 +43,13 @@ network:
 tools:
   bash:
     - "*"
+evals:
+  - id: redis_ping
+    question: Does the output show a PONG response from the Redis service at host.docker.internal port 6379?
+  - id: redis_roundtrip
+    question: Does the output show that GET smoke_test returned the exact service-ports-ok value written by SET?
+  - id: redis_info
+    question: Does the output show Redis server information retrieved from the host service rather than merely claiming connectivity?
 safe-outputs:
     allowed-domains: [default-safe-outputs]
     add-comment:
@@ -47,13 +64,17 @@ timeout-minutes: 5
 imports:
   - shared/otlp.md
   - shared/token-telemetry-check.md
+  - shared/reporting.md
+  - uses: shared/session-artifact-check.md
+    with:
+      session-artifact: agent-stdio
 features:
   gh-aw-detection: false
 ---
 
 # Smoke Test: Service Ports (Redis)
 
-**Purpose:** Validate that the `--allow-host-service-ports` feature works end-to-end. The compiler should have automatically detected the Redis service port and configured AWF to allow traffic to it.
+**Purpose:** Validate that the `--allow-host-service-ports` feature works end-to-end. This workflow uses `runtime: docker-sudo-iptables` so the compiler can configure AWF to allow traffic to the Redis service port.
 
 **IMPORTANT:** Inside AWF's sandbox, you must connect to services via `host.docker.internal` (not `localhost`). The service containers run on the host, and AWF routes traffic through the host gateway. Since the workflow maps port 6379:6379, port 6379 should work. Keep all outputs concise.
 
@@ -70,13 +91,15 @@ features:
 
 ## Output Requirements
 
-Add a **concise comment** to the pull request (if triggered by PR) with:
+Report the results through the safe output appropriate for the trigger:
 
-- Each test with a pass/fail status
-- Overall status: PASS or FAIL
-- Note whether `redis-cli` was available or if `nc`/netcat was used as fallback
+- For issue, pull request, issue-comment, or pull-request-comment triggers, use `add_comment` to post a concise comment on the triggering item with:
+  - Each test with a pass/fail status
+  - Overall status: PASS or FAIL
+  - Note whether `redis-cli` was available or if `nc`/netcat was used as fallback
+- For `schedule` or `workflow_dispatch` triggers, use `noop` with the same pass/fail summary in its `message`. Do not call `add_comment` for these events; there is no triggering item to target.
 
-Example:
+Example comment:
 ```
 ## Service Ports Smoke Test (Redis)
 
@@ -89,8 +112,4 @@ Example:
 **Result:** 3/3 tests passed ✅
 ```
 
-**Important**: If no action is needed after completing your analysis, you **MUST** call the `noop` safe-output tool with a brief explanation.
-
-```json
-{"noop": {"message": "No action needed: [brief explanation of what was analyzed and why]"}}
-```
+For a scheduled or manually dispatched run, include the test results and overall PASS/FAIL status in the `noop` message.

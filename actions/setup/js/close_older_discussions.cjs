@@ -2,10 +2,12 @@
 /// <reference types="@actions/github-script" />
 
 const { getCloseOlderDiscussionMessage } = require("./messages_close_discussion.cjs");
-const { getErrorMessage } = require("./error_helpers.cjs");
 const { sanitizeContent } = require("./sanitize_content.cjs");
-const { closeOlderEntities, MAX_CLOSE_COUNT: SHARED_MAX_CLOSE_COUNT } = require("./close_older_entities.cjs");
-const { buildMarkerSearchQuery, filterByMarker, logFilterSummary } = require("./close_older_search_helpers.cjs");
+const { MAX_CLOSE_COUNT: SHARED_MAX_CLOSE_COUNT } = require("./close_older_entities.cjs");
+const { searchOlderEntitiesByMarker } = require("./close_older_search_helpers.cjs");
+const { createCloseOlderSearchAdapter, closeOlderWithDescriptor } = require("./close_older_handler_factory.cjs");
+const { currentClaimHandle } = require("./work_queue_claim_scope.cjs");
+const { graphEffectIdentity } = require("./work_queue_effect_client.cjs");
 
 /**
  * Maximum number of older discussions to close
@@ -35,60 +37,43 @@ const GRAPHQL_DELAY_MS = 500;
  * @returns {Promise<Array<{id: string, number: number, title: string, url: string}>>} Matching discussions
  */
 async function searchOlderDiscussions(github, owner, repo, workflowId, categoryId, excludeNumber, callerWorkflowId, closeOlderKey) {
-  core.info(`Starting search for older discussions in ${owner}/${repo}`);
-  core.info(`  Workflow ID: ${workflowId || "(none)"}`);
-  core.info(`  Exclude discussion number: ${excludeNumber}`);
-
-  if (!workflowId && !closeOlderKey) {
-    core.info("No workflow ID or close-older-key provided - cannot search for older discussions");
-    return [];
-  }
-
-  const { searchQuery, exactMarker } = buildMarkerSearchQuery({
+  return searchOlderEntitiesByMarker({
     owner,
     repo,
     workflowId,
+    excludeNumber,
+    entityType: "discussion",
     callerWorkflowId,
     closeOlderKey,
-  });
-  core.info(`Executing GitHub search with query: ${searchQuery}`);
-
-  const result = await github.graphql(
-    `
-    query($searchTerms: String!, $first: Int!) {
-      search(query: $searchTerms, type: DISCUSSION, first: $first) {
-        nodes {
-          ... on Discussion {
-            id
-            number
-            title
-            url
-            body
-            category {
-              id
+    executeSearch: searchQuery =>
+      github.graphql(
+        `
+        query($searchTerms: String!, $first: Int!) {
+          search(query: $searchTerms, type: DISCUSSION, first: $first) {
+            nodes {
+              ... on Discussion {
+                id
+                number
+                title
+                url
+                body
+                category {
+                  id
+                }
+                closed
+              }
             }
-            closed
           }
-        }
-      }
-    }`,
-    { searchTerms: searchQuery, first: 50 }
-  );
-
-  core.info(`Search API returned ${result?.search?.nodes?.length || 0} total results`);
-
-  if (!result || !result.search || !result.search.nodes) {
-    core.info("No results returned from search API");
-    return [];
-  }
-
-  core.info("Filtering search results...");
-
-  const { filtered: filteredItems, counters } = filterByMarker({
-    items: result.search.nodes,
-    excludeNumber,
-    exactMarker,
-    entityType: "discussion",
+        }`,
+        { searchTerms: searchQuery, first: 50 }
+      ),
+    getItems: result => result?.search?.nodes,
+    mapItem: d => ({
+      id: d.id,
+      number: d.number,
+      title: d.title,
+      url: d.url,
+    }),
     additionalFilter: (d, extra) => {
       if (d.closed) {
         extra.closedCount = (extra.closedCount || 0) + 1;
@@ -99,24 +84,8 @@ async function searchOlderDiscussions(github, owner, repo, workflowId, categoryI
       }
       return true;
     },
-  });
-
-  const filtered = filteredItems.map(
-    /** @param {any} d */ d => ({
-      id: d.id,
-      number: d.number,
-      title: d.title,
-      url: d.url,
-    })
-  );
-
-  logFilterSummary({
-    entityTypePlural: "discussions",
-    counters,
     extraLabels: [["closedCount", "Excluded closed discussions"]],
   });
-
-  return filtered;
 }
 
 /**
@@ -126,11 +95,11 @@ async function searchOlderDiscussions(github, owner, repo, workflowId, categoryI
  * @param {string} repo - Repository name (unused for GraphQL, but kept for consistency)
  * @param {string} discussionId - Discussion node ID
  * @param {string} message - Comment body
+ * @param {Array<object>} [deliveryReceipts] - Trusted native cleanup receipts for Claim readback
  * @returns {Promise<{id: string, url: string}>} Comment details
  */
-async function addDiscussionComment(github, owner, repo, discussionId, message) {
-  const result = await github.graphql(
-    `
+async function addDiscussionComment(github, owner, repo, discussionId, message, deliveryReceipts = []) {
+  const query = `
     mutation($dId: ID!, $body: String!) {
       addDiscussionComment(input: { discussionId: $dId, body: $body }) {
         comment { 
@@ -138,9 +107,10 @@ async function addDiscussionComment(github, owner, repo, discussionId, message) 
           url
         }
       }
-    }`,
-    { dId: discussionId, body: sanitizeContent(message) }
-  );
+    }`;
+  const variables = { dId: discussionId, body: sanitizeContent(message) };
+  const result = await github.graphql(query, variables);
+  if (currentClaimHandle()) deliveryReceipts.push({ type: "comment", discussionId, id: result.addDiscussionComment.comment.id, body: variables.body, effectId: graphEffectIdentity(query, variables, result) });
 
   return result.addDiscussionComment.comment;
 }
@@ -151,11 +121,11 @@ async function addDiscussionComment(github, owner, repo, discussionId, message) 
  * @param {string} owner - Repository owner (unused for GraphQL, but kept for consistency)
  * @param {string} repo - Repository name (unused for GraphQL, but kept for consistency)
  * @param {string} discussionId - Discussion node ID
+ * @param {Array<object>} [deliveryReceipts] - Trusted native cleanup receipts for Claim readback
  * @returns {Promise<{id: string, url: string}>} Discussion details
  */
-async function closeDiscussionAsOutdated(github, owner, repo, discussionId) {
-  const result = await github.graphql(
-    `
+async function closeDiscussionAsOutdated(github, owner, repo, discussionId, deliveryReceipts = []) {
+  const query = `
     mutation($dId: ID!) {
       closeDiscussion(input: { discussionId: $dId, reason: OUTDATED }) {
         discussion { 
@@ -163,9 +133,10 @@ async function closeDiscussionAsOutdated(github, owner, repo, discussionId) {
           url
         }
       }
-    }`,
-    { dId: discussionId }
-  );
+    }`;
+  const variables = { dId: discussionId };
+  const result = await github.graphql(query, variables);
+  if (currentClaimHandle()) deliveryReceipts.push({ type: "close", discussionId, id: result.closeDiscussion.discussion.id, effectId: graphEffectIdentity(query, variables, result) });
 
   return result.closeDiscussion.discussion;
 }
@@ -182,45 +153,38 @@ async function closeDiscussionAsOutdated(github, owner, repo, discussionId) {
  * @param {string} runUrl - URL of the workflow run
  * @param {string} [callerWorkflowId] - Optional calling workflow identity for precise filtering
  * @param {string} [closeOlderKey] - Optional explicit deduplication key for close-older matching
+ * @param {Array<object>} [deliveryReceipts] - Trusted native cleanup receipts for Claim readback
  * @returns {Promise<Array<{number: number, url: string}>>} List of closed discussions
  */
-async function closeOlderDiscussions(github, owner, repo, workflowId, categoryId, newDiscussion, workflowName, runUrl, callerWorkflowId, closeOlderKey) {
-  const result = await closeOlderEntities(
+async function closeOlderDiscussions(github, owner, repo, workflowId, categoryId, newDiscussion, workflowName, runUrl, callerWorkflowId, closeOlderKey, deliveryReceipts = []) {
+  return closeOlderWithDescriptor({
     github,
     owner,
     repo,
     workflowId,
-    newDiscussion,
+    newEntity: newDiscussion,
     workflowName,
     runUrl,
-    {
-      entityType: "discussion",
-      entityTypePlural: "discussions",
-      // Use a closure so callerWorkflowId and closeOlderKey are forwarded to
-      // searchOlderDiscussions without going through the closeOlderEntities extraArgs
-      // mechanism (which appends excludeNumber last)
-      searchOlderEntities: (gh, o, r, wid, categoryId, excludeNumber) => searchOlderDiscussions(gh, o, r, wid, categoryId, excludeNumber, callerWorkflowId, closeOlderKey),
-      getCloseMessage: params =>
-        getCloseOlderDiscussionMessage({
-          newDiscussionUrl: params.newEntityUrl,
-          newDiscussionNumber: params.newEntityNumber,
-          workflowName: params.workflowName,
-          runUrl: params.runUrl,
-        }),
-      addComment: addDiscussionComment,
-      closeEntity: closeDiscussionAsOutdated,
-      delayMs: GRAPHQL_DELAY_MS,
-      getEntityId: entity => entity.id,
-      getEntityUrl: entity => entity.url,
-    },
-    categoryId // Pass categoryId as extra arg
-  );
-
-  // Map to discussion-specific return type
-  return result.map(item => ({
-    number: item.number,
-    url: item.url || "",
-  }));
+    entityType: "discussion",
+    entityTypePlural: "discussions",
+    searchOlderEntities: createCloseOlderSearchAdapter(searchOlderDiscussions, [categoryId], [callerWorkflowId, closeOlderKey]),
+    getCloseMessage: params =>
+      getCloseOlderDiscussionMessage({
+        newDiscussionUrl: params.newEntityUrl,
+        newDiscussionNumber: params.newEntityNumber,
+        workflowName: params.workflowName,
+        runUrl: params.runUrl,
+      }),
+    addComment: (client, owner, repo, id, message) => addDiscussionComment(client, owner, repo, id, message, deliveryReceipts),
+    closeEntity: (client, owner, repo, id) => closeDiscussionAsOutdated(client, owner, repo, id, deliveryReceipts),
+    delayMs: GRAPHQL_DELAY_MS,
+    getEntityId: entity => entity.id,
+    getEntityUrl: entity => entity.url,
+    mapClosedEntity: item => ({
+      number: item.number,
+      url: item.url || "",
+    }),
+  });
 }
 
 module.exports = {

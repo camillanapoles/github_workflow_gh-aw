@@ -3,6 +3,7 @@
 package workflow
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -22,8 +23,8 @@ func TestValidateNetworkFirewallConfig_AllowURLsRequiresSSLBump(t *testing.T) {
 		err := validateNetworkFirewallConfig(networkPermissions)
 
 		require.Error(t, err, "Expected validation error when allow-urls is specified without ssl-bump")
-		assert.Contains(t, err.Error(), "allow-urls requires ssl-bump: true", "Error should mention the ssl-bump requirement")
-		assert.Contains(t, err.Error(), "network.firewall.allow-urls", "Error should identify the field")
+		require.ErrorContains(t, err, "allow-urls requires ssl-bump: true", "Error should mention the ssl-bump requirement")
+		require.ErrorContains(t, err, "network.firewall.allow-urls", "Error should identify the field")
 	})
 
 	t.Run("allow-urls with ssl-bump passes validation", func(t *testing.T) {
@@ -56,7 +57,7 @@ func TestValidateNetworkFirewallConfig_AllowURLsRequiresSSLBump(t *testing.T) {
 		err := validateNetworkFirewallConfig(networkPermissions)
 
 		require.Error(t, err, "Expected validation error when multiple allow-urls are specified without ssl-bump")
-		assert.Contains(t, err.Error(), "allow-urls requires ssl-bump: true", "Error should mention the ssl-bump requirement")
+		require.ErrorContains(t, err, "allow-urls requires ssl-bump: true", "Error should mention the ssl-bump requirement")
 	})
 
 	t.Run("multiple allow-urls with ssl-bump passes validation", func(t *testing.T) {
@@ -147,7 +148,7 @@ func TestValidateNetworkFirewallConfig_AllowURLsRequiresSSLBump(t *testing.T) {
 		err := validateNetworkFirewallConfig(networkPermissions)
 
 		require.Error(t, err, "Expected validation error even when firewall is disabled")
-		assert.Contains(t, err.Error(), "allow-urls requires ssl-bump: true", "Error should mention the ssl-bump requirement")
+		require.ErrorContains(t, err, "allow-urls requires ssl-bump: true", "Error should mention the ssl-bump requirement")
 	})
 }
 
@@ -181,7 +182,7 @@ func TestValidateNetworkAllowedDomains_EcosystemIdentifiers(t *testing.T) {
 				network := &NetworkPermissions{Allowed: []string{ecosystem}}
 				err := compiler.validateNetworkAllowedDomains(network)
 				require.Error(t, err, "Unknown ecosystem identifier '%s' should fail validation", ecosystem)
-				assert.Contains(t, err.Error(), "not a valid ecosystem identifier", "Error should indicate invalid ecosystem identifier")
+				require.ErrorContains(t, err, "not a valid ecosystem identifier", "Error should indicate invalid ecosystem identifier")
 			})
 		}
 	})
@@ -203,8 +204,8 @@ func TestValidateNetworkAllowedDomains_EcosystemIdentifiers(t *testing.T) {
 		}
 		err := compiler.validateNetworkAllowedDomains(network)
 		require.Error(t, err, "Should fail when invalid ecosystem identifiers are present")
-		assert.Contains(t, err.Error(), "rustxxxx", "Error should mention the invalid identifier")
-		assert.Contains(t, err.Error(), "fakeecosystem", "Error should mention the other invalid identifier")
+		require.ErrorContains(t, err, "rustxxxx", "Error should mention the invalid identifier")
+		require.ErrorContains(t, err, "fakeecosystem", "Error should mention the other invalid identifier")
 	})
 }
 
@@ -231,7 +232,7 @@ func TestValidateNetworkFirewallConfig_Integration(t *testing.T) {
 		err := validateNetworkFirewallConfig(workflowData.NetworkPermissions)
 
 		require.Error(t, err, "Compiler should reject workflow with allow-urls but no ssl-bump")
-		assert.Contains(t, err.Error(), "allow-urls requires ssl-bump: true", "Error should explain the requirement")
+		require.ErrorContains(t, err, "allow-urls requires ssl-bump: true", "Error should explain the requirement")
 	})
 
 	t.Run("compiler accepts workflow with allow-urls and ssl-bump", func(t *testing.T) {
@@ -257,4 +258,157 @@ func TestValidateNetworkFirewallConfig_Integration(t *testing.T) {
 
 		assert.NoError(t, err, "Compiler should accept workflow with allow-urls and ssl-bump enabled")
 	})
+}
+
+func TestValidateHostedWebPolicy(t *testing.T) {
+	tests := []struct {
+		name            string
+		engine          string
+		provider        LLMProvider
+		runtime         string
+		inline          bool
+		policy          *HostedWebPolicy
+		explicitNetwork bool
+		firewallVersion string
+		wantErr         string
+	}{
+		{
+			name:   "allows a lowercase allowlist",
+			engine: "claude",
+			policy: &HostedWebPolicy{Enabled: true, Allowed: []string{"docs.github.com"}, MaxUses: 1},
+		},
+		{
+			name:    "rejects Codex OpenAI standalone max-uses",
+			engine:  "codex",
+			policy:  &HostedWebPolicy{Enabled: true, Allowed: []string{"docs.github.com"}, MaxUses: 1},
+			wantErr: "network.hosted-web.max-uses is not supported by standalone web search",
+		},
+		{
+			name:     "rejects Codex Copilot hosted web",
+			engine:   "codex",
+			provider: LLMProviderGitHub,
+			policy:   &HostedWebPolicy{Enabled: true, Allowed: []string{"docs.github.com"}},
+			wantErr:  "not functional with Codex using Copilot inference",
+		},
+		{
+			name:     "allows Codex Copilot inference without hosted web",
+			engine:   "codex",
+			provider: LLMProviderGitHub,
+		},
+		{
+			name:    "requires a policy list",
+			engine:  "claude",
+			policy:  &HostedWebPolicy{Enabled: true},
+			wantErr: "requires exactly one",
+		},
+		{
+			name:    "rejects simultaneous lists",
+			engine:  "codex",
+			policy:  &HostedWebPolicy{Enabled: true, Allowed: []string{"docs.github.com"}, Blocked: []string{"example.com"}},
+			wantErr: "cannot both be set",
+		},
+		{
+			name:    "rejects uppercase domains",
+			engine:  "claude",
+			policy:  &HostedWebPolicy{Enabled: true, Allowed: []string{"Docs.GitHub.com"}},
+			wantErr: "lowercase DNS hostname",
+		},
+		{
+			name:    "rejects IP addresses",
+			engine:  "claude",
+			policy:  &HostedWebPolicy{Enabled: true, Allowed: []string{"192.0.2.1"}},
+			wantErr: "lowercase DNS hostname",
+		},
+		{
+			name:    "rejects duplicate domains",
+			engine:  "claude",
+			policy:  &HostedWebPolicy{Enabled: true, Allowed: []string{"docs.github.com", "docs.github.com"}},
+			wantErr: "duplicate domain",
+		},
+		{
+			name:    "rejects overlong domains",
+			engine:  "claude",
+			policy:  &HostedWebPolicy{Enabled: true, Allowed: []string{strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 61) + ".com"}},
+			wantErr: "253 characters or fewer",
+		},
+		{
+			name:   "accepts Codex runtime alias",
+			engine: "codex-experimental",
+			policy: &HostedWebPolicy{Enabled: true, Allowed: []string{"docs.github.com"}},
+		},
+		{
+			name:   "accepts Claude runtime underscore alias",
+			engine: "claude_custom",
+			policy: &HostedWebPolicy{Enabled: true, Allowed: []string{"docs.github.com"}},
+		},
+		{
+			name:    "rejects unrelated Codex prefix",
+			engine:  "codexbridge",
+			policy:  &HostedWebPolicy{Enabled: true, Allowed: []string{"docs.github.com"}},
+			wantErr: "only supported",
+		},
+		{
+			name:    "accepts custom engine backed by Codex runtime",
+			engine:  "my-codex-wrapper",
+			runtime: "codex",
+			policy:  &HostedWebPolicy{Enabled: true, Allowed: []string{"docs.github.com"}},
+		},
+		{
+			name:   "accepts inline Claude runtime prefix",
+			engine: "claude-custom",
+			inline: true,
+			policy: &HostedWebPolicy{Enabled: true, Allowed: []string{"docs.github.com"}},
+		},
+		{
+			name:            "rejects explicit policy with older AWF",
+			engine:          "claude",
+			policy:          &HostedWebPolicy{Enabled: true, Allowed: []string{"docs.github.com"}},
+			firewallVersion: "v0.28.24",
+			wantErr:         "requires AWF",
+		},
+		{
+			name:            "rejects implicit deny with older AWF",
+			engine:          "claude",
+			explicitNetwork: true,
+			firewallVersion: "v0.28.24",
+			wantErr:         "requires AWF",
+		},
+		{
+			name:            "ignores absent hosted-web policy for unsupported engines",
+			engine:          "copilot",
+			explicitNetwork: true,
+			firewallVersion: "v0.28.24",
+		},
+		{
+			name:    "rejects unsupported engine",
+			engine:  "copilot",
+			policy:  &HostedWebPolicy{Enabled: false},
+			wantErr: "only supported",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			network := &NetworkPermissions{
+				HostedWeb:         tt.policy,
+				ExplicitlyDefined: tt.explicitNetwork,
+			}
+			if tt.firewallVersion != "" {
+				network.Firewall = &FirewallConfig{Version: tt.firewallVersion}
+			}
+			compiler := NewCompiler()
+			if tt.runtime != "" {
+				compiler.engineCatalog.Register(&EngineDefinition{ID: tt.engine, RuntimeID: tt.runtime})
+			}
+			err := compiler.validateHostedWebPolicy(&WorkflowData{
+				EngineConfig:       &EngineConfig{ID: tt.engine, IsInlineDefinition: tt.inline, LLMProvider: tt.provider},
+				NetworkPermissions: network,
+			})
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.ErrorContains(t, err, tt.wantErr)
+			}
+		})
+	}
 }

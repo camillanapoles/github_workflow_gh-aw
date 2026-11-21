@@ -94,7 +94,7 @@ func FuzzExtractTerminalSubExpressions(f *testing.F) {
 
 // FuzzRenderExpressions fuzz-tests the combined extract-and-render pipeline against
 // arbitrary markdown strings. It validates that the function:
-//  1. Never panics or returns an error for arbitrary input.
+//  1. Never panics; malformed Actions expressions may return errors.
 //  2. After rendering, every ${{ ... }} expression that was extracted is replaced
 //     in the rendered output by the exact __<EnvVar>__ placeholder for that mapping.
 //  3. After rendering, no extracted mapping's Original expression literal remains
@@ -127,7 +127,7 @@ func FuzzRenderExpressions(f *testing.F) {
 	f.Add("Repo: ${{ github.repository }}, Actor: ${{ github.actor }}")
 	f.Add("${{ steps.a.outputs.x || inputs.y }}, ${{ inputs.z }}")
 
-	// Deprecated activation output syntax
+	// Deprecated activation output syntax (kept for backwards-compatibility transformer coverage)
 	f.Add("Content: ${{ needs.activation.outputs.text }}")
 	f.Add("Fallback: ${{ needs.activation.outputs.text || 'default' }}")
 
@@ -141,10 +141,12 @@ func FuzzRenderExpressions(f *testing.F) {
 	f.Fuzz(func(t *testing.T, markdown string) {
 		extractor := NewExpressionExtractor()
 
-		// Must never panic or return an error.
+		// Invalid source must not produce successful mappings.
 		mappings, err := extractor.ExtractExpressions(markdown)
 		if err != nil {
-			t.Errorf("ExtractExpressions(%q) returned unexpected error: %v", markdown, err)
+			if mappings != nil {
+				t.Error("invalid expression returned mappings")
+			}
 			return
 		}
 
@@ -245,7 +247,7 @@ func FuzzExtractExpressions(f *testing.F) {
 	f.Add("Repo: ${{ github.repository }}, Actor: ${{ github.actor }}")
 	f.Add("${{ steps.a.outputs.x || inputs.y }}, ${{ inputs.z }}")
 
-	// Deprecated activation output syntax
+	// Deprecated activation output syntax (kept for backwards-compatibility transformer coverage)
 	f.Add("Content: ${{ needs.activation.outputs.text }}")
 	f.Add("Fallback: ${{ needs.activation.outputs.text || 'default' }}")
 
@@ -261,10 +263,12 @@ func FuzzExtractExpressions(f *testing.F) {
 	f.Fuzz(func(t *testing.T, markdown string) {
 		extractor := NewExpressionExtractor()
 
-		// Must never panic or return an error.
+		// Invalid source must not produce successful mappings.
 		mappings, err := extractor.ExtractExpressions(markdown)
 		if err != nil {
-			t.Errorf("ExtractExpressions(%q) returned unexpected error: %v", markdown, err)
+			if mappings != nil {
+				t.Error("invalid expression returned mappings")
+			}
 			return
 		}
 

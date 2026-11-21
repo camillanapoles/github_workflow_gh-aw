@@ -19,7 +19,9 @@ var orgIPLog = logger.New("cli:org_issue_pr")
 var (
 	ghawReleaseTagCache syncutil.OnceLoader[string]
 
-	getLatestOrgReleaseFunc = getLatestRelease
+	getLatestOrgReleaseFunc = func(ctx context.Context, includePrereleases bool) (string, error) {
+		return getLatestRelease(ctx, includePrereleases)
+	}
 )
 
 var errEmptyGhawReleaseTag = errors.New("latest gh-aw release tag was empty")
@@ -53,9 +55,9 @@ func buildOrgXMLMarker(prefix, tag string) string {
 // getGhawReleaseInfo returns the latest stable gh-aw release tag and its HTML URL.
 // Both values are empty strings when the release cannot be determined; callers must
 // handle this gracefully (e.g. omit the release link rather than failing).
-func getGhawReleaseInfo() (tag, releaseURL string) {
+func getGhawReleaseInfo(ctx context.Context) (tag, releaseURL string) {
 	tag, err := ghawReleaseTagCache.Get(func() (string, error) {
-		tag, err := getLatestOrgReleaseFunc(false)
+		tag, err := getLatestOrgReleaseFunc(ctx, false)
 		if err != nil {
 			return "", err
 		}
@@ -85,11 +87,6 @@ type orgPullRequest struct{}
 func runOrgAPI(ctx context.Context, remoteHost, spinnerMessage string, args ...string) ([]byte, error) {
 	ghArgs := append([]string{"api", "--hostname", remoteHost}, args...)
 	return workflow.RunGHContext(ctx, spinnerMessage, ghArgs...)
-}
-
-func runOrgAPICombined(ctx context.Context, remoteHost, spinnerMessage string, args ...string) ([]byte, error) {
-	ghArgs := append([]string{"api", "--hostname", remoteHost}, args...)
-	return workflow.RunGHCombinedContext(ctx, spinnerMessage, ghArgs...)
 }
 
 func listOpenOrgItems(ctx context.Context, repo, collection string) ([]orgListItem, error) {
@@ -214,7 +211,7 @@ func addLabelToOrgPR(ctx context.Context, prURL, label string, verbose bool) {
 func createOrgIssue(ctx context.Context, repo, title, body, label string) error {
 	endpoint := fmt.Sprintf("/repos/%s/issues", repo)
 	remoteHost := getHostFromOriginRemote()
-	output, err := runOrgAPICombined(ctx, remoteHost, "Creating issue...",
+	output, err := runOrgAPI(ctx, remoteHost, "Creating issue...",
 		"--method", "POST",
 		endpoint,
 		"-f", "title="+title,
@@ -222,18 +219,45 @@ func createOrgIssue(ctx context.Context, repo, title, body, label string) error 
 		"-f", "labels[]="+label,
 	)
 	if err == nil {
-		return nil
+		return reportCreatedOrgIssue(ctx, repo, output)
 	}
 	if !isLabelValidationError(output, err) {
 		return err
 	}
 	// Label may not exist; retry without it so the issue is always created.
 	orgIPLog.Printf("Failed to create issue with label %q, retrying without: %v", label, err)
-	_, err = runOrgAPI(ctx, remoteHost, "Creating issue...",
+	output, err = runOrgAPI(ctx, remoteHost, "Creating issue...",
 		"--method", "POST",
 		endpoint,
 		"-f", "title="+title,
 		"-f", "body="+body,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	return reportCreatedOrgIssue(ctx, repo, output)
+}
+
+func reportCreatedOrgIssue(ctx context.Context, repo string, output []byte) error {
+	if updateReporter(ctx) == nil {
+		return nil
+	}
+	var response struct {
+		URL string `json:"html_url"`
+	}
+	parseErr := json.Unmarshal(output, &response)
+	event := updateJSONLEvent{Event: "issue", Repository: repo, Status: "created", URL: response.URL}
+	if parseErr != nil {
+		event.Error = "issue was created, but its response URL could not be decoded"
+	} else if response.URL == "" {
+		event.Error = "issue was created, but its response did not contain a URL"
+	}
+	outputErr := emitUpdateEvent(ctx, event)
+	if parseErr != nil {
+		return errors.Join(outputErr, fmt.Errorf("decoding created issue response: %w", parseErr))
+	}
+	if response.URL == "" {
+		return errors.Join(outputErr, errors.New("created issue response did not contain a URL"))
+	}
+	return outputErr
 }

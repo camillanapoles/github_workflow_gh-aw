@@ -20,16 +20,14 @@ type addArgs struct {
 }
 
 // registerAddTool registers the add tool with the MCP server.
-func registerAddTool(server *mcp.Server, execCmd execCmdFunc) {
+func registerAddTool(server *mcp.Server, execCmd execCmdFunc) { //nolint:largefunc // Existing MCP tool registration remains centralized.
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "add",
 		Annotations: &mcp.ToolAnnotations{
-			OpenWorldHint: new(true),
+			OpenWorldHint: boolPtr(true),
 		},
 		Description: "Add workflows from remote repositories to .github/workflows",
-		Icons: []mcp.Icon{
-			{Source: "➕"},
-		},
+		Icons:       mcpToolIcons("➕"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args addArgs) (*mcp.CallToolResult, any, error) {
 		// Check for cancellation before starting
 		select {
@@ -41,6 +39,14 @@ func registerAddTool(server *mcp.Server, execCmd execCmdFunc) {
 		// Validate required arguments
 		if len(args.Workflows) == 0 {
 			return nil, nil, newMCPError(jsonrpc.CodeInvalidParams, "missing required parameter: at least one workflow specification is required", nil)
+		}
+		if err := validateMCPPositionalArgs("workflows", args.Workflows...); err != nil {
+			return nil, nil, err
+		}
+		if args.Name != "" {
+			if err := validateAddedWorkflowName(args.Name); err != nil {
+				return nil, nil, newMCPError(jsonrpc.CodeInvalidParams, err.Error(), nil)
+			}
 		}
 		for _, workflowSpec := range args.Workflows {
 			if isRepositoryOnlyWorkflowSpec(workflowSpec) {
@@ -56,9 +62,6 @@ func registerAddTool(server *mcp.Server, execCmd execCmdFunc) {
 		// Build command arguments
 		cmdArgs := []string{"add"}
 
-		// Add workflows
-		cmdArgs = append(cmdArgs, args.Workflows...)
-
 		// Add optional flags
 		if args.Number > 0 {
 			cmdArgs = append(cmdArgs, "-c", strconv.Itoa(args.Number))
@@ -66,6 +69,7 @@ func registerAddTool(server *mcp.Server, execCmd execCmdFunc) {
 		if args.Name != "" {
 			cmdArgs = append(cmdArgs, "-n", args.Name)
 		}
+		cmdArgs = appendMCPPositionals(cmdArgs, args.Workflows...)
 
 		// Execute the CLI command
 		output, err := runMCPExecCombinedOutput(ctx, execCmd, cmdArgs...)
@@ -105,7 +109,7 @@ func registerUpdateTool(server *mcp.Server, execCmd execCmdFunc) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "update",
 		Annotations: &mcp.ToolAnnotations{
-			OpenWorldHint: new(true),
+			OpenWorldHint: boolPtr(true),
 		},
 		Description: `Update workflows from their source repositories and check for gh-aw updates.
 
@@ -123,9 +127,7 @@ Returns formatted text output showing:
 - Extension update status
 - Updated workflows with their new versions
 - Compilation status for each updated workflow`,
-		Icons: []mcp.Icon{
-			{Source: "🔄"},
-		},
+		Icons: mcpToolIcons("🔄"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args updateArgs) (*mcp.CallToolResult, any, error) {
 		// Check for cancellation before starting
 		select {
@@ -134,21 +136,21 @@ Returns formatted text output showing:
 		default:
 		}
 
+		if err := validateMCPPositionalArgs("workflows", args.Workflows...); err != nil {
+			return nil, nil, err
+		}
+
 		mcpToolsManagementLog.Printf("update tool invoked: workflows=%d, major=%v, force=%v", len(args.Workflows), args.Major, args.Force)
 
-		// Build command arguments
 		cmdArgs := []string{"update"}
 
-		// Add workflow IDs if specified
-		cmdArgs = append(cmdArgs, args.Workflows...)
-
-		// Add optional flags
 		if args.Major {
 			cmdArgs = append(cmdArgs, "--major")
 		}
 		if args.Force {
 			cmdArgs = append(cmdArgs, "--force")
 		}
+		cmdArgs = appendMCPPositionals(cmdArgs, args.Workflows...)
 
 		// Execute the CLI command
 		output, err := runMCPExecCombinedOutput(ctx, execCmd, cmdArgs...)
@@ -173,13 +175,13 @@ type fixArgs struct {
 }
 
 // registerFixTool registers the fix tool with the MCP server.
-func registerFixTool(server *mcp.Server, execCmd execCmdFunc) {
+func registerFixTool(server *mcp.Server, execCmd execCmdFunc) { //nolint:largefunc // Existing MCP tool registration remains centralized.
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "fix",
 		Annotations: &mcp.ToolAnnotations{
 			IdempotentHint:  true,
-			DestructiveHint: new(false),
-			OpenWorldHint:   new(false),
+			DestructiveHint: boolPtr(false),
+			OpenWorldHint:   boolPtr(false),
 		},
 		Description: `Apply automatic codemod-style fixes to agentic workflow files.
 
@@ -189,7 +191,6 @@ and migrate to new syntax. Codemods preserve formatting and comments as much as 
 Available codemods:
 • timeout-minutes-migration: Replaces 'timeout_minutes' with 'timeout-minutes'
 • network-firewall-migration: Removes deprecated 'network.firewall' field
-• sandbox-agent-false-removal: Removes 'sandbox.agent: false' (firewall now mandatory)
 • mcp-scripts-mode-removal: Removes deprecated 'mcp-scripts.mode' field
 
 If no workflows are specified, all Markdown files in .github/workflows will be processed.
@@ -204,9 +205,7 @@ Returns formatted text output showing:
 - List of workflow files processed
 - Which codemods were applied to each file
 - Summary of fixes applied`,
-		Icons: []mcp.Icon{
-			{Source: "🔧"},
-		},
+		Icons: mcpToolIcons("🔧"),
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args fixArgs) (*mcp.CallToolResult, any, error) {
 		// Check for cancellation before starting
 		select {
@@ -215,13 +214,14 @@ Returns formatted text output showing:
 		default:
 		}
 
+		if err := validateMCPPositionalArgs("workflows", args.Workflows...); err != nil {
+			return nil, nil, err
+		}
+
 		mcpToolsManagementLog.Printf("fix tool invoked: workflows=%d, write=%v, list_codemods=%v", len(args.Workflows), args.Write, args.ListCodemods)
 
 		// Build command arguments
 		cmdArgs := []string{"fix"}
-
-		// Add workflow IDs if specified
-		cmdArgs = append(cmdArgs, args.Workflows...)
 
 		// Add optional flags
 		if args.Write {
@@ -230,6 +230,7 @@ Returns formatted text output showing:
 		if args.ListCodemods {
 			cmdArgs = append(cmdArgs, "--list-codemods")
 		}
+		cmdArgs = appendMCPPositionals(cmdArgs, args.Workflows...)
 
 		// Execute the CLI command
 		output, err := runMCPExecCombinedOutput(ctx, execCmd, cmdArgs...)

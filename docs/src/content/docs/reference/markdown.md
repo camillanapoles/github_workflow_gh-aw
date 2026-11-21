@@ -5,7 +5,7 @@ sidebar:
   order: 300
 ---
 
-The markdown body is the most important part of your agentic workflow, containing natural language instructions for the AI agent. The markdown follows the frontmatter and is loaded at runtime, allowing you to edit instructions directly on GitHub.com without recompilation. For example:
+The markdown body contains the natural-language instructions for the AI agent. It follows the frontmatter and is loaded at runtime, so you can edit instructions directly on GitHub.com without recompilation. For example:
 
 ```aw wrap
 ---
@@ -19,7 +19,7 @@ Read the issue #${{ github.event.issue.number }}. Add a comment to the issue lis
 
 ## Writing Effective Instructions
 
-Write instructions as if explaining the task to a new team member. Be specific, provide context about your project and constraints, and structure instructions with headings to guide the agent's workflow.
+Write instructions as if explaining the task to a new team member: be specific, include relevant project context and constraints, and use headings to guide the workflow.
 
 ```aw wrap
 # Good: Specific and actionable
@@ -37,18 +37,18 @@ Focus on competitor analysis, emerging AI development trends, and community feed
 Create a structured report with executive summary, key findings by area, and recommended actions.
 ```
 
-Use action-oriented language with clear verbs (analyze, create, update, triage) and specify expected outcomes. Help agents make consistent decisions by providing criteria and examples:
+Use action-oriented verbs such as `analyze`, `create`, `update`, and `triage`, and state the expected outcome. Include clear criteria or examples when you need consistent decisions.
 
 ```aw wrap
 # Issue Labeling Criteria
 Apply labels: `bug` (incorrect behavior with repro steps), `enhancement` (new features), `question` (help requests), `documentation` (docs/examples). Priority: `high-priority` (security/critical bugs), `medium-priority` (features/non-critical bugs), `low-priority` (nice-to-have improvements).
 ```
 
-Anticipate unusual situations and error conditions. If a workflow fails, document the failure in an issue with error messages and context, tag it with 'workflow-failure', and exit gracefully without partial changes.
+Call out unusual situations and failure handling explicitly. For example, if a workflow fails, instruct the agent to file an issue with the error details, apply the `workflow-failure` label, and exit without partial changes.
 
 ## Content Organization
 
-Use numbered lists for multi-step processes, conditional statements for decision-making, and templates for consistent output:
+Use numbered lists for multi-step processes, conditional statements for decision-making, and templates for repeated output shapes:
 
 ```aw wrap
 # Code Review Process
@@ -70,7 +70,7 @@ Otherwise: label 'question'/'discussion', provide resources
 
 ## Common Pitfalls
 
-Avoid over-complexity (keep instructions focused), assuming knowledge (explain project conventions), inconsistent formatting, missing error handling, and vague success criteria. Before deploying, read instructions aloud to check clarity, review examples for accuracy, and consider edge cases.
+Avoid over-complexity, assumed knowledge, inconsistent formatting, missing error handling, and vague success criteria. Before deploying, read the instructions aloud, check examples for accuracy, and consider edge cases.
 
 ## Templating
 
@@ -78,7 +78,7 @@ Agentic markdown supports GitHub Actions expression substitutions and conditiona
 
 ## Editing and Iteration
 
-See [Editing Workflows](/gh-aw/guides/editing-workflows/) for complete guidance on when recompilation is needed versus when you can edit directly.
+See [Editing Workflows](/gh-aw/setup/working-with-workflows/#editing-workflows) for complete guidance on when recompilation is needed versus when you can edit directly.
 
 ## Markdown Scanning
 
@@ -111,9 +111,9 @@ Agent instructions go here.
 
 See [Inline Sub-Agents](/gh-aw/reference/inline-sub-agents/) for the full syntax reference.
 
-## Related Documentation
+## Learn More
 
-- [Editing Workflows](/gh-aw/guides/editing-workflows/) - When to recompile vs edit directly
+- [Editing Workflows](/gh-aw/setup/working-with-workflows/#editing-workflows) - When to recompile vs edit directly
 - [Workflow Structure](/gh-aw/reference/workflow-structure/) - Overall workflow file organization
 - [Frontmatter](/gh-aw/reference/frontmatter/) - YAML configuration options
 - [Inline Sub-Agents](/gh-aw/reference/inline-sub-agents/) - Defining Copilot sub-agents inside a workflow file

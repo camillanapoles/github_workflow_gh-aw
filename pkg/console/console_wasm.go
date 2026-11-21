@@ -7,13 +7,19 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/github/gh-aw/pkg/logger"
 )
+
+var consoleWasmLog = logger.New("console:console_wasm")
 
 func isTTY() bool {
 	return false
 }
 
 func FormatError(err CompilerError) string {
+	consoleWasmLog.Printf("FormatError: type=%s, file=%s, line=%d", err.Type, err.Position.File, err.Position.Line)
+
 	var output strings.Builder
 
 	var prefix string
@@ -38,6 +44,7 @@ func FormatError(err CompilerError) string {
 	output.WriteString("\n")
 
 	if len(err.Context) > 0 && err.Position.Line > 0 {
+		consoleWasmLog.Printf("FormatError: rendering %d lines of source context", len(err.Context))
 		maxLineNum := err.Position.Line + len(err.Context)/2
 		lineNumWidth := len(strconv.Itoa(maxLineNum))
 		for i, line := range err.Context {
@@ -81,6 +88,17 @@ func FormatListHeader(header string) string       { return header }
 func FormatListItem(item string) string           { return "  • " + item }
 func FormatSectionHeader(header string) string    { return header }
 
+// FormatErrorChain formats an error and its full unwrapped chain.
+// In the WASM build there is no rich terminal styling; the top-level error
+// message is sufficient for the JSON-based diagnostics that WASM consumers
+// produce. Full chain formatting is provided by the non-WASM implementation.
+func FormatErrorChain(err error) string {
+	if err == nil {
+		return ""
+	}
+	return "✗ " + err.Error()
+}
+
 func RenderTable(config TableConfig) string {
 	if len(config.Headers) == 0 {
 		return ""
@@ -102,6 +120,8 @@ func RenderTable(config TableConfig) string {
 	}
 	return output.String()
 }
+
+// RenderTableStderr preserves the WASM tab-separated table representation.
 
 func RenderTitleBox(title string, width int) []string {
 	separator := strings.Repeat("=", width)
@@ -130,6 +150,7 @@ func RenderComposedSections(sections []string) {
 }
 
 func RenderTree(root TreeNode) string {
+	consoleWasmLog.Printf("RenderTree: rendering tree rooted at %q with %d children", root.Value, len(root.Children))
 	var render func(node TreeNode, prefix string, isLast bool) string
 	render = func(node TreeNode, prefix string, isLast bool) string {
 		var output strings.Builder

@@ -8,10 +8,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/github/gh-aw/pkg/actionpins"
+	"github.com/goccy/go-yaml"
 )
 
-// TestSetupCLIAction tests the setup-cli action's install.sh script
+// TestSetupCLIAction tests the setup-cli action's generated install scripts.
 func TestSetupCLIAction(t *testing.T) {
+	t.Parallel()
 	// Get project root
 	wd, err := os.Getwd()
 	if err != nil {
@@ -19,10 +23,14 @@ func TestSetupCLIAction(t *testing.T) {
 	}
 	projectRoot := filepath.Join(wd, "..", "..")
 	installScript := filepath.Join(projectRoot, "actions", "setup-cli", "install.sh")
+	installPowerShellScript := filepath.Join(projectRoot, "actions", "setup-cli", "install.ps1")
 
-	// Verify script exists
+	// Verify scripts exist
 	if _, err := os.Stat(installScript); os.IsNotExist(err) {
 		t.Fatalf("install.sh script not found at: %s", installScript)
+	}
+	if _, err := os.Stat(installPowerShellScript); os.IsNotExist(err) {
+		t.Fatalf("install.ps1 script not found at: %s", installPowerShellScript)
 	}
 
 	// Verify script is executable
@@ -33,6 +41,36 @@ func TestSetupCLIAction(t *testing.T) {
 	if info.Mode()&0111 == 0 {
 		t.Errorf("install.sh is not executable")
 	}
+
+	t.Run("powershell_script_supports_input_version_env", func(t *testing.T) {
+		content, err := os.ReadFile(installPowerShellScript)
+		if err != nil {
+			t.Fatalf("Failed to read install.ps1: %v", err)
+		}
+		if !strings.Contains(string(content), "INPUT_VERSION") {
+			t.Errorf("install.ps1 does not support INPUT_VERSION environment variable")
+		}
+	})
+
+	t.Run("powershell_script_has_gh_extension_install_logic", func(t *testing.T) {
+		content, err := os.ReadFile(installPowerShellScript)
+		if err != nil {
+			t.Fatalf("Failed to read install.ps1: %v", err)
+		}
+		if !strings.Contains(string(content), "gh extension install") {
+			t.Errorf("install.ps1 does not include gh extension install logic")
+		}
+	})
+
+	t.Run("powershell_script_has_checksum_validation", func(t *testing.T) {
+		content, err := os.ReadFile(installPowerShellScript)
+		if err != nil {
+			t.Fatalf("Failed to read install.ps1: %v", err)
+		}
+		if !strings.Contains(string(content), "Get-FileHash") {
+			t.Errorf("install.ps1 does not include checksum validation")
+		}
+	})
 
 	// Test script syntax
 	t.Run("script_syntax_valid", func(t *testing.T) {
@@ -121,10 +159,29 @@ func TestSetupCLIAction(t *testing.T) {
 			t.Errorf("install.sh is not synced with install-gh-aw.sh. Run 'make sync-action-scripts'")
 		}
 	})
+
+	t.Run("powershell_script_synced_from_install_gh_aw", func(t *testing.T) {
+		installGhAwPowerShellScript := filepath.Join(projectRoot, "install-gh-aw.ps1")
+
+		installContent, err := os.ReadFile(installPowerShellScript)
+		if err != nil {
+			t.Fatalf("Failed to read install.ps1: %v", err)
+		}
+
+		installGhAwContent, err := os.ReadFile(installGhAwPowerShellScript)
+		if err != nil {
+			t.Fatalf("Failed to read install-gh-aw.ps1: %v", err)
+		}
+
+		if string(installContent) != string(installGhAwContent) {
+			t.Errorf("install.ps1 is not synced with install-gh-aw.ps1. Run 'make sync-action-scripts'")
+		}
+	})
 }
 
 // TestSetupCLIActionYAML tests the action.yml file structure
 func TestSetupCLIActionYAML(t *testing.T) {
+	t.Parallel()
 	wd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("Failed to get working directory: %v", err)
@@ -151,7 +208,6 @@ func TestSetupCLIActionYAML(t *testing.T) {
 		"description:",
 		"inputs:",
 		"version:",
-		"required: true",
 		"outputs:",
 		"installed-version:",
 		"runs:",
@@ -165,22 +221,44 @@ func TestSetupCLIActionYAML(t *testing.T) {
 		}
 	}
 
-	// Verify version input is required
-	if !strings.Contains(contentStr, "required: true") {
-		t.Errorf("version input should be required")
+	var action struct {
+		Inputs map[string]actionpins.ActionYAMLInput `yaml:"inputs"`
+	}
+	if err := yaml.Unmarshal(content, &action); err != nil {
+		t.Fatalf("Failed to parse action.yml: %v", err)
 	}
 
-	// Verify github-token has default value
-	if !strings.Contains(contentStr, "github-token:") {
-		t.Errorf("action.yml should define github-token input")
+	version, ok := action.Inputs["version"]
+	if !ok {
+		t.Fatal("action.yml should define version input")
 	}
-	if !strings.Contains(contentStr, "default: ${{ github.token }}") {
+	if version.Required {
+		t.Errorf("version input should be optional")
+	}
+	if version.Default != "latest" {
+		t.Errorf("version input should default to latest, got %q", version.Default)
+	}
+
+	githubToken, ok := action.Inputs["github-token"]
+	if !ok {
+		t.Fatal("action.yml should define github-token input")
+	}
+	if githubToken.Required {
+		t.Errorf("github-token input should be optional")
+	}
+	if githubToken.Default != "${{ github.token }}" {
 		t.Errorf("github-token should have default value of github.token")
 	}
 
 	// Verify GH_TOKEN environment variable is set
 	if !strings.Contains(contentStr, "GH_TOKEN:") {
 		t.Errorf("action.yml should set GH_TOKEN environment variable")
+	}
+	if !strings.Contains(contentStr, "runner.os == 'Windows'") {
+		t.Errorf("action.yml should install with PowerShell on Windows")
+	}
+	if !strings.Contains(contentStr, "install.ps1") {
+		t.Errorf("action.yml should reference install.ps1 for Windows runners")
 	}
 
 	// Verify no SHA mention (only release tags)

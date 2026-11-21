@@ -1,6 +1,7 @@
 // @ts-check
 import { describe, it, expect, beforeEach } from "vitest";
-const { main, parseDuplicateOf } = require("./close_issue.cjs");
+const { main: createHandler, parseDuplicateOf } = require("./close_issue.cjs");
+const main = (config = {}) => createHandler({ target: "*", ...config });
 
 describe("close_issue", () => {
   let mockCore;
@@ -13,6 +14,8 @@ describe("close_issue", () => {
       info: () => {},
       warning: () => {},
       error: () => {},
+      debug: () => {},
+      debugs: [],
       messages: [],
       infos: [],
       warnings: [],
@@ -31,6 +34,10 @@ describe("close_issue", () => {
     mockCore.error = msg => {
       mockCore.errors.push(msg);
       mockCore.messages.push({ level: "error", message: msg });
+    };
+    mockCore.debug = msg => {
+      mockCore.debugs.push(msg);
+      mockCore.messages.push({ level: "debug", message: msg });
     };
 
     mockGithub = {
@@ -64,6 +71,7 @@ describe("close_issue", () => {
     };
 
     mockContext = {
+      eventName: "issues",
       repo: {
         owner: "test-owner",
         repo: "test-repo",
@@ -139,8 +147,130 @@ describe("close_issue", () => {
       expect(updateCalls[0].state).toBe("closed");
     });
 
-    it("should close an issue from context when issue_number not provided", async () => {
+    it("should include issue-intent metadata on close when enabled", async () => {
       const handler = await main({ max: 10 });
+      const requestCalls = [];
+      mockGithub.request = async (route, params) => {
+        requestCalls.push({ route, params });
+        return {
+          data: {
+            number: params.issue_number,
+            title: "Test Issue",
+            html_url: `https://github.com/${params.owner}/${params.repo}/issues/${params.issue_number}`,
+          },
+        };
+      };
+
+      const result = await handler(
+        {
+          issue_number: 456,
+          body: "Closing this issue",
+          rationale: "Duplicate confirmed",
+          confidence: "medium",
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(requestCalls).toHaveLength(1);
+      expect(requestCalls[0].route).toBe("PATCH /repos/{owner}/{repo}/issues/{issue_number}");
+      expect(requestCalls[0].params.state).toEqual({ value: "closed", rationale: "Duplicate confirmed", confidence: "MEDIUM" });
+      expect(requestCalls[0].params.rationale).toBeUndefined();
+      expect(requestCalls[0].params.confidence).toBeUndefined();
+      expect(requestCalls[0].params.headers).toBeUndefined();
+      expect(mockCore.debugs).toContain("Attempting issue-intent close request");
+      expect(mockCore.debugs).toContain("Issue-intent close request succeeded");
+    });
+
+    it.each([403, 422, 500])("should fail without a legacy close when the intent request returns %i", async status => {
+      const handler = await main({ max: 10 });
+      let updateCalled = false;
+      mockGithub.request = async () => {
+        throw Object.assign(new Error("Intent rejected"), { status });
+      };
+      mockGithub.rest.issues.update = async () => {
+        updateCalled = true;
+        throw new Error("Legacy close must not be called");
+      };
+
+      const result = await handler({ issue_number: 456, body: "Closing this issue", rationale: "Confirmed" }, {});
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("Intent rejected");
+      expect(updateCalled).toBe(false);
+      expect(mockCore.debugs).toContain(`Issue-intent close request failed; legacy fallback disabled (status=${status})`);
+      expect(mockCore.debugs.join(" ")).not.toContain("Intent rejected");
+    });
+
+    it.each([404, 501])("should fall back to a legacy close when the intent endpoint returns %i", async status => {
+      const handler = await main({ max: 10 });
+      let updateCalled = false;
+      mockGithub.request = async () => {
+        throw Object.assign(new Error("Intent endpoint unavailable"), { status });
+      };
+      mockGithub.rest.issues.update = async params => {
+        updateCalled = true;
+        return { data: { number: params.issue_number, title: "Test Issue", html_url: "https://github.com/test-owner/test-repo/issues/456" } };
+      };
+
+      const result = await handler({ issue_number: 456, body: "Closing this issue", rationale: "Confirmed" }, {});
+
+      expect(result.success).toBe(true);
+      expect(updateCalled).toBe(true);
+      expect(mockCore.warnings).toEqual([`Issue-intent close endpoint unavailable (status=${status}); falling back to legacy close path`]);
+    });
+
+    it("should fall back when the unavailable intent status is wrapped in the response", async () => {
+      const handler = await main({ max: 10 });
+      let updateCalled = false;
+      mockGithub.request = async () => {
+        throw Object.assign(new Error("Intent endpoint unavailable"), { response: { status: 404 } });
+      };
+      mockGithub.rest.issues.update = async params => {
+        updateCalled = true;
+        return { data: { number: params.issue_number, title: "Test Issue", html_url: "https://github.com/test-owner/test-repo/issues/456" } };
+      };
+
+      const result = await handler({ issue_number: 456, body: "Closing this issue", rationale: "Confirmed" }, {});
+
+      expect(result.success).toBe(true);
+      expect(updateCalled).toBe(true);
+      expect(mockCore.warnings).toEqual(["Issue-intent close endpoint unavailable (status=404); falling back to legacy close path"]);
+    });
+
+    it("should skip issue-intent metadata when explicitly disabled", async () => {
+      const handler = await main({ max: 10, issue_intent: false });
+      const updateCalls = [];
+      mockGithub.rest.issues.update = async params => {
+        updateCalls.push(params);
+        return {
+          data: {
+            number: params.issue_number,
+            title: "Test Issue",
+            html_url: `https://github.com/${params.owner}/${params.repo}/issues/${params.issue_number}`,
+          },
+        };
+      };
+
+      const result = await handler(
+        {
+          issue_number: 456,
+          body: "Closing this issue",
+          rationale: "Duplicate confirmed",
+          confidence: "high",
+        },
+        {}
+      );
+
+      expect(result.success).toBe(true);
+      expect(updateCalls).toHaveLength(1);
+      expect(updateCalls[0].rationale).toBeUndefined();
+      expect(updateCalls[0].confidence).toBeUndefined();
+      expect(updateCalls[0].headers).toBeUndefined();
+    });
+
+    it("should close an issue from context when issue_number not provided", async () => {
+      const handler = await main({ max: 10, target: "triggering" });
       const updateCalls = [];
 
       mockGithub.rest.issues.update = async params => {
@@ -174,18 +304,18 @@ describe("close_issue", () => {
       );
 
       expect(result.success).toBe(false);
-      expect(result.error).toContain("Invalid issue number");
+      expect(result.error).toContain("Invalid item_number/issue_number");
     });
 
     it("should handle missing issue_number and no context", async () => {
       mockContext.payload = {};
 
-      const handler = await main({ max: 10 });
+      const handler = await main({ max: 10, target: "triggering" });
 
       const result = await handler({ body: "Trying to close" }, {});
 
       expect(result.success).toBe(false);
-      expect(result.error).toContain("No issue number available");
+      expect(result.error).toContain("no issue found");
     });
 
     it("should respect max count limit", async () => {
@@ -318,6 +448,8 @@ describe("close_issue", () => {
       expect(result.success).toBe(true);
       expect(commentCalls.length).toBe(1);
       expect(commentCalls[0].body).toContain("This issue is being closed automatically");
+      expect(commentCalls[0].body).toContain("for #123");
+      expect(commentCalls[0].body).toContain("gh-aw-agentic-workflow:");
     });
 
     it("should use body field from message over config comment", async () => {
@@ -348,8 +480,26 @@ describe("close_issue", () => {
       expect(result.success).toBe(true);
       expect(commentCalls.length).toBe(1);
       // Should use the body from message, not the config comment
-      expect(commentCalls[0].body).toBe("Custom body from message");
+      expect(commentCalls[0].body).toContain("Custom body from message");
+      expect(commentCalls[0].body).toContain("for #123");
+      expect(commentCalls[0].body).toContain("gh-aw-agentic-workflow:");
       expect(commentCalls[0].body).not.toContain("Default comment from config");
+    });
+
+    it("should pass shell metacharacters in a comment as API data", async () => {
+      const payload = "$(touch /tmp/gh-aw-command-injection); echo safe";
+      const handler = await main({ max: 10 });
+      const commentCalls = [];
+      mockGithub.rest.issues.createComment = async params => {
+        commentCalls.push(params);
+        return { data: { id: 999, html_url: "https://github.com/test-owner/test-repo/issues/100#issuecomment-999" } };
+      };
+
+      const result = await handler({ issue_number: 100, body: payload }, {});
+
+      expect(result.success).toBe(true);
+      expect(commentCalls).toHaveLength(1);
+      expect(commentCalls[0].body).toContain(payload);
     });
 
     it("should require body field when no config comment is set", async () => {
@@ -441,7 +591,7 @@ describe("close_issue", () => {
 
       expect(result.success).toBe(true);
       expect(result.alreadyClosed).toBe(true);
-      expect(commentBody).toBe("Closing comment with details");
+      expect(commentBody).toContain("Closing comment with details");
       expect(issueUpdateCalled).toBe(false); // Should not call update for already closed issue
     });
 
@@ -725,7 +875,7 @@ describe("close_issue", () => {
       expect(updateCalls[0].state_reason).toBe("duplicate");
     });
 
-    it("should prefer item-level state_reason over config-level default", async () => {
+    it("should enforce scalar state_reason from config regardless of item-level value", async () => {
       const handler = await main({ max: 10, state_reason: "NOT_PLANNED" });
       const updateCalls = [];
 
@@ -740,10 +890,116 @@ describe("close_issue", () => {
         };
       };
 
+      // Agent provides DUPLICATE but scalar config is NOT_PLANNED — config wins.
       const result = await handler({ issue_number: 100, body: "Duplicate of #50", state_reason: "DUPLICATE" }, {});
 
       expect(result.success).toBe(true);
+      expect(updateCalls[0].state_reason).toBe("not_planned");
+    });
+
+    it("should use first item in allowed_state_reason list as default when agent omits state_reason", async () => {
+      const handler = await main({ max: 10, allowed_state_reason: ["not_planned", "duplicate"] });
+      const updateCalls = [];
+
+      mockGithub.rest.issues.update = async params => {
+        updateCalls.push(params);
+        return {
+          data: {
+            number: params.issue_number,
+            title: "Test Issue",
+            html_url: `https://github.com/${params.owner}/${params.repo}/issues/${params.issue_number}`,
+          },
+        };
+      };
+
+      const result = await handler({ issue_number: 100, body: "Closing" }, {});
+
+      expect(result.success).toBe(true);
+      expect(updateCalls[0].state_reason).toBe("not_planned");
+    });
+
+    it("should accept item-level state_reason from allowed_state_reason list", async () => {
+      const handler = await main({ max: 10, allowed_state_reason: ["not_planned", "duplicate"] });
+      const updateCalls = [];
+
+      mockGithub.rest.issues.update = async params => {
+        updateCalls.push(params);
+        return {
+          data: {
+            number: params.issue_number,
+            title: "Test Issue",
+            html_url: `https://github.com/${params.owner}/${params.repo}/issues/${params.issue_number}`,
+          },
+        };
+      };
+
+      const result = await handler({ issue_number: 100, body: "Duplicate", state_reason: "DUPLICATE" }, {});
+
+      expect(result.success).toBe(true);
       expect(updateCalls[0].state_reason).toBe("duplicate");
+    });
+
+    it("should reject item-level state_reason not in allowed_state_reason list", async () => {
+      const handler = await main({ max: 10, allowed_state_reason: ["not_planned", "duplicate"] });
+
+      const result = await handler({ issue_number: 100, body: "Completed", state_reason: "COMPLETED" }, {});
+
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/not permitted/i);
+      expect(result.error).toMatch(/COMPLETED/);
+    });
+
+    it("should accept item-level state_reason for omitted config (all three values)", async () => {
+      const handler = await main({ max: 10 });
+      const updateCalls = [];
+
+      mockGithub.rest.issues.update = async params => {
+        updateCalls.push(params);
+        return {
+          data: {
+            number: params.issue_number,
+            title: "Test Issue",
+            html_url: `https://github.com/${params.owner}/${params.repo}/issues/${params.issue_number}`,
+          },
+        };
+      };
+
+      for (const reason of ["COMPLETED", "NOT_PLANNED", "DUPLICATE"]) {
+        updateCalls.length = 0;
+        const result = await handler({ issue_number: 100, body: "Closing", state_reason: reason }, {});
+        expect(result.success).toBe(true);
+        expect(updateCalls[0].state_reason).toBe(reason.toLowerCase());
+      }
+    });
+
+    it("should reject invalid state_reason for omitted config", async () => {
+      const handler = await main({ max: 10 });
+
+      const result = await handler({ issue_number: 100, body: "Closing", state_reason: "INVALID" }, {});
+
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/not a supported value/i);
+    });
+
+    it("should default to COMPLETED when omitted config and agent omits state_reason", async () => {
+      const handler = await main({ max: 10 });
+      const updateCalls = [];
+
+      mockGithub.rest.issues.update = async params => {
+        updateCalls.push(params);
+        return {
+          data: {
+            number: params.issue_number,
+            title: "Test Issue",
+            html_url: `https://github.com/${params.owner}/${params.repo}/issues/${params.issue_number}`,
+          },
+        };
+      };
+
+      const result = await handler({ issue_number: 100, body: "Closing" }, {});
+
+      expect(result.success).toBe(true);
+      expect(updateCalls[0].state_reason).toBe("completed");
     });
 
     it("should resolve temporary ID in issue_number field", async () => {
@@ -933,6 +1189,107 @@ describe("close_issue", () => {
   });
 
   describe("duplicate_of native marking", () => {
+    it.each([50, "50", "#50", "test-owner/test-repo#50", "https://github.com/test-owner/test-repo/issues/50", "other-org/other-repo#50"])("should resolve %s to a database ID before sending a duplicate close intent", async duplicateOf => {
+      const handler = await main({ allowed_repos: ["other-org/other-repo"] });
+      const getCalls = [];
+      const requestCalls = [];
+      const graphqlCalls = [];
+      mockGithub.rest.issues.get = async params => {
+        getCalls.push(params);
+        return { data: { id: 100000 + params.issue_number, node_id: `node_${params.issue_number}`, number: params.issue_number, title: "Test Issue", labels: [], state: "open" } };
+      };
+      mockGithub.request = async (route, params) => {
+        expect(getCalls).toHaveLength(2);
+        requestCalls.push({ route, params });
+        return { data: { number: params.issue_number, node_id: `node_${params.issue_number}`, title: "Test Issue", state: "open" } };
+      };
+      mockGithub.graphql = async (mutation, variables) => graphqlCalls.push(variables);
+
+      const result = await handler({ issue_number: 100, body: "Duplicate", state_reason: "duplicate", duplicate_of: duplicateOf, suggest: true, rationale: "Same defect", confidence: "high" }, {});
+
+      expect(result.success).toBe(true);
+      expect(getCalls[1]).toEqual({
+        owner: String(duplicateOf).startsWith("other-org/") ? "other-org" : "test-owner",
+        repo: String(duplicateOf).startsWith("other-org/") ? "other-repo" : "test-repo",
+        issue_number: 50,
+      });
+      expect(requestCalls).toEqual([
+        {
+          route: "PATCH /repos/{owner}/{repo}/issues/{issue_number}",
+          params: {
+            owner: "test-owner",
+            repo: "test-repo",
+            issue_number: 100,
+            state: { value: "closed", suggest: true, rationale: "Same defect", confidence: "HIGH" },
+            state_reason: "duplicate",
+            duplicate_issue_id: 100050,
+          },
+        },
+      ]);
+      expect(getCalls).toHaveLength(2);
+      expect(graphqlCalls).toHaveLength(1);
+      expect(graphqlCalls[0].canonicalId).toBe("node_50");
+    });
+
+    it.each([403, 404, "missing ID"])("should fail closed when canonical issue lookup fails with %s", async failure => {
+      const handler = await main();
+      const mutations = [];
+      mockGithub.rest.issues.get = async ({ issue_number }) => {
+        if (issue_number === 50 && typeof failure === "number") {
+          throw Object.assign(new Error("Canonical issue unavailable"), { status: failure });
+        }
+        return { data: { number: issue_number, title: "Test Issue", labels: [], state: "open" } };
+      };
+      mockGithub.request = async () => mutations.push("intent");
+      mockGithub.rest.issues.update = async () => mutations.push("legacy close");
+      mockGithub.graphql = async () => mutations.push("duplicate marking");
+
+      const result = await handler({ issue_number: 100, body: "Duplicate", state_reason: "duplicate", duplicate_of: 50, suggest: true }, {});
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain(failure === "missing ID" ? "id missing for canonical issue" : "Canonical issue unavailable");
+      expect(mutations).toEqual([]);
+    });
+
+    it.each([
+      { fields: { duplicate_of: "invalid" }, rejected: true },
+      { fields: { duplicate_of: 100 }, rejected: true },
+      { fields: { duplicate_of: "Test-Owner/Test-Repo#100" }, rejected: true },
+      { fields: { duplicate_of: "other-org/other-repo#50" }, rejected: true },
+      { fields: { duplicate_of: 50, state_reason: "completed" }, rejected: false },
+    ])("should handle an ineligible duplicate reference safely: %j", async ({ fields, rejected }) => {
+      const handler = await main();
+      const getCalls = [];
+      const requestCalls = [];
+      const updateCalls = [];
+      mockGithub.rest.issues.get = async params => {
+        getCalls.push(params);
+        return { data: { number: params.issue_number, title: "Test Issue", labels: [], state: "open" } };
+      };
+      mockGithub.request = async (route, params) => {
+        requestCalls.push(params);
+        return { data: { number: params.issue_number, title: "Test Issue" } };
+      };
+      mockGithub.rest.issues.update = async params => {
+        updateCalls.push(params);
+        return { data: { number: params.issue_number, title: "Test Issue" } };
+      };
+
+      const result = await handler({ issue_number: 100, body: "Close", state_reason: "duplicate", suggest: true, ...fields }, {});
+
+      expect(getCalls).toHaveLength(1);
+      if (rejected) {
+        expect(result.success).toBe(false);
+        expect(result.error).toContain("duplicate close intent requires a valid");
+        expect(requestCalls).toHaveLength(0);
+        expect(updateCalls).toHaveLength(0);
+      } else {
+        expect(result.success).toBe(true);
+        expect(requestCalls).toHaveLength(1);
+        expect(requestCalls[0].duplicate_issue_id).toBeUndefined();
+      }
+    });
+
     it("should call markAsDuplicate mutation when duplicate_of and state_reason DUPLICATE are set", async () => {
       const handler = await main({ max: 10, state_reason: "DUPLICATE" });
       const graphqlCalls = [];
@@ -1255,6 +1612,65 @@ describe("close_issue", () => {
       expect(result.success).toBe(true);
       expect(graphqlCalls.length).toBe(0);
       expect(mockCore.warnings.some(w => w.includes("not DUPLICATE"))).toBe(true);
+    });
+
+    it("should mark native duplicate when using allowed_state_reason list with DUPLICATE and duplicate_of", async () => {
+      const handler = await main({ max: 10, allowed_state_reason: ["not_planned", "duplicate"] });
+      const graphqlCalls = [];
+      const requestCalls = [];
+
+      mockGithub.rest.issues.get = async ({ owner, repo, issue_number }) => ({
+        data: {
+          id: 100000 + issue_number,
+          number: issue_number,
+          title: "Test Issue",
+          labels: [],
+          html_url: `https://github.com/${owner}/${repo}/issues/${issue_number}`,
+          state: "open",
+          node_id: `node_${owner}_${repo}_${issue_number}`,
+        },
+      });
+
+      mockGithub.rest.issues.update = async params => ({
+        data: {
+          number: params.issue_number,
+          title: "Test Issue",
+          html_url: `https://github.com/${params.owner}/${params.repo}/issues/${params.issue_number}`,
+          node_id: `node_${params.owner}_${params.repo}_${params.issue_number}`,
+        },
+      });
+
+      mockGithub.request = async (route, params) => {
+        requestCalls.push({ route, params });
+        return {
+          data: {
+            number: params.issue_number,
+            title: "Test Issue",
+            html_url: `https://github.com/${params.owner}/${params.repo}/issues/${params.issue_number}`,
+            node_id: `node_${params.owner}_${params.repo}_${params.issue_number}`,
+          },
+        };
+      };
+
+      mockGithub.graphql = async (mutation, variables) => {
+        graphqlCalls.push(variables);
+        return { markAsDuplicate: { duplicate: { id: variables.duplicateId, number: 1003 } } };
+      };
+
+      const result = await handler({ issue_number: 1003, body: "Duplicate report", state_reason: "DUPLICATE", duplicate_of: 50, suggest: true, rationale: "Same CSV defect.", confidence: "HIGH" }, {});
+
+      expect(result.success).toBe(true);
+
+      // Verify issue-intent PATCH was called with the intent metadata intact (suggest, rationale, confidence)
+      expect(requestCalls).toHaveLength(1);
+      expect(requestCalls[0].route).toBe("PATCH /repos/{owner}/{repo}/issues/{issue_number}");
+      expect(requestCalls[0].params.state).toMatchObject({ value: "closed", suggest: true, rationale: "Same CSV defect.", confidence: "HIGH" });
+      expect(requestCalls[0].params.duplicate_issue_id).toBe(100050);
+
+      // Verify the native duplicate GraphQL mutation was also executed
+      expect(graphqlCalls.length).toBeGreaterThan(0);
+      const mutation = graphqlCalls.find(c => "duplicateId" in c || "canonicalId" in c);
+      expect(mutation).toBeDefined();
     });
   });
 });

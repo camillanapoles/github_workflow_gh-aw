@@ -1,15 +1,9 @@
 // @ts-check
 /// <reference types="@actions/github-script" />
 
-const {
-  createEngineLogParser,
-  generateConversationMarkdown,
-  generateInformationSection,
-  buildStepSummaryDetailsSection,
-  formatInitializationSummary,
-  formatToolUse,
-  convertLegacyLogEntriesToCopilotEvents,
-} = require("./log_parser_shared.cjs");
+const { createEngineLogParser, generateConversationMarkdown, generateInformationSection, buildStepSummaryDetailsSection, formatInitializationSummary, formatToolUse, parseLogEntries } = require("./log_parser_shared.cjs");
+const { transformFlatSessionEntries, projectSessionResult, selectSessionResult, reconcileSessionUsage } = require("./agent_session.cjs");
+const { transformPiV3Entries, computePiV3Stats, normalizePiObservations } = require("./pi_session.cjs");
 
 const main = createEngineLogParser({
   parserName: "Pi",
@@ -18,83 +12,71 @@ const main = createEngineLogParser({
 });
 
 /**
- * Parse Pi CLI JSONL streaming log output and format as markdown.
- * Pi CLI emits one JSON object per line (JSONL) with typed events:
- * - type "init":        session initialization with model and session_id
- * - type "assistant":   agent message content (delta:true for streaming chunks)
- * - type "tool_use":    tool invocations with tool_name, tool_id, and parameters
- * - type "tool_result": tool responses with tool_id, status, and output
- * - type "result":      final stats with token usage and duration
+ * Parse Pi-compatible CLI JSONL streaming log output and format as markdown.
+ * Normalize native streaming events and historical flat records directly into
+ * canonical session events, then render the shared conversation and usage view.
  * @param {string} logContent - The raw log content to parse
+ * @param {{sourceEngine?: string, displayName?: string}} [options]
  * @returns {{markdown: string, logEntries: Array, mcpFailures: Array<string>, maxTurnsHit: boolean}} Parsed log data
  */
-function parsePiLog(logContent) {
+function parsePiStreamLog(logContent, { sourceEngine = "pi", displayName = "Pi" } = {}) {
   if (!logContent) {
     return {
-      markdown: buildStepSummaryDetailsSection("Pi", "No log content provided."),
+      markdown: buildStepSummaryDetailsSection(displayName, "No log content provided."),
       logEntries: [],
       mcpFailures: [],
       maxTurnsHit: false,
     };
   }
 
-  /** @type {Array<any>} */
-  const rawEntries = [];
-  for (const line of logContent.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed || !trimmed.startsWith("{")) {
-      continue;
-    }
-    try {
-      rawEntries.push(JSON.parse(trimmed));
-    } catch (_e) {
-      // Skip non-JSON lines
-    }
-  }
+  const rawEntries = (parseLogEntries(logContent) ?? []).filter(e => e && typeof e === "object" && !Array.isArray(e));
 
   if (rawEntries.length === 0) {
     return {
-      markdown: buildStepSummaryDetailsSection("Pi", "Log format not recognized as Pi JSONL."),
+      markdown: buildStepSummaryDetailsSection(displayName, `Log format not recognized as ${displayName} JSONL.`),
       logEntries: [],
       mcpFailures: [],
       maxTurnsHit: false,
     };
   }
 
-  const logEntries = transformPiEntries(rawEntries);
-
-  const resultEntry = rawEntries.find(e => e.type === "result");
-
-  const canonicalLogEntries = convertLegacyLogEntriesToCopilotEvents(logEntries, { sourceEngine: "pi" });
+  // Pi CLI's `--mode json` output schema changed over time. Current builds emit a
+  // v3 streaming schema (session, turn_start, turn_end, tool_execution_start/end, agent_end)
+  // while older builds emitted a flat init/assistant/tool_use/tool_result/result schema.
+  // Detect which schema this log uses and transform accordingly so the step summary
+  // renders the conversation and token stats for both.
+  const useV3Schema = isPiV3Schema(rawEntries);
+  const stats = useV3Schema ? computePiV3Stats(rawEntries, { sourceEngine }) : null;
+  const canonicalLogEntries = transformPiV3Entries(rawEntries, undefined, { sourceEngine });
+  if (stats) {
+    const terminal = [...canonicalLogEntries].reverse().find(event => event.type === "session.result");
+    const selected = selectSessionResult(canonicalLogEntries);
+    const data = {
+      sourceEngine: selected?.sourceEngine ?? sourceEngine,
+      numTurns: stats.turns ?? selected?.numTurns,
+      usage: reconcileSessionUsage(selected?.usage, stats.usage),
+      totalCostUsd: stats.total_cost_usd ?? selected?.totalCostUsd,
+      durationMs: stats.duration_ms ?? selected?.durationMs,
+    };
+    if (terminal) {
+      Object.assign(terminal.data, data);
+      if (stats.errors.length || stats.exposedErrors) terminal.data.errors = [...(Array.isArray(terminal.data.errors) ? terminal.data.errors : []), ...stats.errors];
+    } else {
+      canonicalLogEntries.push({ type: "session.result", data: { ...data, errors: stats.errors.length || stats.exposedErrors ? stats.errors : undefined } });
+    }
+  }
+  if (canonicalLogEntries.length === 0) {
+    return { markdown: buildStepSummaryDetailsSection(displayName, `Log format not recognized as ${displayName} JSONL.`), logEntries: [], mcpFailures: [], maxTurnsHit: false };
+  }
   const conversationResult = generateConversationMarkdown(canonicalLogEntries, {
+    includeInformation: false,
     formatToolCallback: (toolUse, toolResult) => formatToolUse(toolUse, toolResult, { includeDetailedParameters: false }),
     formatInitCallback: initEntry => formatInitializationSummary(initEntry, { includeSlashCommands: false }),
   });
 
   let markdown = conversationResult.markdown;
 
-  if (resultEntry && resultEntry.stats) {
-    const stats = resultEntry.stats;
-    const syntheticEntry = {
-      usage: {
-        input_tokens: stats.input_tokens || 0,
-        output_tokens: stats.output_tokens || 0,
-      },
-      duration_ms: stats.duration_ms || 0,
-      num_turns: stats.turns || 0,
-    };
-    markdown += generateInformationSection(syntheticEntry);
-
-    // Append a normalized result entry so log_parser_bootstrap.cjs can write it
-    // to agent-stdio.log for OTEL gh-aw.turns / token-usage enrichment.
-    canonicalLogEntries.push({
-      type: "result",
-      num_turns: syntheticEntry.num_turns,
-      usage: syntheticEntry.usage,
-    });
-  } else {
-    markdown += generateInformationSection(null);
-  }
+  markdown += generateInformationSection(projectSessionResult(canonicalLogEntries));
 
   return {
     markdown,
@@ -102,6 +84,14 @@ function parsePiLog(logContent) {
     mcpFailures: [],
     maxTurnsHit: false,
   };
+}
+
+/**
+ * @param {string} logContent - The raw log content to parse
+ * @returns {{markdown: string, logEntries: Array, mcpFailures: Array<string>, maxTurnsHit: boolean}} Parsed log data
+ */
+function parsePiLog(logContent) {
+  return parsePiStreamLog(logContent, { sourceEngine: "pi", displayName: "Pi" });
 }
 
 /**
@@ -118,77 +108,53 @@ function parsePiLog(logContent) {
  * @returns {Array<any>} Canonical log entries for generateConversationMarkdown
  */
 function transformPiEntries(rawEntries) {
-  /** @type {Array<any>} */
-  const entries = [];
-
-  for (const raw of rawEntries) {
-    if (raw.type === "init") {
-      entries.push({
-        type: "system",
-        subtype: "init",
-        model: raw.model,
-        session_id: raw.session_id,
-      });
-    } else if (raw.type === "assistant") {
-      const text = raw.content || "";
-      if (!text.trim()) {
-        continue;
-      }
-      // Merge consecutive streaming delta chunks into one assistant text entry.
-      const last = entries[entries.length - 1];
-      if (raw.delta === true && isConsecutiveDeltaEntry(last)) {
-        last.message.content[0].text += text;
-      } else {
-        entries.push({
-          type: "assistant",
-          message: {
-            content: [{ type: "text", text }],
-          },
-        });
-      }
-    } else if (raw.type === "tool_use") {
-      entries.push({
-        type: "assistant",
-        message: {
-          content: [
-            {
-              type: "tool_use",
-              id: raw.tool_id,
-              name: raw.tool_name,
-              input: raw.parameters || {},
-            },
-          ],
-        },
-      });
-    } else if (raw.type === "tool_result") {
-      const output = typeof raw.output === "string" ? raw.output : JSON.stringify(raw.output || "");
-      entries.push({
-        type: "user",
-        message: {
-          content: [
-            {
-              type: "tool_result",
-              tool_use_id: raw.tool_id,
-              content: output,
-              is_error: raw.status !== "success",
-            },
-          ],
-        },
-      });
-    }
-  }
-
-  return entries;
+  return transformFlatSessionEntries(rawEntries);
 }
 
 /**
- * Checks whether a canonical log entry is an assistant text entry eligible for merging
- * with a subsequent streaming delta chunk.
- * @param {any} entry - The candidate last entry
- * @returns {boolean} True when the entry is a mergeable assistant text entry
+ * Detects whether the raw Pi entries use the v3 streaming schema.
+ *
+ * The v3 schema emits envelope events (session, turn_end, tool_execution_start/end, agent_end)
+ * that the legacy flat schema (init/assistant/tool_use/tool_result/result) never uses.
+ * A single marker event is enough to distinguish the two.
+ *
+ * @param {Array<any>} rawEntries - Raw parsed JSONL entries
+ * @returns {boolean} True when the log uses the v3 streaming schema
  */
-function isConsecutiveDeltaEntry(entry) {
-  return entry && entry.type === "assistant" && entry.message && Array.isArray(entry.message.content) && entry.message.content.length === 1 && entry.message.content[0].type === "text";
+function isPiV3Schema(rawEntries) {
+  for (const e of rawEntries) {
+    if (!e || typeof e.type !== "string") {
+      continue;
+    }
+    if (
+      e.type === "turn_end" ||
+      e.type === "turn_start" ||
+      e.type === "agent_end" ||
+      e.type === "agent_start" ||
+      e.type === "tool_execution_start" ||
+      e.type === "tool_execution_end" ||
+      e.type === "tool_execution_update" ||
+      e.type === "extension_error" ||
+      e.type === "message_update" ||
+      e.type === "message_start" ||
+      e.type === "message_end" ||
+      (e.type === "message" && e.message && typeof e.message.role === "string") ||
+      (e.type === "session" && typeof e.version === "number")
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Normalizes Pi tool call names to the canonical names expected by the shared
+ * formatters (e.g. log_parser_format.cjs special-cases "Bash", not "bash").
+ * @param {string} name - Raw tool name as emitted by Pi
+ * @returns {string} Normalized tool name
+ */
+function normalizePiToolName(name) {
+  return typeof name === "string" && name.trim().toLowerCase() === "bash" ? "Bash" : name;
 }
 
 // Export for testing
@@ -197,5 +163,10 @@ if (typeof module !== "undefined" && module.exports) {
     main,
     parsePiLog,
     transformPiEntries,
+    isPiV3Schema,
+    transformPiV3Entries,
+    computePiV3Stats,
+    normalizePiToolName,
+    normalizeSessionEvents: normalizePiObservations,
   };
 }

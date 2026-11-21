@@ -378,6 +378,7 @@ func TestAddCustomStepsWithRuntimeInsertion(t *testing.T) {
 		customSteps       string
 		runtimeSetupSteps []GitHubActionStep
 		tools             *ToolsConfig
+		ensureArcNodePath bool
 		expectInOutput    []string
 		expectStepOrder   []string
 		notInOutput       []string
@@ -393,7 +394,7 @@ func TestAddCustomStepsWithRuntimeInsertion(t *testing.T) {
   - name: Build
     run: make build`,
 			runtimeSetupSteps: []GitHubActionStep{
-				{"      - name: Setup Node.js", "        uses: actions/setup-node@v4", "        with:", "          node-version: '20'"},
+				{"      - name: Setup Node.js", "        uses: actions/setup-node@v4", "        with:", "          node-version: '24'"},
 			},
 			tools: &ToolsConfig{},
 			expectInOutput: []string{
@@ -401,7 +402,7 @@ func TestAddCustomStepsWithRuntimeInsertion(t *testing.T) {
 				"uses: actions/checkout@v4",
 				"- name: Setup Node.js",
 				"uses: actions/setup-node@v4",
-				"node-version: '20'",
+				"node-version: '24'",
 				"- name: Build",
 				"run: make build",
 			},
@@ -433,7 +434,7 @@ func TestAddCustomStepsWithRuntimeInsertion(t *testing.T) {
 			insertionHappened: false,
 		},
 		{
-			name: "checkout with uses on same line - not detected as checkout",
+			name: "checkout with uses on same line",
 			customSteps: `steps:
   - uses: actions/checkout@v4
   - name: Build
@@ -444,12 +445,14 @@ func TestAddCustomStepsWithRuntimeInsertion(t *testing.T) {
 			tools: &ToolsConfig{},
 			expectInOutput: []string{
 				"- uses: actions/checkout@v4",
+				"- name: Setup Go",
 				"- name: Build",
 			},
-			notInOutput: []string{
-				"Setup Go", // Won't be inserted - function doesn't detect "- uses:" as checkout
+			expectStepOrder: []string{
+				"Setup Go",
+				"Build",
 			},
-			insertionHappened: false,
+			insertionHappened: true,
 		},
 		{
 			name: "multiple runtime steps inserted",
@@ -462,16 +465,19 @@ func TestAddCustomStepsWithRuntimeInsertion(t *testing.T) {
 				{"      - name: Setup Node.js", "        uses: actions/setup-node@v4"},
 				{"      - name: Setup Python", "        uses: actions/setup-python@v5"},
 			},
-			tools: &ToolsConfig{},
+			tools:             &ToolsConfig{},
+			ensureArcNodePath: true,
 			expectInOutput: []string{
 				"- name: Checkout",
 				"- name: Setup Node.js",
+				"- name: Ensure Node.js is at daemon-visible path",
 				"- name: Setup Python",
 				"- name: Deploy",
 			},
 			expectStepOrder: []string{
 				"Checkout",
 				"Setup Node.js",
+				"Ensure Node.js is at daemon-visible path",
 				"Setup Python",
 				"Deploy",
 			},
@@ -499,7 +505,7 @@ func TestAddCustomStepsWithRuntimeInsertion(t *testing.T) {
 			compiler := NewCompiler()
 			var yaml strings.Builder
 
-			compiler.addCustomStepsWithRuntimeInsertion(&yaml, tt.customSteps, tt.runtimeSetupSteps, tt.tools)
+			compiler.addCustomStepsWithRuntimeInsertion(&yaml, tt.customSteps, tt.runtimeSetupSteps, nil, tt.tools, tt.ensureArcNodePath)
 			result := yaml.String()
 
 			for _, expected := range tt.expectInOutput {
@@ -673,7 +679,7 @@ func TestGenerateMainJobSteps(t *testing.T) {
 			if tt.shouldError {
 				require.Error(t, err, "expected error but got none")
 				if tt.errorContains != "" {
-					assert.Contains(t, err.Error(), tt.errorContains, "error message mismatch")
+					require.ErrorContains(t, err, tt.errorContains, "error message mismatch")
 				}
 			} else {
 				require.NoError(t, err, "unexpected error: %v", err)
@@ -756,17 +762,19 @@ func TestGenerateMainJobStepsArcDindRedirectsToolCacheToRunnerTemp(t *testing.T)
 	assert.NotContains(t, result, "/tmp/gh-aw/tool-cache")
 }
 
-func TestGenerateMainJobStepsArcDindSkipsNodePathStepWhenRuntimeStepsDeferred(t *testing.T) {
-	// When custom steps contain a checkout action, needsCheckout is false and
-	// customStepsContainCheckout is true, so runtime steps (including setup-node) are
-	// deferred to after the custom checkout. In that case the Node relocation step must
-	// NOT be emitted here because setup-node hasn't run yet and `command -v node` may be
-	// empty or point to the wrong binary.
+func TestGenerateMainJobStepsArcDindInsertsNodePathStepWhenRuntimeStepsDeferred(t *testing.T) {
+	// When runtime setup is deferred to after a custom checkout, ARC/DinD should still
+	// emit the Node relocation step immediately after Setup Node.js.
 	compiler := NewCompiler()
 	compiler.stepOrderTracker = NewStepOrderTracker()
 
-	customStepsWithCheckout := `      - name: Custom checkout
-        uses: actions/checkout@v4
+	customStepsWithCheckout := `steps:
+  - name: Custom checkout
+    uses: actions/checkout@v4
+    with:
+      fetch-depth: 0
+  - name: Prepare context
+    run: echo ready
 `
 
 	data := &WorkflowData{
@@ -781,6 +789,9 @@ func TestGenerateMainJobStepsArcDindSkipsNodePathStepWhenRuntimeStepsDeferred(t 
 		},
 		CustomSteps: customStepsWithCheckout,
 		ParsedTools: NewTools(nil),
+		Runtimes: map[string]any{
+			"node": map[string]any{},
+		},
 	}
 
 	var yaml strings.Builder
@@ -790,8 +801,223 @@ func TestGenerateMainJobStepsArcDindSkipsNodePathStepWhenRuntimeStepsDeferred(t 
 	result := yaml.String()
 	// Tool cache redirect is always emitted on ARC/DinD regardless of checkout placement.
 	assert.Contains(t, result, "- name: Redirect tool cache and install paths for ARC/DinD")
-	// Node relocation step must be suppressed when runtime steps are deferred.
+	assert.Contains(t, result, "- name: Setup Node.js")
+	assert.Contains(t, result, "- name: Ensure Node.js is at daemon-visible path")
+
+	customCheckoutIndex := strings.Index(result, "- name: Custom checkout")
+	setupNodeIndex := strings.Index(result, "- name: Setup Node.js")
+	nodePathIndex := strings.Index(result, "- name: Ensure Node.js is at daemon-visible path")
+	prepareContextIndex := strings.Index(result, "- name: Prepare context")
+	assert.NotEqual(t, -1, customCheckoutIndex)
+	assert.NotEqual(t, -1, setupNodeIndex)
+	assert.NotEqual(t, -1, nodePathIndex)
+	assert.NotEqual(t, -1, prepareContextIndex)
+	assert.Greater(t, setupNodeIndex, customCheckoutIndex)
+	assert.Greater(t, nodePathIndex, setupNodeIndex)
+	assert.Greater(t, prepareContextIndex, nodePathIndex)
+	assert.Equal(t, 1, strings.Count(result, "- name: Ensure Node.js is at daemon-visible path"))
+}
+
+func TestGenerateMainJobStepsArcDindDeferredNodePathStepPreservesRuntimeIfCondition(t *testing.T) {
+	compiler := NewCompiler()
+	compiler.stepOrderTracker = NewStepOrderTracker()
+
+	customStepsWithCheckout := `steps:
+  - name: Custom checkout
+    uses: actions/checkout@v4
+  - name: Prepare context
+    run: echo ready
+`
+
+	data := &WorkflowData{
+		Name:            "Test Workflow",
+		AI:              "copilot",
+		MarkdownContent: "Test prompt",
+		EngineConfig: &EngineConfig{
+			ID: "copilot",
+		},
+		RunnerConfig: &RunnerConfig{
+			Topology: RunnerTopologyArcDind,
+		},
+		CustomSteps: customStepsWithCheckout,
+		ParsedTools: NewTools(nil),
+		Runtimes: map[string]any{
+			"node": map[string]any{
+				"if": "hashFiles('package.json') != ''",
+			},
+		},
+	}
+
+	var yaml strings.Builder
+	err := compiler.generateMainJobSteps(&yaml, data)
+	require.NoError(t, err)
+
+	result := yaml.String()
+	assert.Contains(t, result, "- name: Setup Node.js")
+	assert.Contains(t, result, "if: hashFiles('package.json') != ''")
+
+	nodePathIndex := strings.Index(result, "- name: Ensure Node.js is at daemon-visible path")
+	require.NotEqual(t, -1, nodePathIndex)
+	afterNodePath := result[nodePathIndex:]
+	lines := strings.SplitN(afterNodePath, "\n", 4)
+	require.GreaterOrEqual(t, len(lines), 3)
+	assert.Equal(t, "        if: hashFiles('package.json') != ''", lines[1])
+	assert.Equal(t, "        run: |", lines[2])
+}
+
+func TestGenerateMainJobStepsArcDindSkipsNodePathStepWithoutGeneratedNodeSetup(t *testing.T) {
+	compiler := NewCompiler()
+	compiler.stepOrderTracker = NewStepOrderTracker()
+
+	customStepsWithCheckoutAndOwnedSetupNode := `steps:
+  - name: Custom checkout
+    uses: actions/checkout@v4
+  - name: Setup Node
+    uses: actions/setup-node@v6
+    with:
+      node-version: "22"
+  - name: Prepare context
+    run: echo ready
+`
+
+	data := &WorkflowData{
+		Name:            "Test Workflow",
+		AI:              "copilot",
+		MarkdownContent: "Run npm --version",
+		EngineConfig: &EngineConfig{
+			ID: "copilot",
+		},
+		RunnerConfig: &RunnerConfig{
+			Topology: RunnerTopologyArcDind,
+		},
+		CustomSteps: customStepsWithCheckoutAndOwnedSetupNode,
+		ParsedTools: NewTools(nil),
+		Runtimes: map[string]any{
+			"node": map[string]any{},
+		},
+	}
+
+	var yaml strings.Builder
+	err := compiler.generateMainJobSteps(&yaml, data)
+	require.NoError(t, err)
+
+	result := yaml.String()
+	// User-owned setup-node remains in custom steps; no generated Setup Node.js means no ARC relocation step.
+	assert.NotContains(t, result, "- name: Setup Node.js")
 	assert.NotContains(t, result, "- name: Ensure Node.js is at daemon-visible path")
+}
+
+func TestGenerateMainJobStepsNonArcDeferredNodeSetupDoesNotInsertNodePathStep(t *testing.T) {
+	compiler := NewCompiler()
+	compiler.stepOrderTracker = NewStepOrderTracker()
+
+	customStepsWithCheckout := `steps:
+  - name: Custom checkout
+    uses: actions/checkout@v4
+  - name: Prepare context
+    run: echo ready
+`
+
+	data := &WorkflowData{
+		Name:            "Test Workflow",
+		AI:              "copilot",
+		MarkdownContent: "Run npm --version",
+		EngineConfig: &EngineConfig{
+			ID: "copilot",
+		},
+		CustomSteps: customStepsWithCheckout,
+		ParsedTools: NewTools(nil),
+		Runtimes: map[string]any{
+			"node": map[string]any{},
+		},
+	}
+
+	var yaml strings.Builder
+	err := compiler.generateMainJobSteps(&yaml, data)
+	require.NoError(t, err)
+
+	result := yaml.String()
+	assert.Contains(t, result, "- name: Setup Node.js")
+	assert.NotContains(t, result, "- name: Ensure Node.js is at daemon-visible path")
+}
+
+func TestGenerateMainJobStepsArcDindManagedCheckoutKeepsNodePathStep(t *testing.T) {
+	compiler := NewCompiler()
+	compiler.stepOrderTracker = NewStepOrderTracker()
+
+	data := &WorkflowData{
+		Name:            "Test Workflow",
+		AI:              "copilot",
+		MarkdownContent: "Run npm --version",
+		EngineConfig: &EngineConfig{
+			ID: "copilot",
+		},
+		RunnerConfig: &RunnerConfig{
+			Topology: RunnerTopologyArcDind,
+		},
+		ParsedTools: NewTools(nil),
+		Runtimes: map[string]any{
+			"node": map[string]any{},
+		},
+	}
+
+	var yaml strings.Builder
+	err := compiler.generateMainJobSteps(&yaml, data)
+	require.NoError(t, err)
+
+	result := yaml.String()
+	redirectIndex := strings.Index(result, "- name: Redirect tool cache and install paths for ARC/DinD")
+	setupNodeIndex := strings.Index(result, "- name: Setup Node.js")
+	nodePathIndex := strings.Index(result, "- name: Ensure Node.js is at daemon-visible path")
+	assert.NotEqual(t, -1, redirectIndex)
+	assert.NotEqual(t, -1, setupNodeIndex)
+	assert.NotEqual(t, -1, nodePathIndex)
+	assert.Greater(t, setupNodeIndex, redirectIndex)
+	assert.Greater(t, nodePathIndex, setupNodeIndex)
+}
+
+func TestGenerateMainJobStepsArcDindDeferredMultipleRuntimesInsertSingleNodePathStep(t *testing.T) {
+	compiler := NewCompiler()
+	compiler.stepOrderTracker = NewStepOrderTracker()
+
+	customStepsWithCheckout := `steps:
+  - name: Custom checkout
+    uses: actions/checkout@v4
+  - name: Prepare context
+    run: npm --version && python --version
+`
+
+	data := &WorkflowData{
+		Name:            "Test Workflow",
+		AI:              "copilot",
+		MarkdownContent: "Test prompt",
+		EngineConfig: &EngineConfig{
+			ID: "copilot",
+		},
+		RunnerConfig: &RunnerConfig{
+			Topology: RunnerTopologyArcDind,
+		},
+		CustomSteps: customStepsWithCheckout,
+		ParsedTools: NewTools(nil),
+		Runtimes: map[string]any{
+			"node":   map[string]any{},
+			"python": map[string]any{},
+		},
+	}
+
+	var yaml strings.Builder
+	err := compiler.generateMainJobSteps(&yaml, data)
+	require.NoError(t, err)
+
+	result := yaml.String()
+	setupNodeIndex := strings.Index(result, "- name: Setup Node.js")
+	nodePathIndex := strings.Index(result, "- name: Ensure Node.js is at daemon-visible path")
+	setupPythonIndex := strings.Index(result, "- name: Setup Python")
+	assert.NotEqual(t, -1, setupNodeIndex)
+	assert.NotEqual(t, -1, nodePathIndex)
+	assert.NotEqual(t, -1, setupPythonIndex)
+	assert.Greater(t, nodePathIndex, setupNodeIndex)
+	assert.Equal(t, 1, strings.Count(result, "- name: Ensure Node.js is at daemon-visible path"))
 }
 
 func TestGenerateMainJobStepsWithDevMode_GhAwRuntimeBuildsFromSource(t *testing.T) {
@@ -841,7 +1067,10 @@ func TestGenerateMainJobStepsStepOrdering(t *testing.T) {
 		EngineConfig: &EngineConfig{
 			ID: "copilot",
 		},
-		ParsedTools: &ToolsConfig{},
+		Tools: map[string]any{"github": nil},
+		ParsedTools: &ToolsConfig{
+			GitHub: &GitHubToolConfig{},
+		},
 	}
 
 	var yaml strings.Builder
@@ -849,6 +1078,84 @@ func TestGenerateMainJobStepsStepOrdering(t *testing.T) {
 
 	// Should not error - step ordering should be valid
 	require.NoError(t, err, "step ordering validation should pass")
+
+	output := yaml.String()
+	start := strings.Index(output, "- name: Log GitHub rate limits at agent start")
+	execution := strings.Index(output, "id: agentic_execution")
+	end := strings.Index(output, "- name: Log GitHub rate limits at agent end")
+	upload := strings.Index(output, "uses: actions/upload-artifact@")
+	require.NotEqual(t, -1, start)
+	require.NotEqual(t, -1, execution)
+	require.NotEqual(t, -1, end)
+	require.NotEqual(t, -1, upload)
+	require.Less(t, start, execution)
+	require.Less(t, execution, end)
+	require.Less(t, end, upload)
+	assert.True(t, strings.HasPrefix(output[start:], "- name: Log GitHub rate limits at agent start\n        continue-on-error: true\n"))
+	assert.True(t, strings.HasPrefix(output[end:], "- name: Log GitHub rate limits at agent end\n        if: always()\n        continue-on-error: true\n"),
+		"the end snapshot itself must run even after agent failure, not just a later collection step")
+	detection := strings.Index(output, "- name: Detect agent errors")
+	require.NotEqual(t, -1, detection)
+	assert.Less(t, end, detection, "capture the agent's final quota before post-agent error handling")
+	assert.Contains(t, output[upload:], "/tmp/gh-aw/github_rate_limits.jsonl")
+}
+
+func TestGenerateAgentRateLimitSnapshotStepTokenPrecedence(t *testing.T) {
+	t.Parallel()
+
+	defaultToken := "${{ secrets.GH_AW_GITHUB_MCP_SERVER_TOKEN || secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}"
+	customToken := "${{ secrets.CUSTOM_MCP_TOKEN }}"
+	appToken := "${{ steps.github-mcp-app-token.outputs.token }}"
+	tests := []struct {
+		name          string
+		tools         map[string]any
+		githubEnabled bool
+		token         string
+	}{
+		{name: "default magic secrets", tools: map[string]any{"github": nil}, githubEnabled: true, token: defaultToken},
+		{name: "without GitHub tool"},
+		{name: "disabled GitHub tool", tools: map[string]any{"github": false}},
+		{name: "GitHub CLI proxy", tools: map[string]any{"github": map[string]any{"mode": "gh-proxy"}}},
+		{name: "empty GitHub configuration", tools: map[string]any{"github": map[string]any{}}, githubEnabled: true, token: defaultToken},
+		{name: "remote GitHub MCP", tools: map[string]any{"github": map[string]any{"mode": "remote"}}, githubEnabled: true, token: defaultToken},
+		{name: "configured token", tools: map[string]any{"github": map[string]any{"github-token": customToken}}, githubEnabled: true, token: customToken},
+		{name: "app overrides configured token", tools: map[string]any{"github": map[string]any{
+			"github-token": customToken,
+			"github-app":   map[string]any{"client-id": "${{ vars.APP_ID }}", "private-key": "${{ secrets.APP_KEY }}"},
+		}}, githubEnabled: true, token: appToken},
+		{name: "optional app configured fallback", tools: map[string]any{"github": map[string]any{
+			"github-token": customToken,
+			"github-app":   map[string]any{"client-id": "${{ vars.APP_ID }}", "private-key": "${{ secrets.APP_KEY }}", "ignore-if-missing": true},
+		}}, githubEnabled: true, token: "${{ steps.github-mcp-app-token.outputs.token || secrets.CUSTOM_MCP_TOKEN }}"},
+		{name: "optional app magic fallback", tools: map[string]any{"github": map[string]any{
+			"github-app": map[string]any{"client-id": "${{ vars.APP_ID }}", "private-key": "${{ secrets.APP_KEY }}", "ignore-if-missing": true},
+		}}, githubEnabled: true, token: "${{ steps.github-mcp-app-token.outputs.token || secrets.GH_AW_GITHUB_MCP_SERVER_TOKEN || secrets.GH_AW_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			for _, phase := range []string{"start", "end"} {
+				var yaml strings.Builder
+				data := &WorkflowData{Tools: tt.tools, ParsedTools: NewTools(tt.tools)}
+				NewCompiler().generateAgentRateLimitSnapshotStep(&yaml, data, phase)
+				output := yaml.String()
+				if !tt.githubEnabled {
+					assert.Empty(t, output)
+					continue
+				}
+				assert.Contains(t, output, "github-token: "+tt.token+"\n")
+				assert.Contains(t, output, "uses: actions/github-script@")
+				assert.Contains(t, output, "continue-on-error: true")
+				assert.Contains(t, output, "github_rate_limit_logger.cjs")
+				assert.Contains(t, output, "await fetchAndLogRateLimit(github, 'agent_"+phase+"', true);")
+				if phase == "end" {
+					assert.Contains(t, output, "if: always()")
+				} else {
+					assert.NotContains(t, output, "if: always()")
+				}
+			}
+		})
+	}
 }
 
 // TestShouldAddCheckoutStepEdgeCases tests edge cases for checkout step detection

@@ -3,6 +3,7 @@ private: true
 emoji: "🧪"
 description: Smoke Copilot
 on:
+  schedule: every 2 days
   restore-memory: true
   slash_command:
     name: smoke-copilot
@@ -24,7 +25,11 @@ permissions:
 name: Smoke Copilot
 engine:
   id: copilot
-  model: gpt-5.4
+  durable:
+    retention-days: 7
+  fallback-models:
+    - copilot/gpt-5.6-luna
+    - copilot/claude-sonnet-5
   max-continuations: 2
   bare: true
 imports:
@@ -35,6 +40,11 @@ imports:
   - shared/mcp/serena-go.md
   - shared/otlp.md
   - shared/token-telemetry-check.md
+  - shared/smoke-test-brevity.md
+  - shared/playwright-title-test.md
+  - uses: shared/session-artifact-check.md
+    with:
+      session-artifact: copilot-events
 network:
   allowed:
     - defaults
@@ -54,9 +64,6 @@ tools:
     trusted-users:
       - pelikhan
   playwright:
-    mode: cli
-  web-fetch:
-  cli-proxy: true
 lsp:
   typescript:
     command: typescript-language-server
@@ -69,9 +76,9 @@ lsp:
       ".tsx": typescriptreact
 runtimes:
   go:
-    version: "1.26"
+    version: "1.27.4"
   node:
-    version: "20"
+    version: "24"
 models:
   providers:
     anthropic:
@@ -90,8 +97,10 @@ safe-outputs:
       skip-archive: true
     add-comment:
       allowed-repos: ["github/gh-aw"]
+      target: "*"
       hide-older-comments: true
       max: 2
+      discussions: true
     create-issue:
       expires: 2h
       group: true
@@ -158,13 +167,39 @@ safe-outputs:
       run-started: "📰 BREAKING: [{workflow_name}]({run_url}) is now investigating this {event_type}. Sources say the story is developing..."
       run-success: "📰 VERDICT: [{workflow_name}]({run_url}) has concluded. All systems operational. This is a developing story. 🎤"
       run-failure: "📰 DEVELOPING STORY: [{workflow_name}]({run_url}) reports {status}. Our correspondents are investigating the incident..."
-timeout-minutes: 15
+timeout-minutes: 8
 experiments:
   caveman: [yes, no]
   subagent_model: [small, large]
 features:
   gh-aw-detection: false
+evals:
+  - id: smoke-passed
+    question: Did all or most smoke tests pass? Look for an overall PASS status or the majority of tests showing ✅ in the agent output.
+  - id: build-succeeded
+    question: Did the gh-aw binary build succeed? Look for a successful make build step or explicit mention that compilation succeeded.
+  - id: issue-created
+    question: Was a smoke test issue created with test results? Look for a create_issue output containing 'Smoke Test' in the title.
 
+sandbox:
+  agent:
+    id: awf
+post-steps:
+  - name: Assert unified-session contract
+    if: always()
+    uses: actions/github-script@v9.0.0
+    with:
+      script: |
+        const path = require("node:path");
+        const { sessionContractMain } = require(path.join(process.env.RUNNER_TEMP, "gh-aw/actions/smoke_model_routing_assertions.cjs"));
+        await sessionContractMain({
+          core,
+          engine: "copilot",
+          expectModelInventory: true,
+          copilotInventory: true,
+          resolutionRoles: ["main"],
+          requiredSubAgents: ["file-summarizer"],
+        });
 ---
 
 # Smoke Test: Copilot Engine Validation
@@ -173,16 +208,18 @@ features:
 Talk like a caveman in all your responses and outputs. Use short, broken sentences. Me test. You run.
 {{/if}}
 
-**IMPORTANT: Keep all outputs extremely short and concise. Use single-line responses where possible. No verbose explanations.**
-
 ## Hard Limit: `add_comment` Budget
 
 `safe-outputs.add-comment.max` is `2`. Never exceed 2 total `add_comment` calls in this run.
 
 - Call #1 is required for the discussion interaction test (comment on latest discussion).
-- Call #2 depends on trigger:
-  - `pull_request` event: post the brief PR summary comment, and **skip** the fun discussion follow-up comment.
-  - non-`pull_request` event: **skip** the PR summary comment and post the fun discussion follow-up comment.
+- Call #2 depends on context:
+  - A `pull-request-number` is shown in `<github-context>`: post the brief PR summary comment (pass `item_number` with that PR number explicitly), and **skip** the fun discussion follow-up comment.
+  - No `pull-request-number` in `<github-context>`: **skip** the PR summary comment and post the fun discussion follow-up comment.
+
+## Required First Step: `file-summarizer` Sub-agent
+
+Your first action in this run must be a `task` tool call to the `file-summarizer` agent asking it to summarize `README.md`. Do this before any numbered test below. This step is mandatory and must not be skipped. Record the sub-agent's one-line summary of `README.md`; you will report it as test 14.
 
 ## Test Requirements
 
@@ -192,16 +229,16 @@ Run these checks and mark each as ✅/❌:
 2. `mcpscripts-gh`: query 2 PRs using `pr list --repo ${{ github.repository }} --limit 2 --json number,title,author`.
 3. Serena CLI (bash only): run `serena activate_project --path ${{ github.workspace }}`, then `serena find_symbol --name_path <symbol>` and confirm at least 3 symbols.
 4. Playwright CLI (bash only): run `playwright-cli open https://github.com` then `playwright-cli screenshot`; confirm successful GitHub navigation.
-5. `web-fetch` tool: fetch `https://github.com` and confirm response contains `GitHub`.
+5. Bash: fetch `https://github.com` with `curl` and confirm response contains `GitHub`.
 6. File + bash: create `/tmp/gh-aw/agent/smoke-test-copilot-${{ github.run_id }}.txt` with timestamped success text, then `cat` it.
-7. Discussion interaction: get latest discussion with `github-discussion-query` (`limit=1`, `jq=".[0]"`), extract number, then `add_comment` to that discussion.
+7. Discussion interaction: get latest discussion with `github-discussion-query` (`limit=1`, `jq=".[0]"`), extract number, then call `add_comment` with `item_number` set to that discussion number (do NOT use `target=discussion`; pass only `item_number` and `body`).
 8. Build: run `GOCACHE=/tmp/gh-aw/agent/go-cache GOMODCACHE=/tmp/gh-aw/agent/go-mod make build`.
 9. Artifact upload (only if build passes): stage `./gh-aw` at `$RUNNER_TEMP/gh-aw/safeoutputs/upload-artifacts/gh-aw` and call `upload_artifact` with `path: "gh-aw"`.
-10. Discussion create: call `create_discussion` in `announcements` with label `ai-generated`, title `copilot was here`, temp ID `aw_smoke_discussion`.
-11. Workflow dispatch: call `dispatch_workflow` for `haiku-printer` and include `inputs.message` with an original testing/automation haiku (non-empty string).
+10. Discussion create: call `create_discussion` in `announcements` with label `ai-generated`, title `copilot was here`, and `temporary_id: "aw_discuss"`.
+11. Workflow dispatch: call `dispatch_workflow` for `haiku-printer`, set top-level `ref` to `${{ github.event.repository.default_branch }}`, and include `inputs.message` with an original testing/automation haiku (non-empty string).
 12. PR review tools: add 1-2 inline `create_pull_request_review_comment` comments, submit review with event `COMMENT`, then reply to most recent existing review comment ID when available.
 13. Comment memory: append an original 3-line haiku to `/tmp/gh-aw/comment-memory/*.md`.
-14. Sub-agent: use `file-summarizer` on `README.md`.
+14. Sub-agent: report the result of the required first step (the `task` call to `file-summarizer` on `README.md`), including its one-line summary. Do not call it again here.
 15. Check run: call `create_check_run` with `conclusion=success`, title `Smoke Copilot - Run ${{ github.run_id }}`, summary `All smoke tests completed.`, text `Detailed results attached.`
 16. **LSP TypeScript Testing**: Use the TypeScript language server (configured via `lsp.typescript` frontmatter) to count the number of functions in `${{ github.workspace }}/actions/setup/js/safe_output_helpers.cjs`:
     - Open the file `${{ github.workspace }}/actions/setup/js/safe_output_helpers.cjs` via LSP
@@ -222,19 +259,19 @@ Run these checks and mark each as ✅/❌:
 
 2. **Set Issue Type** (**required**): Use the `set_issue_type` safe-output tool with `issue_number: "aw_smoke1"` (the temporary ID from step 1) and `issue_type: "Bug"` to set the type of the just-created smoke test issue.
 
-3. **Only if this workflow was triggered by a pull_request event**: Use the `add_comment` tool to add a **very brief** comment (max 5-10 lines) to the triggering pull request (omit the `item_number` parameter to auto-target the triggering PR) with:
+3. **Only if a `pull-request-number` appears in the `<github-context>` block**: Use the `add_comment` tool to add a **very brief** comment (max 5-10 lines) to that pull request — pass the pull-request-number explicitly as `item_number` (required; auto-targeting does not work for `workflow_dispatch` triggers) with:
    - PR titles only (no descriptions)
    - ✅ or ❌ for each test result
    - Overall status: PASS or FAIL
    - Mention the pull request author and any assignees
 
-4. **Only if this workflow was NOT triggered by a pull_request event**: Use the `add_comment` tool to add a **fun and creative comment** to the newly created discussion (use the temporary ID `aw_smoke_discussion` from step 11) - be playful and entertaining in your comment
+4. **Only if no `pull-request-number` in `<github-context>`**: Use the `add_comment` tool to add a **fun and creative comment** to the newly created discussion (use `item_number: "aw_discuss"` from step 11) - be playful and entertaining in your comment
 
 5. Use the `send_slack_message` tool to send a brief summary message (e.g., "Smoke test ${{ github.run_id }}: All tests passed! ✅")
 
-If all tests pass and this workflow was triggered by a pull_request event:
-- Use the `add_labels` safe-output tool to add the label `smoke-copilot` to the pull request (omit the `item_number` parameter to auto-target the triggering PR)
-- Use the `remove_labels` safe-output tool to remove the label `smoke` from the pull request (omit the `item_number` parameter to auto-target the triggering PR)
+If all tests pass and a `pull-request-number` appears in `<github-context>`:
+- Use the `add_labels` safe-output tool to add the label `smoke-copilot` to the pull request (pass the pull-request-number as `item_number`)
+- Use the `remove_labels` safe-output tool to remove the label `smoke` from the pull request (pass the pull-request-number as `item_number`)
 ## agent: `file-summarizer`
 ---
 model: ${{ experiments.subagent_model }}

@@ -1,8 +1,6 @@
 package workflow
 
 import (
-	"strings"
-
 	"github.com/github/gh-aw/pkg/typeutil"
 )
 
@@ -11,6 +9,7 @@ import (
 // before parsing the max field from configMap. Supports both integer values and GitHub
 // Actions expression strings (e.g. "${{ inputs.max }}").
 func (c *Compiler) parseBaseSafeOutputConfig(configMap map[string]any, config *BaseSafeOutputConfig, defaultMax int) {
+	config.Authorization = parseLocalSafeOutputAuthorization(configMap["authorization"])
 	// Set default max if provided
 	if defaultMax > 0 {
 		safeOutputsConfigLog.Printf("Setting default max: %d", defaultMax)
@@ -22,7 +21,7 @@ func (c *Compiler) parseBaseSafeOutputConfig(configMap map[string]any, config *B
 		switch v := max.(type) {
 		case string:
 			// Accept GitHub Actions expression strings
-			if strings.HasPrefix(v, "${{") && strings.HasSuffix(v, "}}") {
+			if isExpression(v) {
 				safeOutputsConfigLog.Printf("Parsed max as GitHub Actions expression: %s", v)
 				config.Max = &v
 			}

@@ -84,6 +84,22 @@ function resolvePropertyRef(prop) {
 }
 
 /**
+ * Get the value schema for an object with dynamic keys.
+ */
+function getDynamicProperty(prop) {
+  if (prop.additionalProperties && typeof prop.additionalProperties === "object") {
+    return resolvePropertyRef(prop.additionalProperties);
+  }
+
+  const patternProperties = Object.values(prop.patternProperties || {});
+  if (patternProperties.length === 1 && typeof patternProperties[0] === "object") {
+    return resolvePropertyRef(patternProperties[0]);
+  }
+
+  return null;
+}
+
+/**
  * Format a description as YAML comment
  */
 function formatComment(text, indent = 0) {
@@ -113,6 +129,10 @@ function formatComment(text, indent = 0) {
  * Generate YAML example value based on schema type
  */
 function getExampleValue(prop, propName = "") {
+  if (Object.hasOwn(prop, "const")) {
+    return prop.const;
+  }
+
   if (prop.enum && prop.enum.length > 0) {
     return prop.enum[0];
   }
@@ -122,6 +142,7 @@ function getExampleValue(prop, propName = "") {
       if (propName === "github-token") return "${{ secrets.GITHUB_TOKEN }}";
       if (propName === "name") return "My Workflow";
       if (propName === "description") return "Description of the workflow";
+      if (propName === "docs") return "https://docs.example.com/automation/repository-health";
       return "example-value";
     case "number":
     case "integer":
@@ -224,9 +245,9 @@ function generateVariants(prop, propName, indent = 0, required = []) {
         if (variant.properties) {
           const subLines = generateProperties(variant.properties, variant.required || [], indent + 2);
           lines.push(subLines);
-        } else if (variant["x-example-key"] && variant.additionalProperties && typeof variant.additionalProperties === "object") {
+        } else if (variant["x-example-key"] && getDynamicProperty(variant)) {
           const exampleKey = variant["x-example-key"];
-          const addlProp = resolvePropertyRef(variant.additionalProperties);
+          const addlProp = getDynamicProperty(variant);
           if (addlProp.description) {
             lines.push(formatComment(addlProp.description, indent + 2));
           }
@@ -241,9 +262,11 @@ function generateVariants(prop, propName, indent = 0, required = []) {
           lines.push(`${indentStr}  {}`);
         }
       } else if (variant.type === "array") {
-        lines.push(`${indentStr}${propName}: []`);
+        const example = variant.examples?.find(Array.isArray) || [];
+        lines.push(`${indentStr}${propName}: ${JSON.stringify(example)}`);
         if (variant.items) {
-          lines.push(formatComment(`Array items: ${variant.items.description || variant.items.type}`, indent + 2));
+          const items = resolvePropertyRef(variant.items);
+          lines.push(formatComment(`Array items: ${items.description || items.type}`, indent + 2));
         }
       } else if (variant.type === "boolean") {
         const boolExample = getExampleValue(variant, propName);
@@ -295,11 +318,11 @@ function generateProperty(propName, prop, indent = 0, isRequired = false) {
     if (prop.properties) {
       const subLines = generateProperties(prop.properties, prop.required || [], indent + 2);
       lines.push(subLines);
-    } else if (prop["x-example-key"] && prop.additionalProperties && typeof prop.additionalProperties === "object") {
+    } else if (prop["x-example-key"] && getDynamicProperty(prop)) {
       // Dynamic-key object (additionalProperties pattern): expand an annotated example entry
       // so users can see the per-key schema rather than a bare '{}'.
       const exampleKey = prop["x-example-key"];
-      const addlProp = resolvePropertyRef(prop.additionalProperties);
+      const addlProp = getDynamicProperty(prop);
       if (addlProp.description) {
         lines.push(formatComment(addlProp.description, indent + 2));
       }

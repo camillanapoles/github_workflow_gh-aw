@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestManager_WithInjectedGetter smoke-tests all Resolve* methods through a
@@ -15,6 +16,7 @@ func TestManager_WithInjectedGetter(t *testing.T) {
 		DefaultTimeoutMinutes:     "45",
 		DefaultMaxTurnCacheMisses: "9",
 		DefaultDetectionModel:     "gpt-5.5-mini",
+		DefaultEvalsModel:         "gpt-5.5-nano",
 		DefaultUTC:                "-08:00",
 	}
 	m := New(func(key string) string { return env[key] })
@@ -34,6 +36,9 @@ func TestManager_WithInjectedGetter(t *testing.T) {
 	t.Run("ResolveDefaultDetectionModel", func(t *testing.T) {
 		assert.Equal(t, "gpt-5.5-mini", m.ResolveDefaultDetectionModel(""))
 	})
+	t.Run("ResolveDefaultEvalsModel", func(t *testing.T) {
+		assert.Equal(t, "gpt-5.5-nano", m.ResolveDefaultEvalsModel(""))
+	})
 
 	t.Run("ResolveDefaultUTC", func(t *testing.T) {
 		assert.Equal(t, "-08:00", m.ResolveDefaultUTC("+00:00"))
@@ -51,11 +56,40 @@ func TestNew_NilGetterUsesProcessEnv(t *testing.T) {
 func TestManager_FallbackWhenEnvEmpty(t *testing.T) {
 	m := New(func(string) string { return "" })
 
+	requireSelfHosted, err := m.ResolveRequireSelfHostedRunners()
+	require.NoError(t, err)
+	assert.False(t, requireSelfHosted)
 	assert.Equal(t, "7", m.ResolveDefaultMaxTurns("7"))
 	assert.Equal(t, 20, m.ResolveDefaultTimeoutMinutes(20))
 	assert.Equal(t, 5, m.ResolveDefaultMaxTurnCacheMisses(5))
 	assert.Equal(t, "gpt-5.5-mini", m.ResolveDefaultDetectionModel("gpt-5.5-mini"))
+	assert.Equal(t, "gpt-5.5-nano", m.ResolveDefaultEvalsModel("gpt-5.5-nano"))
 	assert.Equal(t, "+00:00", m.ResolveDefaultUTC("+00:00"))
+}
+
+func TestManager_ResolveRequireSelfHostedRunners(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		value   string
+		want    bool
+		wantErr bool
+	}{
+		{name: "true enables enforcement", value: "true", want: true},
+		{name: "case-insensitive true", value: " TRUE ", want: true},
+		{name: "false disables enforcement", value: "false"},
+		{name: "invalid value errors", value: "yes", wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			m := New(func(string) string { return tt.value })
+			got, err := m.ResolveRequireSelfHostedRunners()
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
 
 // TestManager_PolicyModelsAllowed exercises ResolvePolicyModelsAllowed on a
@@ -118,10 +152,39 @@ func TestBuildDefaultMaxTurnsExpression(t *testing.T) {
 	)
 }
 
+func TestBuildDefaultOTLPEndpointExpression(t *testing.T) {
+	assert.Equal(t,
+		"${{ secrets.GH_AW_DEFAULT_OTLP_ENDPOINT || vars.GH_AW_DEFAULT_OTLP_ENDPOINT }}",
+		BuildDefaultOTLPEndpointExpression(),
+	)
+}
+
+func TestBuildTimeoutMinutesExpression(t *testing.T) {
+	assert.Equal(t,
+		"${{ fromJSON(vars.GH_AW_DEFAULT_TIMEOUT_MINUTES || '20') }}",
+		BuildTimeoutMinutesExpression(DefaultTimeoutMinutes, 20),
+	)
+	assert.Equal(t,
+		"${{ fromJSON(vars.GH_AW_DEFAULT_AGENT_JOB_TIMEOUT_MINUTES || '60') }}",
+		BuildTimeoutMinutesExpression(DefaultAgentJobTimeoutMinutes, 60),
+	)
+	assert.Equal(t,
+		"${{ fromJSON(vars.GH_AW_DEFAULT_DETECTION_JOB_TIMEOUT_MINUTES || '10') }}",
+		BuildTimeoutMinutesExpression(DefaultDetectionJobTimeoutMinutes, 10),
+	)
+}
+
 func TestBuildDefaultDetectionMaxAICreditsExpression(t *testing.T) {
 	assert.Equal(t,
 		"${{ vars.GH_AW_DEFAULT_DETECTION_MAX_AI_CREDITS || '400' }}",
 		BuildDefaultDetectionMaxAICreditsExpression("400"),
+	)
+}
+
+func TestBuildDefaultEvalsMaxAICreditsExpression(t *testing.T) {
+	assert.Equal(t,
+		"${{ vars.GH_AW_DEFAULT_EVALS_MAX_AI_CREDITS || '400' }}",
+		BuildDefaultEvalsMaxAICreditsExpression("400"),
 	)
 }
 
@@ -140,8 +203,8 @@ func TestBuildModelOverrideExpression(t *testing.T) {
 	)
 	assert.Equal(
 		t,
-		"${{ vars.GH_AW_MODEL_AGENT_CLAUDE || vars.GH_AW_DEFAULT_MODEL_CLAUDE || '' }}",
-		BuildModelOverrideExpressionEmptyFallback("GH_AW_MODEL_AGENT_CLAUDE", "GH_AW_DEFAULT_MODEL_CLAUDE"),
+		"${{ vars.GH_AW_MODEL_AGENT_CODEX || vars.GH_AW_DEFAULT_MODEL_CODEX || '' }}",
+		BuildModelOverrideExpressionEmptyFallback("GH_AW_MODEL_AGENT_CODEX", "GH_AW_DEFAULT_MODEL_CODEX"),
 	)
 }
 
@@ -240,6 +303,23 @@ func TestResolveDefaultDetectionModel(t *testing.T) {
 	t.Run("set value overrides fallback", func(t *testing.T) {
 		t.Setenv(DefaultDetectionModel, "gpt-5.5-mini")
 		assert.Equal(t, "gpt-5.5-mini", ResolveDefaultDetectionModel(""))
+	})
+}
+
+func TestResolveDefaultEvalsModel(t *testing.T) {
+	t.Run("unset uses fallback", func(t *testing.T) {
+		t.Setenv(DefaultEvalsModel, "")
+		assert.Empty(t, ResolveDefaultEvalsModel(""))
+	})
+
+	t.Run("unset keeps non-empty fallback", func(t *testing.T) {
+		t.Setenv(DefaultEvalsModel, "")
+		assert.Equal(t, "gpt-5.5-nano", ResolveDefaultEvalsModel("gpt-5.5-nano"))
+	})
+
+	t.Run("set value overrides fallback", func(t *testing.T) {
+		t.Setenv(DefaultEvalsModel, "gpt-5.5-nano")
+		assert.Equal(t, "gpt-5.5-nano", ResolveDefaultEvalsModel(""))
 	})
 }
 

@@ -1,84 +1,79 @@
 ---
-private: true
-emoji: "🔍"
+cache:
+  key: pr-prefetch-v2-${{ github.event.pull_request.number || github.event.issue.number || (fromJSON(github.event.inputs.aw_context || github.event.client_payload.aw_context || '{}').item_type == 'pull_request' && fromJSON(github.event.inputs.aw_context || github.event.client_payload.aw_context || '{}').item_number) }}-${{ github.event.pull_request.head.sha || 'unknown' }}-${{ github.run_id }}-${{ github.run_attempt }}
+  path: /tmp/gh-aw/agent
+  restore-keys:
+  - pr-prefetch-v2-${{ github.event.pull_request.number || github.event.issue.number || (fromJSON(github.event.inputs.aw_context || github.event.client_payload.aw_context || '{}').item_type == 'pull_request' && fromJSON(github.event.inputs.aw_context || github.event.client_payload.aw_context || '{}').item_number) }}-${{ github.event.pull_request.head.sha && format('{0}-', github.event.pull_request.head.sha) || '' }}
 description: Reviews pull requests using Matt Pocock's engineering skills to provide targeted, high-quality improvement suggestions based on the type of changes
-on:
-  pull_request:
-    types: [ready_for_review]
-  slash_command:
-    strategy: centralized
-    name: matt
-    events: [pull_request_comment, pull_request_review_comment]
-permissions:
-  contents: read
-  pull-requests: read
-  copilot-requests: write
-skills:
-  - mattpocock/skills/diagnosing-bugs@801dca688564c529fa84f247f64472520d9ebe28
-  - mattpocock/skills/tdd@801dca688564c529fa84f247f64472520d9ebe28
-  - mattpocock/skills/improve-codebase-architecture@801dca688564c529fa84f247f64472520d9ebe28
-  - mattpocock/skills/grill-with-docs@801dca688564c529fa84f247f64472520d9ebe28
-  - mattpocock/skills/to-prd@801dca688564c529fa84f247f64472520d9ebe28
-  - mattpocock/skills/codebase-design@801dca688564c529fa84f247f64472520d9ebe28
-  - mattpocock/skills/domain-modeling@801dca688564c529fa84f247f64472520d9ebe28
-
-sandbox:
-  agent:
-    sudo: false
-
+emoji: 🔍
+model: router/economy
 engine:
   id: copilot
-  model: claude-sonnet-4.6
+  copilot-sdk: true
   max-continuations: 6
+features:
+  gh-aw-detection: true
+
+network:
+  allowed: [defaults, go]
+
 imports:
-  - uses: shared/pr-review-base.md
-    with:
-      min-integrity: approved
-  - shared/otlp.md
-pre-agent-steps:
-  - name: Pre-fetch PR diff
-    env:
-      GH_TOKEN: ${{ github.token }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
-      EXPR_GITHUB_REPOSITORY: ${{ github.repository }}
-    run: |
-      set -euo pipefail
-      mkdir -p /tmp/gh-aw/agent
-      { gh pr diff "$PR_NUMBER" --repo $EXPR_GITHUB_REPOSITORY \
-          --exclude '**/*.lock.yml' \
-          --exclude '**/generated/**' \
-          --exclude '**/dist/**' \
-          --exclude '**/build/**' \
-          || true; } | head -n 3000 > /tmp/gh-aw/agent/pr-diff.patch
-      LINES=$(wc -l < /tmp/gh-aw/agent/pr-diff.patch)
-      gh pr view "$PR_NUMBER" \
-        --repo $EXPR_GITHUB_REPOSITORY \
-        --json number,title,body,headRefName,additions,deletions,changedFiles,files \
-        > /tmp/gh-aw/agent/pr-meta.json
-      echo "Pre-fetched PR diff (${LINES} lines) and metadata"
-tools:
-  cli-proxy: true
-  github:
-    mode: gh-proxy
+- uses: shared/pr-review-base.md
+  with:
+    min-integrity: approved
+- shared/otlp.md
+- shared/pr-diff-data-fetch.md
+- shared/reporting.md
+max-daily-ai-credits: 10000
+"on":
+  pull_request:
+    paths-ignore:
+    - "*.md"
+    - docs/**
+    - .changeset/**
+    - scratchpad/**
+    types:
+    - ready_for_review
+  slash_command:
+    events:
+    - pull_request_comment
+    - pull_request_review_comment
+    name: [matt, review]
+    strategy: centralized
+permissions:
+  contents: read
+  copilot-requests: write
+  pull-requests: read
+private: true
 safe-outputs:
   add-comment:
     hide-older-comments: true
     max: 1
   create-pull-request-review-comment:
     max: 10
-  submit-pull-request-review:
-    max: 1
   mentions:
-    allowed: ["@copilot"]
+    allowed:
+    - "@copilot"
   messages:
     footer: "> 🧠 *Reviewed using Matt Pocock's skills by [{workflow_name}]({run_url})*{ai_credits_suffix}{history_link}"
-    run-started: "🧠 [{workflow_name}]({run_url}) is reviewing this {event_type} using Matt Pocock's engineering skills..."
-    run-success: "🧠 [{workflow_name}]({run_url}) has completed the skills-based review. ✅"
-    run-failure: "🧠 [{workflow_name}]({run_url}) {status} during the skills-based review."
-max-daily-ai-credits: 10000
-timeout-minutes: 15
-
-
+    run-failure: 🧠 [{workflow_name}]({run_url}) {status} during the skills-based review.
+    run-started: 🧠 [{workflow_name}]({run_url}) is reviewing this {event_type} using Matt Pocock's engineering skills...
+    run-success: 🧠 [{workflow_name}]({run_url}) has completed the skills-based review. ✅
+  submit-pull-request-review:
+    max: 1
+skills:
+- mattpocock/skills/diagnosing-bugs@4ae2317ddb22b046e26455e4f9c9b3aaaf62212d
+- mattpocock/skills/tdd@4ae2317ddb22b046e26455e4f9c9b3aaaf62212d
+- mattpocock/skills/improve-codebase-architecture@4ae2317ddb22b046e26455e4f9c9b3aaaf62212d
+- mattpocock/skills/grill-with-docs@4ae2317ddb22b046e26455e4f9c9b3aaaf62212d
+- mattpocock/skills/codebase-design@4ae2317ddb22b046e26455e4f9c9b3aaaf62212d
+# Raised from 15m: skill-driven PR reviews on larger diffs were hitting the
+# engine step's hard timeout mid-review (not a hang) - see #66819.
+timeout-minutes: 30
+tools:
+  cli-proxy: true
+  github:
+    mode: gh-proxy
 ---
 
 # Matt Pocock Skills Reviewer
@@ -94,15 +89,13 @@ You are a skilled engineering reviewer who applies [Matt Pocock's engineering sk
 
 ## Available Matt Pocock Skills
 
-The following skills have been installed via `gh skill` and are available under `${RUNNER_TEMP}/gh-aw/mattpocock-skills/`. Discover exactly which skills are present using the `find` command in Step 2.
+The following skills have been installed via `gh skill` and are available under `${GITHUB_WORKSPACE}/.github/skills/`. Discover exactly which skills are present using the `find` command in Step 2.
 
 - **`/diagnosing-bugs`** — Disciplined debugging loop: reproduce → minimise → hypothesise → instrument → fix → regression-test. Use for PRs that fix bugs or address performance regressions.
 - **`/tdd`** — Test-driven development: red-green-refactor loop. Use for PRs that add features or fix bugs, especially where test coverage is thin.
 - **`/codebase-design`** — Shared vocabulary for deep modules, interface seams, and codebase navigability. Use for large refactors or when reviewing unfamiliar modules.
 - **`/improve-codebase-architecture`** — Find deepening opportunities informed by the domain language. Use for PRs that restructure or extend the architecture.
-- **`/domain-modeling`** — Sharpen project terminology and architectural context. Use when changes introduce or rename concepts.
 - **`/grill-with-docs`** — Challenges the plan against the existing domain model and terminology. Use when changes introduce new concepts or abstractions.
-- **`/to-prd`** — Turn context into a PRD. Use when the PR description is unclear or the scope is hard to understand.
 
 ## Your Mission
 
@@ -118,27 +111,32 @@ A successful review:
 - approves only when no actionable issue remains
 - uses `noop` instead of generic praise when there is nothing useful to say
 
+## Investigation Budget
+
+Treat the pre-fetched diff, `pr-triage` output, and the skill guidance below as your primary source of truth. Large, cross-cutting diffs can tempt open-ended tracing through the codebase to build architectural context — bound that exploration to roughly 20 tool calls beyond Steps 1-3. If you reach that budget without a clear picture, stop investigating and submit the best review supported by the evidence gathered so far (call out remaining uncertainty in the review body) rather than continuing to chase every reference; this is what previously caused engine-step timeouts on large diffs (#66819).
+
 ### Step 1: Load Pre-fetched PR Data
 
-> **⚠️ Do NOT call any GitHub MCP tools for PR data.** All PR information is pre-fetched: use `/tmp/gh-aw/agent/pr-meta.json` and `/tmp/gh-aw/agent/pr-diff.patch` exclusively.
+> **⚠️ Do NOT call any GitHub MCP tools for PR data.** All PR information is pre-fetched: use `/tmp/gh-aw/agent/pr-meta.json`, `/tmp/gh-aw/agent/pr-diff.patch`, and `/tmp/gh-aw/agent/pr-review-comments.json` exclusively.
 
 PR data and the diff (excluding lock files and common generated/build artifacts) have already been fetched before the agent started. Read the pre-fetched files:
 
 ```bash
-cat /tmp/gh-aw/agent/pr-meta.json   # fields: number, title, body, headRefName, additions, deletions, changedFiles, files
-cat /tmp/gh-aw/agent/pr-diff.patch  # full unified diff of all changed files
+cat /tmp/gh-aw/agent/pr-meta.json             # fields: number, title, body, headRefName, additions, deletions, changedFiles, files
+cat /tmp/gh-aw/agent/pr-diff.patch            # full unified diff of all changed files
+cat /tmp/gh-aw/agent/pr-review-comments.json  # existing review comments (each: id, path, line, body, user) — use to avoid duplication
 ```
 
-Do **not** call `gh pr diff` or `gh pr view` inside the agent — the data is already available on disk.
+Do **not** call `gh pr diff`, `gh pr view`, or `get_review_comments` inside the agent — the data is already available on disk.
 
 If the pre-fetched patch has 3000 lines, treat it as potentially truncated and focus your review on the highest-impact changed files. The 3000-line cap is intentional to keep token usage bounded on very large PRs; if important context appears missing, explicitly call that out in your review.
 
 ### Step 2: Read Available Skills
 
-Discover the installed Matt Pocock skills from the install root `${RUNNER_TEMP}/gh-aw/mattpocock-skills/`. List what is available:
+Discover the installed Matt Pocock skills from the install root `${GITHUB_WORKSPACE}/.github/skills/`. List what is available:
 
 ```bash
-find "${RUNNER_TEMP}/gh-aw/mattpocock-skills" -name "SKILL.md" 2>/dev/null | head -30
+find "${GITHUB_WORKSPACE}/.github/skills" -name "SKILL.md" 2>/dev/null | head -30
 ```
 
 Use the inline skill guidance below by default. Only read a skill file when the inline guidance is insufficient for the specific PR.
@@ -149,9 +147,11 @@ Invoke the `pr-triage` agent and capture its JSON response.
 Use the returned `change_type`, `recommended_skills`, `high_impact_files`, and `key_signals`.
 Apply the recommended skills in Step 4, prioritising the listed `high_impact_files`.
 
+**Fallback — never fail the review because of triage.** If the `pr-triage` call errors, times out, returns empty output, or returns text you cannot parse as the documented JSON shape, do **not** retry more than once and do **not** abort. Log one line noting that triage was unavailable, then apply the same classification logic described in the `pr-triage` agent definition (see the `change_type` categories and skill mapping below) directly against `/tmp/gh-aw/agent/pr-meta.json` and `/tmp/gh-aw/agent/pr-diff.patch`. For `high_impact_files`, fall back to the non-generated changed files with the largest `additions + deletions` in `pr-meta.json`, most-changed first, and treat `key_signals` as empty. Continue with Step 4 as normal, and mention in the Step 6 review body that skill selection used the fallback heuristic.
+
 ### Step 4: Review Using Selected Skills
 
-Focus your skill application on files listed in `pr-triage`'s `high_impact_files`.
+Focus your skill application on the `high_impact_files` from Step 3 (from `pr-triage`, or from the fallback heuristic when triage was unavailable).
 
 Apply the skill(s) to review the changed lines. For each issue you find:
 
@@ -190,17 +190,14 @@ Focus areas by skill:
 
 ### Step 5: Post Inline Review Comments
 
-For each issue found, create a review comment using `create-pull-request-review-comment`. Apply **progressive disclosure**: lead with a brief visible statement, then collapse verbose analysis and code examples in a `<details>` block:
+For each issue found, create a review comment using the `safeoutputs` CLI from bash; do not call it as a native tool. Include `pull_request_number` in the JSON payload and send it on stdin:
 
-```json
-{
-  "path": "path/to/file.ts",
-  "line": 42,
-  "body": "**[/tdd]** Missing edge case: `value` is `null` — add a test to prevent this regression.\n\n<details>\n<summary>💡 Suggested test</summary>\n\n```ts\nit('returns default when value is null', () => {\n  expect(fn(null)).toBe(defaultValue);\n});\n```\n\nMissing edge case tests are a common source of regressions.\n\n</details>\n\n@copilot please address this."
-}
+```bash
+printf '%s' '{"path":"path/to/file.ts","line":42,"pull_request_number":123,"body":"**[/tdd]** Missing edge case: `value` is `null` — add a test to prevent this regression.\n\n<details>\n<summary>💡 Suggested test</summary>\n\n```ts\nit(\u0027returns default when value is null\u0027, () => {\n  expect(fn(null)).toBe(defaultValue);\n});\n```\n\nMissing edge case tests are a common source of regressions.\n\n</details>\n\n@copilot please address this."}' | safeoutputs create_pull_request_review_comment .
 ```
 
 Guidelines:
+- Encode every apostrophe in JSON string values as `\u0027` before wrapping the JSON in shell single quotes. Use only valid JSON escapes, never shell double quotes, and encode control characters (for example, newlines as `\n`) instead of including them raw.
 - Prefix each comment with the skill name in brackets: `**[/diagnosing-bugs]**`, `**[/tdd]**`, etc.
 - Keep the **immediately visible text brief** (1–2 sentences): state the issue and its impact
 - Wrap code examples, detailed explanations, and multi-step suggestions in `<details><summary>💡 …</summary>` blocks
@@ -210,7 +207,13 @@ Guidelines:
 
 ### Step 6: Submit the Overall Review
 
-Submit a review using `submit_pull_request_review` with an overall summary:
+Submit an overall review using the `safeoutputs` CLI from bash (do not call it as a native tool). Include `pull_request_number` and send the JSON payload on stdin:
+
+```bash
+printf '%s' '{"pull_request_number":123,"event":"COMMENT","body":"Review summary"}' | safeoutputs submit_pull_request_review .
+```
+
+Follow the same JSON/shell encoding rules as Step 5: encode apostrophes as `\u0027`, use only valid JSON escapes, never shell double quotes, and do not include raw control characters.
 
 - **`APPROVE`** — Changes are solid; only minor suggestions
 - **`REQUEST_CHANGES`** — There are important issues that should be addressed

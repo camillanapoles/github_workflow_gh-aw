@@ -12,6 +12,10 @@ on:
     strategy: centralized
     name: approach-validator
     events: [issue_comment, pull_request_comment]
+if: github.event_name != 'push'
+concurrency:
+  group: "approach-validator-${{ github.event.issue.number || github.event.pull_request.number || fromJSON(github.event.inputs.aw_context || '{}').item_number || fromJSON(github.event.inputs.aw_context || '{}').event_type || github.ref }}"
+  cancel-in-progress: true
 max-daily-ai-credits: 10000
 permissions:
   contents: read
@@ -22,13 +26,11 @@ imports:
   - shared/safe-output-upload-artifact.md
   - shared/reporting.md
   - shared/otlp.md
-sandbox:
-  agent:
-    sudo: false
+  - shared/graders.md
 tools:
   cli-proxy: true
   github:
-    mode: gh-proxy
+    mode: local
     toolsets: [default, pull_requests, issues]
   bash:
     - "cat:*"
@@ -52,6 +54,12 @@ safe-outputs:
 timeout-minutes: 30
 features:
   gh-aw-detection: true
+evals:
+  - id: approach_evaluated
+    question: Did the multi-agent panel evaluate the proposed technical approach?
+  - id: validation_feedback_provided
+    question: Was structured feedback produced from the Devil's Advocate, Alternatives Scout, Implementation Estimator, and Dead End Detector agents?
+
 ---
 
 # Approach Validator 🔬

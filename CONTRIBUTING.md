@@ -22,6 +22,12 @@ The Dev Container installs all required dependencies and runs `make deps` automa
 
 If you encounter errors about Node.js or Go versions when running `make deps` or other build commands, this is a sign that you are not using the Dev Container. Please switch to a Dev Container or Codespace environment.
 
+### Keep local agent settings private
+
+Claude Code can persist plaintext credentials from approved commands in `.claude/settings.local.json`. Repository ignore rules exclude this file at every project depth. Builds and the **Agent local settings security** PR check reject indexed copies, including files added with `git add -f`. Run `make test-agent-local-settings` to check the repository and exercise the guard.
+
+If the check fails, use `git rm --cached -- <path>` to untrack each reported file without deleting the local copy. Rotate any credentials already published: untracking does not erase Git history or forks. Shared `.claude/settings.json` files and skills remain allowed, but must not contain credentials. This guard checks the current Git index; it is not a general secret scanner or a history audit.
+
 ## 🤖 How Development Works
 
 GitHub Agentic Workflows is developed by a core team using agentic development — primarily GitHub Copilot coding agent and local coding agents. This means:
@@ -102,7 +108,7 @@ Please implement the following changes:
 5. **Follow Guidelines**:
    - Use console formatting from `pkg/console` for CLI output
    - Follow error message style guide
-   - Run `make agent-finish` before completing
+   - Run `make agent-report-progress` once before the final push
 ```
 
 ### Step 3: Discuss and Refine with the Team
@@ -120,7 +126,7 @@ A core team member will:
 - Take your agentic plan and use a coding agent (Copilot or local) to implement it
 - Read relevant documentation and specifications
 - Make code changes following established patterns
-- Run `make agent-finish` to validate changes
+- Run `make agent-report-progress` once to validate changes before the final push
 - Create a PR and handle review feedback and adjustments
 
 **You don't create or own the PR** — the core team member does, using agents as their implementation tool.
@@ -149,8 +155,8 @@ When a core team member implements your plan, the coding agent they use will:
 - **Follow code organization patterns** (see [scratchpad/code-organization.md](scratchpad/code-organization.md))
 - **Implement validation** following the architecture in [scratchpad/validation-architecture.md](scratchpad/validation-architecture.md)
 - **Use console formatting** from `pkg/console` for CLI output
-- **Write error messages** following the [Error Message Style Guide](.github/skills/error-messages/SKILL.md) and [docs guide](docs/src/content/docs/contributing/error-messages.md)
-- **Run all quality checks**: `make agent-finish` (build, test, recompile, format, lint)
+- **Write error messages** following the [Error Message Style Guide](.github/skills/error-messages/SKILL.md) and [docs guide](docs/src/content/docs/troubleshooting/error-messages.md)
+- **Run the final quality gate**: `make agent-report-progress` (build, impacted tests, workflow drift, formatting, lint)
 - **Update documentation** for new features
 - **Create tests** for new functionality
 
@@ -172,7 +178,7 @@ For workflow failures, use this prompt with your agent:
 Please debug this workflow failure:
 https://github.com/owner/repo/actions/runs/RUN_ID
 
-Load [https://github.com/github/gh-aw/.github/skills/agentic-workflows/SKILL.md](https://github.com/github/gh-aw/blob/main/.github/skills/agentic-workflows/SKILL.md) and investigate:
+Follow https://raw.githubusercontent.com/github/gh-aw/main/debug.md and investigate:
 - Why the workflow failed
 - What tools were missing
 - How to fix the configuration
@@ -195,6 +201,19 @@ When filing issues with agentic plans:
 - A core team member will pick up the issue and implement your plan using a coding agent
 
 **Quality of the agentic plan directly impacts implementation success.** Provide comprehensive, step-by-step instructions with specific details.
+
+#### ✍️ Writing Prompts for Copilot-Assigned Issues
+
+When an issue will be assigned to Copilot coding agent (or another SWE agent), how you write the task description measurably affects whether the resulting PR merges. Recurring "Copilot PR Prompt Pattern Analysis" reports (see [discussion #53203](https://github.com/github/gh-aw/discussions/53203)) show a consistent trend: merged PRs average **~151 words** per task prompt and name concrete files or subsystems (e.g. `pkg`, `engine`, a specific package), while closed/unsuccessful PRs average **~229 words** — roughly 50% longer — and skew toward open-ended, exploratory language without a concrete acceptance criterion.
+
+To improve merge rate for agent-assigned work:
+
+- **Be concise.** Aim for a short, focused prompt rather than a long, exploratory one. Prompts longer than ~200 words without a concrete acceptance criterion correlate with lower merge rates.
+- **Name concrete files or subsystems.** Reference specific packages, files, or functions (e.g. `pkg/workflow`, `cmd/gh-aw`) instead of describing the problem in the abstract.
+- **State an explicit acceptance criterion.** Describe what "done" looks like (e.g. "the CLI flag `--foo` is parsed and validated" or "add a test in `pkg/parser/parser_test.go` covering X") instead of open-ended language like "investigate and fix as appropriate."
+- **Avoid pure exploration prompts.** Prompts that only ask the agent to "look into" or "figure out" a problem without a concrete target tend to result in longer, less-scoped PRs that are more likely to be closed.
+
+Note: automated CVE/dependency-tracker PRs are excluded from this signal, since their close rate reflects triage policy rather than prompt quality.
 
 ### Code Quality Standards
 
@@ -330,7 +349,7 @@ All community-sourced pull requests are created and managed by core team members
    - They run the plan through a coding agent (Copilot or local)
    - The agent reads specifications and guidelines
    - The agent makes changes following established patterns
-   - The agent runs `make agent-finish` automatically
+   - The agent runs `make agent-report-progress` once before the final push
 
 4. **Automated quality checks:**
    - CI runs on all PRs
@@ -353,6 +372,21 @@ When implementing community contributions using an agent:
 - For features that deeply impact the engine, add the `smoke` label and approve workflows.
 - If no smoke run is queued after setting `smoke`, or additional changes require another smoke run, toggle the `smoke` label (remove and re-add) and approve workflows again.
 
+### PR Triage Labels (Core Team)
+
+PR triage assigns one risk label (`pr-risk:low`, `pr-risk:medium`, or
+`pr-risk:high`), a priority label (`pr-priority:*`), and one action label.
+Priority reflects impact, urgency, and quality; quality includes CI status,
+test coverage, and the PR description.
+
+- `pr-action:fast_track` identifies a high-value, high-priority PR that is
+  ready for expedited human review. The risk label determines the review
+  scope; fast-track does not bypass required CI or approvals.
+- `pr-action:batch_review` groups similar low- or medium-risk PRs for review
+  together, typically when a cluster contains three or more related PRs.
+- `pr-action:defer` identifies lower-value, lower-priority work that remains
+  open but is not currently prioritized.
+
 **Remember: As a community contributor, you don't create the PR yourself.** You create an issue with a detailed plan, discuss it with the team, and a core team member creates the PR using agents.
 
 ### What Gets Validated
@@ -362,9 +396,17 @@ Every agent-created PR automatically runs:
 - `make build` - Ensures Go code compiles
 - `make test` - Runs all unit and integration tests
 - `make lint` - Checks code quality and style
-- `make recompile` - Recompiles all workflows to ensure compatibility
-- `make fmt` - Formats Go code
+- `make recompile` - Recompiles all workflows to ensure compatibility. If you edit `.github/workflows/*.md`, run this before committing so the paired `.lock.yml` files stay in sync with CI.
+- `make fmt` - Formats changed Go, JavaScript, TypeScript, and JSON files; use `make fmt-all` for full-repository formatting
 - `make lint-errors` - Validates error message quality
+
+For local iteration, run `make fmt` and one focused test command. Before an
+intermediate agent save, `make agent-report-progress-no-test` formats changes
+and compiles/vets affected Go packages without running test bodies, package-wide
+Go linters, or full workflow recompilation. Run `make agent-report-progress`
+once before the final push to retain the build, lint, impacted-test, and workflow
+drift checks. Cold Go compilation and final validation can take longer than the
+warm inner loop.
 
 ## 🏗️ Project Structure
 
@@ -406,6 +448,18 @@ The following licenses are **not allowed** as they conflict with our MIT license
 - **GPL, LGPL, AGPL** - Copyleft licenses that would force us to release under GPL
 - **SSPL** - Server Side Public License with restrictive requirements
 - **Proprietary/Commercial** - Closed-source licenses requiring payment or special terms
+
+### Container Base OS Packages
+
+The license policy in `.grant.yaml` is also applied to the container images referenced by compiled workflows (`gh aw compile --grant`). Packages that ship with the upstream base images are listed under `ignore-packages` as a documented exception: the Alpine base OS packages (`busybox`, `apk-tools`, `alpine-baselayout`, `musl-utils`, `git`, `libgcc`, `libstdc++`, and their variants), the Debian base OS packages of the `ghcr.io/github/github-mcp-server` image (`base-files`, `libc6`, `libssl3`, `media-types`, `netbase`, `tzdata`), and the Node.js/npm runtime with npm's bundled dependencies (`node`, `npm`, `tar`, `glob`, `minipass`, and friends). They are executed as part of a third-party image, never linked into or redistributed with gh-aw, and cannot be changed without replacing the upstream image. Every other package in those images is still evaluated against the allowlist above.
+
+`.grant.yaml` also supports an `ignore-images` list of glob patterns matched against the image reference. It excludes an entire image from license scanning and is reserved for third-party images whose bundled toolchains produce license findings that cannot be acted on, such as `ghcr.io/oraios/serena` (a Debian development image whose cargo registry ships hundreds of crates without SPDX license metadata). This key is specific to gh-aw; grant ignores it. Vulnerability scanning still covers every image, including the ignored ones.
+
+`libatomic` is an explicitly approved runtime-package exception for the vendored `ghcr.io/github/gh-aw-node` image. The verified Linux/amd64 image inherited Alpine 3.24's `libatomic@15.2.0-r5` unchanged from its Node base. Its [Alpine package metadata](https://pkgs.alpinelinux.org/package/v3.24/main/x86_64/libatomic) declares `GPL-2.0-or-later AND LGPL-2.1-or-later`, inherited from the GCC packaging recipe; [GCC 15.2 libatomic source notices](https://github.com/gcc-mirror/gcc/blob/releases/gcc-15.2.0/libatomic/gload.c#L1-L24) specify `GPL-3.0-or-later WITH GCC-exception-3.1`. This is a policy acceptance, not a finding that publishing the runtime has no license obligations: the [GCC Runtime Library Exception](https://github.com/gcc-mirror/gcc/blob/releases/gcc-15.2.0/COPYING.RUNTIME) does not waive applicable notice or source-distribution requirements for the library itself. Grant's `ignore-packages` mechanism applies by package name across scanned images and versions. The general license allowlist, vulnerability scanning, and vendored-image gates remain unchanged.
+
+### Container Vulnerability Exceptions
+
+`gh aw compile --grype` reads the optional `.grype.yaml` file at the repository root and applies its `ignore` rules. The file is reserved for documented risk acceptances: findings that have no fixed version available upstream, where there is nothing to upgrade to. Each rule is scoped to a specific vulnerability ID, package, and affected version so newly disclosed vulnerabilities and rebuilt packages are still reported, and each carries a `reason` explaining the acceptance. Remove a rule as soon as the upstream image ships a fix — the daily container scan runs `gh aw compile --force-refresh-container-pins` and picks up rebuilt base images automatically. When `.grype.yaml` is absent, grype runs with its defaults.
 
 ### Before Adding a Dependency
 
@@ -495,9 +549,185 @@ Dependabot prioritizes security patches:
 For comprehensive testing guidelines including assert vs require usage, table-driven test patterns, and best practices, see **[scratchpad/testing.md](scratchpad/testing.md)**.
 
 Quick reference:
-- `make test-unit` - Fast unit tests (~25s)
-- `make test` - Full test suite (~30s)
-- `make agent-finish` - Complete validation before committing
+- `make test-unit` - Impacted Go tests (30-second selected-runtime budget; compilation is additional)
+- `make test-unit-all` - Full Go unit test suite
+- `make test-unit-fast` - All unit tests except measured >=10s tests
+- `make test-unit-slow` - Only measured >=10s unit tests
+- `make agent-report-progress` - Final branch-scoped validation before pushing
+- `make agent-finish` - Explicit repository-wide maintenance sweep; not an inner-loop command
+
+### CI Front Door
+
+CGO uses `scripts/ci-front-door.cjs` on PRs to filter optional check jobs,
+including slow Go tests, security checks, linters, conformance, builds, fuzzing,
+and both macOS and Windows. The fast Go unit suite and its integration compilation
+prerequisite always run. Main-branch pushes,
+manual runs, and the weekly scheduled control run all applicable suites without
+calling the Decision API. CJS and Windows CI are unchanged.
+
+Benchmarks run separately in `.github/workflows/benchmarks.yml`, only on main
+pushes, weekly schedules, or manual main-branch runs, never on PRs. CLI,
+workflow, workqueue, and other benchmark packages run in parallel. Workqueue
+replay uses one iteration per size instead of three; all sizes are retained.
+Routine benchmarks exclude external Zizmor/Poutine scanner invocations, which
+can measure container startup or timeouts rather than Go performance; the
+separate CGO security scan is unchanged. `make bench` still runs the full set
+locally. Use `BENCH_PACKAGES`, `BENCH_TIME`, and `BENCH_SKIP` to narrow a run.
+Each shard publishes its own results and compares with its previous main-branch
+baseline; the first run establishes the new shard baseline.
+
+The selector uses GitHub Decisions at
+`https://api.githubcopilot.com/v1/decisions` with model `gpt-6-luna-decisions`.
+Only the dedicated `front-door-decision` job has `copilot-requests: write`;
+`checkout-cache`, tests, cache restores, and conformance checks do not receive
+this permission. The selection step passes the built-in workflow token through
+`CI_DECISION_TOKEN`. It runs the selector, shared client, catalog, prompt, and
+selection logic from a separate checkout pinned to the PR's trusted base
+SHA. SHA-pinned GitHub API evidence supplies the PR merge commit's first-parent
+diff without a second checkout; no PR-controlled code runs in this job.
+The checkout disables credential persistence. During initial rollout, a missing
+trusted selector is skipped and older trusted versions fall back to all suites;
+the PR implementation is never used to bootstrap credential-bearing execution.
+No endpoint variable or PAT is needed, and credentials are never sent to another
+host. Missing tokens or denied inference permissions, including restricted fork
+PRs, run all suites.
+A configured token makes one POST containing the diff summary and a named
+safe-to-omit predicate for every catalog job. The model decides relevance;
+there is no path allowlist or mandatory check-job list. Invalid inputs,
+empty/unavailable/incomplete evidence, and selector-policy changes bypass
+inference and retain all jobs.
+There are no retries or redirects. Diff-evidence API requests are counted
+separately. Checkout, existing CI cache/artifact
+actions, and timing collection are outside this selector boundary.
+
+The request includes `diff_summary`, `suite_catalog`, and the versioned prompt.
+The summary uses only the merge commit's first-parent diff, retaining the first
+`.lock.yml` in sorted path order as a representative generated sample and
+excluding all other generated locks before inventory and patch budgets apply.
+The sample is representative generated evidence, not an eligibility rule.
+It separates `.js`/`.cjs`, `.go`, and
+other files into `javascript`, `go`, and `other` groups. Each group retains its
+filenames and up to 8,000 UTF-8 patch bytes; `patch_truncated` explicitly marks
+partial snippets. Large patches do not discard the file inventory or consume
+another group's patch budget. Decisions must treat missing hunks conservatively.
+Incomplete inventories (more than 2,000 retained paths or a 128 KiB summary),
+unavailable history, and selector-policy changes still force all suites.
+The API path uses one immutable-SHA comparison. At its 300-file cap, the selector
+instead paginates the immutable merge commit's files, verifying its SHA and
+first parent against the event on every page before filtering locks. A raw
+3,000-file ceiling, 2 MiB per-response bound, or shared 10-second evidence
+deadline still fails open. Local `CI_DIFF_WORKSPACE` evidence never fetches.
+
+GitHub returns a named safe-to-omit predicate for each check job.
+Probabilities at least 0.9 permit omission of optional suites; lower probabilities
+retain the suite. A refusal, missing/duplicate/unknown answer,
+malformed JSON, non-200 status, 10-second deadline, or more than 16 KiB of response
+data forces all suites. The adapter preserves normalized replay responses such
+as `{"suite_ids":["build-wasm"],"confidence":0.95}`. Selected jobs retain
+their direct and transitive prerequisites: `test` and `test-slow` require
+`verify-integration-build`, `canary-go` requires both unit suites, and `security`,
+`security-scan`, and `cross-platform-build` require `build`.
+Invalid IDs or missing prerequisites are rejected before reaching downstream job
+conditions. A skipped or failed decision job, step failure, or missing outputs
+also runs all check jobs. Selection runs independently of the checkout
+cache; all check jobs wait for its validated output on PRs. Cross-platform
+selection enables or omits both macOS and Windows together.
+Pushes and other non-PR events skip the decision job without suppressing
+any suite.
+
+The decision step summary shows retained and omitted suite counts at a glance.
+Expand **Suite selection and diagnostics** to see the suite IDs, fallback reason
+when applicable, and metrics. The selector still emits JSON to stdout and keeps
+its workflow outputs machine-readable.
+
+The same model-driven selection and prerequisite closure apply during
+recorded-response replay. Source, test-only, dependency, configuration, and
+unknown paths all reach the model; no path category automatically forces all
+jobs to run or skip. This is a relevance decision, not a guarantee of safety:
+uncertain answers retain the associated suite, and independent full runs remain the
+control for missed regressions.
+
+`.github/ci/suite-catalog.json` has schema version 1 and entries with a stable
+`id`, short `description`, `mandatory` flag, and
+`historical_duration_seconds` (nonnegative seconds, or `null` for unknown).
+The `test` suite is mandatory; its prerequisite is included by the runtime.
+IDs match CGO check jobs.
+Adding a suite requires updating both the catalog and the runtime's fixed ID
+list, plus job wiring and tests. Never invent historical durations.
+
+### CGO unit-test timing
+
+The split uses completed top-level `pass`/`fail` events (not subtests) from
+[failed run 44921173289](https://github.com/github/gh-aw/actions/runs/44921173289)
+and [successful run 44880152498](https://github.com/github/gh-aw/actions/runs/44880152498),
+both on 2026-11-21. The ten slowest tests by maximum observed elapsed time:
+
+| Test | Package | Failed-run seconds | Successful-run seconds |
+|------|---------|-------------------:|-----------------------:|
+| `TestRepositoryAgenticWorkflows` | `pkg/workflow/lint` | 103.57 | 130.67 |
+| `TestRepositoryWorkflowsCompileWithoutEmitting` | `pkg/workflow` | 45.80 | 57.81 |
+| `TestLastAttemptCompletionCanSpendReservedClosureBytes` | `pkg/workqueue` | 50.39 | 44.70 |
+| `TestLinearAutomaticLookupFrozenHosts` | `pkg/workflow` | 35.79 | 33.71 |
+| `TestAzureBoundedReadersBundledNode` | `pkg/workflow` | 25.72 | 23.42 |
+| `TestCompileJSONOptionalScannerFindings` | `pkg/cli` | 15.05 | 22.00 |
+| `TestLintCacheModeLiteralsCLI` | `pkg/cli` | 19.12 | 20.29 |
+| `TestAzureDevOpsConnectorBundledNodeResponseIdentity` | `pkg/workflow` | 19.77 | 18.42 |
+| `TestNestedImportHashGoJavaScriptParity` | `pkg/parser` | 13.39 | 18.76 |
+| `TestUpdateUpgradeAutoMergeOrgDispatchErrors` | `pkg/cli` | 16.01 | 16.01 |
+
+The failed H-J shard's test step lasted 212 seconds, but its failure,
+`TestJavaScriptSummaryCatalogSourceIdentity`, took 0.00 seconds. Its reviewed
+runtime source hash no longer matched the source. This is an assertion failure,
+not a timeout or a slow-test failure; it remains in the fast suite. Compilation,
+setup and preceding tests delay feedback even for instantaneous failures.
+The A and N-R shards' longest package durations were 153.56 and 166.35 seconds.
+
+`.github/ci/go-unit-slow-tests.json` records the 20 tests taking at least
+10 seconds in either run, their packages, maxima, and four slow shards.
+The `test` job retains 12 alphabetical fast shards and excludes exactly those
+top-level names with `-skip`. `test-slow` runs those names with anchored `-run`
+patterns and five-minute package timeouts. Shared steps preserve coverage and
+failure artifacts under unique shard names. New tests default to fast; refresh
+the manifest from complete CGO artifacts when timings change. Move a whole
+top-level test, including all subtests, and keep its shard unique.
+
+The front door retains the fast suite (including new or unmeasured tests).
+It can omit the slow suite only when its coverage is unaffected. Selecting the
+coverage canary retains both. Main pushes, scheduled controls, and invalid/missing
+decisions still run both. The researcher mines cached test and job timing to
+identify candidates with critical-path savings rather than treating every slow
+test as skippable. Split-suite runner durations remain `null` in the
+catalog until measured: per-test times and old shard times cannot establish
+split-suite runner-minutes or a guaranteed fast-suite wall-clock budget.
+Local `test-unit-fast` and `test-unit-slow` retain the full suite's `-short`
+behavior; CI retains its existing non-short behavior.
+
+Download existing artifacts and rank tests without double-counting subtests:
+
+```bash
+gh run download RUN_ID --pattern 'test-result-cgo-unit-*' --dir "$TMPDIR/cgo-results"
+find "$TMPDIR/cgo-results" -name '*.json' -exec cat {} + |
+  jq -r 'select((.Action == "pass" or .Action == "fail") and .Test != null and (.Test | contains("/") | not)) | [.Elapsed, .Package, .Test, .Action] | @tsv' |
+  sort -rn | head -20
+```
+
+Run `node --test scripts/ci-front-door.test.cjs scripts/ci-front-door-workflow.test.cjs`
+for selector and workflow trust-boundary conformance checks.
+Offline evaluation uses
+`node scripts/ci-front-door-evaluate.cjs .github/ci/suite-catalog.json RECORDS.json`.
+The input is an object containing `records`. Each record has a unique `id`,
+`diff_summary`, cached `response`, optional per-suite `durations_seconds`,
+`api_requests: {decision, github}`, and, for full-run controls, `full_run: true`
+with `failed_suite_ids` (an empty array means observed success). Replay never
+calls an API. It reports selected suite count, estimated minutes saved, observed
+misses, API counts, and missing evidence separately. Missing outcomes are not
+zero regressions, and recorded-response replay alone cannot validate a new
+model prompt. Savings are estimates, not measured billing reductions.
+
+The manually invoked `ci-front-door-researcher` consumes restored PR/run evidence, reports
+cache gaps without downloading replacements, and proposes evidence-backed draft
+PRs for catalog or policy changes. Require historical replay and independent
+full-run controls before accepting a more selective policy.
 
 ### Compiling against a different actions repository
 
@@ -559,6 +789,21 @@ The team follows a **weekly or bi-weekly minor release cadence**, similar to VS 
 
 > **Note:** The release workflow publishes the new version as a **prerelease** on GitHub with `latest=false`. Prereleases are floated for a few days. On Monday, maintainers promote the last known good prerelease to stable so `latest` resolves to that release. Immediately after promotion, a new minor pre-release is kicked off to start the next cycle.
 
+### Release credential changes
+
+Changes to release credential minting, token selection, permissions, or checkout credential persistence require an explicit human security sign-off before merge, including any attempt to reintroduce GitHub App authentication. Record the approving maintainer/security reviewer's identity and link to their approval in the PR description. Automated review, compilation, and the release environment approval are not substitutes for this sign-off.
+
+The PR must document:
+
+- **Scope:** The credential's target repositories and minimum permissions, with a justification for each write permission. A tag-only push does not require `workflows: write`.
+- **Availability and exposure:** For an App token, evidence that the App is installed on the target repository with the required permissions; which steps receive the token; whether checkout persists it for later build steps; and how it is revoked or removed. Do not include token or private-key values.
+- **Validation:** Review both the workflow source and regenerated lock file, including failure handling and downstream-trigger behavior. App-token tag pushes can trigger workflows that `GITHUB_TOKEN` pushes do not.
+- **Rollback:** The known-good credential path, rollback steps, and any previous revert's cause and unresolved review findings.
+
+#### Previous App-token revert
+
+[PR #60214](https://github.com/github/gh-aw/pull/60214) added an App token to the release tag checkout. [PR #60218](https://github.com/github/gh-aw/pull/60218) records the revert reason: the configured `APP_ID` was not installed on `github/gh-aw`, so token minting failed with HTTP 404 before tag creation. The revert restored the `GITHUB_TOKEN`-backed checkout and tag push; it was not a security sign-off for a future attempt. The original [automated review](https://github.com/github/gh-aw/pull/60214#discussion_r3986689467) also flagged unnecessary workflow-write permission and credential exposure to later build steps. Address both the installation failure and these review concerns before reintroducing App-token minting.
+
 ### Steps
 
 1. **Launch the release action**
@@ -573,7 +818,7 @@ The team follows a **weekly or bi-weekly minor release cadence**, similar to VS 
 
    a. **Run the sync-actions workflow** — go to [Actions → sync-actions](https://github.com/github/gh-aw-actions/actions/workflows/sync-actions.yml) and trigger it with the new release tag (e.g. `v1.2.3`).
 
-   b. **Merge the PR** — the sync-actions workflow will open a pull request in `github/gh-aw-actions`. Review and merge it to bring the tag into that repository.
+   b. **Merge the PR** — the sync-actions workflow will open a pull request in `github/gh-aw-actions`. Review and merge it to bring the tag into that repository. The downstream release is created as a **draft**; leave it unpublished while the `gh-aw` prerelease is being evaluated.
 
 3. **Approve the environment gate**
 
@@ -583,9 +828,11 @@ The team follows a **weekly or bi-weekly minor release cadence**, similar to VS 
 
    After floating prereleases for a few days and confirming stability, on Monday:
 
-   a. **Edit the GitHub release** — go to the [Releases page](https://github.com/github/gh-aw/releases), open the new prerelease, uncheck **This is a pre-release**, and save. This promotes the release to a stable full release.
+   a. **Publish `gh-aw-actions` first** — open the matching tag's draft on the [`github/gh-aw-actions` Releases page](https://github.com/github/gh-aw-actions/releases). Ensure **This is a pre-release** is unchecked, select **Set as the latest release**, and publish it. If it is already published, edit it to make it stable and latest. This manual step is mandatory: no cross-repository write token is maintained to publish or promote it automatically.
 
-   b. **Move `latest` to the promoted release** — GitHub resolves `latest` to the most recent non-prerelease release. Promoting the selected prerelease in step (a) updates `latest` automatically.
+   b. **Promote the same tag in `gh-aw`** — run [Actions → Promote Release to Latest](https://github.com/github/gh-aw/actions/workflows/promote-release.yml) with that exact version. The workflow refuses promotion unless `github/gh-aw-actions` already reports that tag as its published, stable latest release, then clears the `gh-aw` prerelease flag and explicitly sets it as latest.
+
+   c. **Verify alignment** — confirm that both repositories' latest releases use the same tag. The **Validate latest release alignment** CI check also verifies this on every CI run, including hourly scheduled runs without recent commits.
 
    Users who install with `version: latest` (the default) will now receive the new release.
 
@@ -611,16 +858,22 @@ Run sync-actions in github/gh-aw-actions (with new tag)
 Merge the sync-actions PR
         │
         ▼
+gh-aw-actions release remains a draft
+        │
+        ▼
 Approve the gh-aw-actions-release environment gate
         │
         ▼
 Release published as prerelease 🎉
         │
         ▼  (Monday — manual)
-Promote prerelease → full release on GitHub Releases page
+Manually publish gh-aw-actions draft as stable & latest FIRST
         │
         ▼
-'latest' now resolves to the new version ✅
+Run Promote Release to Latest in gh-aw with the same tag
+        │
+        ▼
+Both repositories' latest releases now match ✅
         │
         ▼  (same day — start next cycle)
 Launch next minor release action → new prerelease published
@@ -641,3 +894,14 @@ Community members contribute by crafting detailed agentic plans that the core te
 The [Development Guide](DEVGUIDE.md) is the reference guide used by core team members and their agents.
 
 Thank you for contributing to GitHub Agentic Workflows! 🤖🎉
+
+
+## Repository Topics (Maintainer Note)
+
+To improve discoverability in GitHub search and AI assistant recommendations, the repository should have these topics set (via repository Settings → Topics — must be done by a maintainer with admin access):
+
+```
+github-actions  ai-agents  claude  copilot  automation  openai  gemini  agentic-workflows  continuous-ai  safe-outputs
+```
+
+These map to the most common search queries the project serves: "claude code github actions", "ai agents github", "copilot automation", "automated pr review ai", etc.

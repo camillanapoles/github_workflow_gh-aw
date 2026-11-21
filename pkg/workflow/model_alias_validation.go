@@ -22,17 +22,29 @@ package workflow
 
 import (
 	"fmt"
+	"maps"
 	"math"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/github/gh-aw/pkg/console"
+	"github.com/github/gh-aw/pkg/logger"
 	"github.com/github/gh-aw/pkg/setutil"
 	"github.com/github/gh-aw/pkg/sliceutil"
 )
 
-var modelAliasValidationLog = newValidationLogger("model_alias")
+var modelAliasValidationLog = logger.New("workflow:model_alias_validation")
+
+// builtinCycleCheckOnce caches the result of the first cycle-detection DFS over
+// the pure builtin alias map.  The builtins are a compile-time constant so cycles
+// can only appear once; checking them on every ParseWorkflowFile call is wasteful.
+var (
+	builtinCycleCheckOnce sync.Once
+	builtinCycleCheckErr  error
+)
 
 // ─── Known-parameter validation ───────────────────────────────────────────────
 
@@ -130,7 +142,25 @@ func (c *Compiler) validateModelAliasMap(
 	}
 
 	// Validate user-supplied frontmatter aliases only (builtins are pre-validated).
-	for key, entries := range frontmatterModels {
+	if err := c.validateUserModelAliases(frontmatterModels, markdownPath); err != nil {
+		return err
+	}
+
+	// V-MAF-010: detect circular alias references across the merged map.
+	if err := detectCircularModelAliases(mergedAliasMap, markdownPath); err != nil {
+		return err
+	}
+
+	modelAliasValidationLog.Print("Model alias map validation passed")
+	return nil
+}
+
+// validateUserModelAliases runs the key and entry checks (V-MAF-001..006, V-MAF-011) on one
+// user-supplied alias map: the main workflow's models: aliases or one imported workflow's.
+// Keys are checked in sorted order so the first reported error is deterministic.
+func (c *Compiler) validateUserModelAliases(models map[string][]string, markdownPath string) error {
+	for _, key := range slices.Sorted(maps.Keys(models)) {
+		entries := models[key]
 		// V-MAF-005: alias keys MUST NOT contain "/", "?", or "&".
 		if err := validateAliasKey(key, markdownPath); err != nil {
 			return err
@@ -144,13 +174,6 @@ func (c *Compiler) validateModelAliasMap(
 		// V-MAF-011: warn about unrecognised parameter keys in each entry.
 		c.warnUnrecognizedModelParams(entries, markdownPath)
 	}
-
-	// V-MAF-010: detect circular alias references across the merged map.
-	if err := detectCircularModelAliases(mergedAliasMap, markdownPath); err != nil {
-		return err
-	}
-
-	modelAliasValidationLog.Print("Model alias map validation passed")
 	return nil
 }
 
@@ -241,6 +264,27 @@ func (c *Compiler) warnUnrecognizedModelParams(identifiers []string, markdownPat
 func detectCircularModelAliases(aliasMap map[string][]string, markdownPath string) error {
 	modelAliasValidationLog.Printf("Checking for circular alias references in %d aliases", len(aliasMap))
 
+	// Fast path: the builtin alias map is a compile-time constant and cycle-free by
+	// construction.  Cache the result of the first DFS check so that the expensive
+	// sort + 52-node traversal is skipped on subsequent ParseWorkflowFile calls that
+	// use only builtins (no imports, no frontmatter overrides).
+	if isBuiltinOnlyAliasMap(aliasMap) {
+		builtinCycleCheckOnce.Do(func() {
+			// Builtin aliases are cycle-free by construction (validated in CI).
+			// Pass a sentinel path so that if a cycle is ever introduced into the
+			// builtin data (a bug) the error message clearly identifies the source
+			// rather than referencing a caller's workflow path.
+			builtinCycleCheckErr = detectCircularModelAliasesUnoptimized(aliasMap, "<builtin-aliases>")
+		})
+		return builtinCycleCheckErr
+	}
+
+	return detectCircularModelAliasesUnoptimized(aliasMap, markdownPath)
+}
+
+// detectCircularModelAliasesUnoptimized is the full DFS implementation used when the
+// alias map may include user-defined aliases (imports or frontmatter overrides).
+func detectCircularModelAliasesUnoptimized(aliasMap map[string][]string, markdownPath string) error {
 	// visited tracks keys for which all DFS descendants have been fully explored
 	// (no cycle detected from that key).
 	visited := map[string]struct {

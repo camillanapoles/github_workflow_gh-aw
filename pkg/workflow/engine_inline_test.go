@@ -109,19 +109,55 @@ func TestExtractEngineConfig_InlineDefinition(t *testing.T) {
 			expectedEngineSetting: "claude",
 			expectInlineFlag:      true,
 		},
+		{
+			name: "engine.model overrides top-level model in inline engine",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"runtime": map[string]any{
+						"id": "codex",
+					},
+					"model": "gpt-4o",
+				},
+				"model": "gpt-5",
+			},
+			expectedID:            "codex",
+			expectedModel:         "gpt-4o",
+			expectedEngineSetting: "codex",
+			expectInlineFlag:      true,
+		},
+		{
+			name: "engine.model in inline engine (no top-level model)",
+			frontmatter: map[string]any{
+				"engine": map[string]any{
+					"runtime": map[string]any{
+						"id": "codex",
+					},
+					"model": "gpt-4o",
+				},
+			},
+			expectedID:            "codex",
+			expectedModel:         "gpt-4o",
+			expectedEngineSetting: "codex",
+			expectInlineFlag:      true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c := NewCompiler()
-			engineSetting, config := c.ExtractEngineConfig(tt.frontmatter)
+			var engineSetting string
+			var config *EngineConfig
+			var model string
+			stderr := captureStderr(func() {
+				engineSetting, config, model = c.ExtractEngineConfig(tt.frontmatter)
+			})
 
 			require.NotNil(t, config, "should return non-nil EngineConfig for inline definition")
 			assert.Equal(t, tt.expectedEngineSetting, engineSetting, "engineSetting should equal runtime.id")
 			assert.Equal(t, tt.expectedID, config.ID, "config.ID should equal runtime.id")
 			assert.Equal(t, tt.expectInlineFlag, config.IsInlineDefinition, "IsInlineDefinition flag should be set")
 			assert.Equal(t, tt.expectedVersion, config.Version, "Version should match runtime.version")
-			assert.Equal(t, tt.expectedModel, config.Model, "Model should match provider.model")
+			assert.Equal(t, tt.expectedModel, model, "Model should match provider.model")
 			assert.Equal(t, tt.expectedProviderID, config.InlineProviderID, "InlineProviderID should match provider.id")
 			if tt.expectedSecret != "" {
 				require.NotNil(t, config.InlineProviderAuth, "InlineProviderAuth should be set when secret is expected")
@@ -130,6 +166,9 @@ func TestExtractEngineConfig_InlineDefinition(t *testing.T) {
 				assert.Nil(t, config.InlineProviderAuth, "InlineProviderAuth should be nil when provider.auth is omitted")
 			}
 			assert.Equal(t, tt.expectedPermission, config.PermissionMode, "PermissionMode should match engine.permission-mode")
+
+			assert.NotContains(t, stderr, "engine.model' is deprecated",
+				"engine.model should no longer emit a deprecation warning")
 		})
 	}
 }
@@ -143,7 +182,7 @@ func TestExtractEngineConfig_InlineDefinition_NotTriggeredByIDField(t *testing.T
 			"id": "copilot",
 		},
 	}
-	_, config := c.ExtractEngineConfig(frontmatter)
+	_, config, _ := c.ExtractEngineConfig(frontmatter)
 
 	require.NotNil(t, config, "should return non-nil EngineConfig")
 	assert.Equal(t, "copilot", config.ID, "ID should be set from 'id' field")
@@ -159,7 +198,7 @@ func TestExtractEngineConfig_LegacyStringFormat_Regression(t *testing.T) {
 	for _, engineID := range []string{"copilot", "claude", "codex", "gemini"} {
 		t.Run(engineID, func(t *testing.T) {
 			frontmatter := map[string]any{"engine": engineID}
-			engineSetting, config := c.ExtractEngineConfig(frontmatter)
+			engineSetting, config, _ := c.ExtractEngineConfig(frontmatter)
 
 			require.NotNil(t, config, "should return non-nil EngineConfig for string format")
 			assert.Equal(t, engineID, engineSetting, "engineSetting should equal the engine string")
@@ -181,8 +220,8 @@ func TestValidateEngineInlineDefinition_MissingRuntimeID(t *testing.T) {
 
 	err := c.validateEngineInlineDefinition(config)
 	require.Error(t, err, "missing runtime.id should return an error")
-	assert.Contains(t, err.Error(), "runtime.id", "error should mention the missing field")
-	assert.Contains(t, err.Error(), string(constants.DocsEnginesURL), "error should include docs URL")
+	require.ErrorContains(t, err, "runtime.id", "error should mention the missing field")
+	require.ErrorContains(t, err, string(constants.DocsEnginesURL), "error should include docs URL")
 }
 
 // TestValidateEngineInlineDefinition_ValidRuntimeID verifies that a valid inline
@@ -263,7 +302,7 @@ func TestInlineEngineDefinition_ResolvesViaCatalog(t *testing.T) {
 		},
 	}
 
-	_, config := c.ExtractEngineConfig(frontmatter)
+	_, config, _ := c.ExtractEngineConfig(frontmatter)
 	require.NotNil(t, config, "should extract EngineConfig from inline definition")
 	require.True(t, config.IsInlineDefinition, "should be flagged as inline definition")
 
@@ -294,11 +333,11 @@ func TestInlineEngineDefinition_UnknownRuntimeID(t *testing.T) {
 	// validateEngineInlineDefinition should catch the unknown runtime ID with a clear error.
 	err := c.validateEngineInlineDefinition(config)
 	require.Error(t, err, "unknown runtime.id should produce a validation error")
-	assert.Contains(t, err.Error(), "nonexistent-runtime",
+	require.ErrorContains(t, err, "nonexistent-runtime",
 		"error should mention the unknown runtime ID")
-	assert.Contains(t, err.Error(), "runtime.id",
+	require.ErrorContains(t, err, "runtime.id",
 		"error should mention the 'runtime.id' field")
-	assert.Contains(t, err.Error(), string(constants.DocsEnginesURL),
+	require.ErrorContains(t, err, string(constants.DocsEnginesURL),
 		"error should include the docs URL")
 }
 
@@ -317,7 +356,7 @@ func TestExtractEngineConfig_InlineDefinition_Bare(t *testing.T) {
 			},
 		}
 
-		_, config := compiler.ExtractEngineConfig(frontmatter)
+		_, config, _ := compiler.ExtractEngineConfig(frontmatter)
 		require.NotNil(t, config, "inline definition with bare:true should produce a config")
 		assert.True(t, config.IsInlineDefinition, "Expected inline definition")
 		assert.True(t, config.Bare, "Expected Bare=true for inline definition with bare:true")
@@ -333,7 +372,7 @@ func TestExtractEngineConfig_InlineDefinition_Bare(t *testing.T) {
 			},
 		}
 
-		_, config := compiler.ExtractEngineConfig(frontmatter)
+		_, config, _ := compiler.ExtractEngineConfig(frontmatter)
 		require.NotNil(t, config, "inline definition with bare:false should produce a config")
 		assert.True(t, config.IsInlineDefinition, "Expected inline definition")
 		assert.False(t, config.Bare, "Expected Bare=false")
@@ -348,7 +387,7 @@ func TestExtractEngineConfig_InlineDefinition_Bare(t *testing.T) {
 			},
 		}
 
-		_, config := compiler.ExtractEngineConfig(frontmatter)
+		_, config, _ := compiler.ExtractEngineConfig(frontmatter)
 		require.NotNil(t, config, "inline definition without bare field should produce a config")
 		assert.True(t, config.IsInlineDefinition, "Expected inline definition")
 		assert.False(t, config.Bare, "Expected Bare=false by default for inline definition")

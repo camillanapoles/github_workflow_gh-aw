@@ -94,13 +94,13 @@ func renderOrgActionSummary(preview orgRepoPreview, action string) {
 			fmt.Fprintln(os.Stderr, console.FormatListItemStderr(fmt.Sprintf("%s: %s -> %s", wf.Name, wf.CurrentRef, wf.LatestRef)))
 		}
 	}
-	currentVersion := normalizeDisplayVersion(preview.CurrentVersion)
+	currentVersion := formatUpgradeCompilerVersions(preview)
 	targetVersion := normalizeDisplayVersion(GetVersion())
-	if currentVersion != "" {
+	if len(preview.CurrentVersions) > 0 || preview.UnknownVersionLocks > 0 || preview.MissingWorkflowLocks > 0 {
 		if targetVersion != "" && targetVersion != currentVersion {
-			fmt.Fprintln(os.Stderr, console.FormatListItemStderr(fmt.Sprintf("Compiler version: %s -> %s", currentVersion, targetVersion)))
+			fmt.Fprintln(os.Stderr, console.FormatListItemStderr(fmt.Sprintf("Compiler versions: %s -> %s", currentVersion, targetVersion)))
 		} else {
-			fmt.Fprintln(os.Stderr, console.FormatListItemStderr("Compiler version: "+currentVersion))
+			fmt.Fprintln(os.Stderr, console.FormatListItemStderr("Compiler versions: "+currentVersion))
 		}
 	}
 }
@@ -135,7 +135,12 @@ func confirmOrgAction(preview orgRepoPreview, action string, autoYes bool) (bool
 //  6. Calls cbs.ReportFn to display the summary.
 //  7. When createPR or createIssue is set, iterates through results calling
 //     cbs.ApplyFn or cbs.IssueFn, continuing past per-repo errors.
+//
+//nolint:largefunc // Preserve the legacy scan, confirmation, and issue-creation flow for existing callers.
 func runCommandForOrg(ctx context.Context, org string, repoGlobs []string, cbs orgRunCallbacks, createPR bool, createIssue bool, verbose bool) error {
+	if opts := orgRolloutFromContext(ctx); opts != nil && !opts.worker {
+		return runOrgRollout(ctx, org, repoGlobs, cbs, createPR, createIssue, verbose, *opts)
+	}
 	if strings.TrimSpace(org) == "" {
 		return errors.New("--org cannot be empty")
 	}
@@ -235,12 +240,21 @@ func runCommandForOrg(ctx context.Context, org string, repoGlobs []string, cbs o
 
 			preview, include, scanErr := cbs.ScanFn(ctx, repo, verbose)
 			if scanErr != nil {
+				if err := emitUpdateEvent(ctx, updateJSONLEvent{Event: "repository_completed", Repository: repo, Status: "failed", Error: scanErr.Error()}); err != nil {
+					return err
+				}
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Skipping %s: %v", repo, scanErr)))
 				orgRunnerLog.Printf("Failed to scan %s: %v", repo, scanErr)
 				continue
 			}
 			if !include {
+				if err := emitUpdateEvent(ctx, updateJSONLEvent{Event: "repository_completed", Repository: repo, Status: "unchanged"}); err != nil {
+					return err
+				}
 				continue
+			}
+			if err := reportUpdatePreview(ctx, preview, "planned"); err != nil {
+				return err
 			}
 			results = append(results, preview)
 		}
@@ -324,7 +338,11 @@ func runCommandForOrg(ctx context.Context, org string, repoGlobs []string, cbs o
 				continue
 			}
 			attempted++
-			if err := cbs.IssueFn(ctx, result, verbose); err != nil {
+			issueErr := cbs.IssueFn(withUpdateRepository(ctx, result.Repo), result, verbose)
+			if err := reportUpdateRepositoryCompletion(ctx, result.Repo, issueErr); err != nil {
+				return err
+			}
+			if err := issueErr; err != nil {
 				fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Skipping %s: %v", result.Repo, err)))
 				orgRunnerLog.Printf("Failed to create issue in %s: %v", result.Repo, err)
 				continue
@@ -378,7 +396,11 @@ func runCommandForOrg(ctx context.Context, org string, repoGlobs []string, cbs o
 			continue
 		}
 		attempted++
-		if err := cbs.ApplyFn(ctx, result, verbose); err != nil {
+		applyErr := cbs.ApplyFn(withUpdateRepository(ctx, result.Repo), result, verbose)
+		if err := reportUpdateRepositoryCompletion(ctx, result.Repo, applyErr); err != nil {
+			return err
+		}
+		if err := applyErr; err != nil {
 			fmt.Fprintln(os.Stderr, console.FormatWarningMessage(fmt.Sprintf("Skipping %s: %v", result.Repo, err)))
 			orgRunnerLog.Printf("Failed to apply to %s: %v", result.Repo, err)
 			continue

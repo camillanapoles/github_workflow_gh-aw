@@ -2,8 +2,10 @@
 emoji: "🔎"
 description: Daily analysis of detection jobs to identify misconfigured workflows and compare performance between regular runs and runs using the gh-aw detection feature
 on:
-  schedule: daily
+  schedule:
+    - cron: "05 23 * * *" # Offset from other nightly scheduled workflows
   workflow_dispatch:
+timeout-minutes: 45
 max-ai-credits: 1500
 max-daily-ai-credits: 10000
 permissions:
@@ -29,11 +31,15 @@ imports:
     with:
       title-prefix: "[detection-analysis] "
       expires: 3d
+  - uses: shared/aw-logs-24h-fetch-setup.md
+  - shared/reporting.md
 features:
   gh-aw-detection: true
-sandbox:
-  agent:
-    sudo: false
+evals:
+  - id: detection_runs_analyzed
+    question: Did the agent analyze detection jobs for workflow misconfiguration and performance differences?
+  - id: detection_report_created
+    question: Did the agent create a report with evidence-backed detection findings or recommendations?
 ---
 
 # Detection Analysis Report
@@ -49,7 +55,7 @@ You are the Detection Analysis Agent. Your goal is to analyze the last 24 hours 
 
 Generate a comparison chart showing how detection-enabled runs differ from regular runs:
 
-1. **Detection Feature Comparison**: A side-by-side grouped bar chart with two groups — "Regular Runs" (detection disabled or absent) and "Detection Runs" (`gh-aw-detection: true`) — plotting these metrics for each group:
+1. **Detection Feature Comparison**: A side-by-side grouped bar chart with two groups — "Regular Runs" (`gh-aw-detection: false`, i.e. the feature was explicitly opted out) and "Detection Runs" (`gh-aw-detection` enabled, which is the default when the flag is absent) — plotting these metrics for each group:
    - Total run count (left y-axis)
    - Success rate % (right y-axis, line overlay)
    - Average token usage (secondary chart or annotation)
@@ -62,89 +68,67 @@ Upload the chart using the `upload_asset` safe-output tool with the absolute pat
 
 ## Analysis Steps
 
-### Step 1 — Fetch Logs
+### Step 1 — Logs
 
-Use the `agentic-workflows` MCP `logs` tool to download workflow runs from the last 24 hours:
+{{#runtime-import? shared/aw-logs-24h-fetch-prompt.md}}
 
+Each run's `aw_info.json` contains `features["gh-aw-detection"]` (boolean), `status`, `total_tokens`, and `engine_id`. Use `features.gh-aw-detection` directly — do not infer detection status from `.lock.yml` files. Note that the key is only present when the workflow sets it explicitly; when it is missing, detection is **enabled** (the default).
+
+Each run's `run_summary.json` contains `job_details`, an array of `{name, conclusion, steps: [{name, status, conclusion}]}` for every GitHub Actions job in the run (e.g. `agent`, `detection`, `activation`). Use this for step-level failure attribution in Rule 3 below.
+
+### Analyze Runs
+
+In a single pass over the run directories at `/tmp/gh-aw/aw-mcp/logs`, classify and aggregate all runs:
+
+**Classify each run** using `features.gh-aw-detection` from `aw_info.json`. The `gh-aw-detection` feature is **enabled by default**, so an absent or unset value means detection is enabled:
+- **Detection-enabled**: value is `true`, absent, or unset
+- **Regular**: value is explicitly `false`
+
+Collect per-run: `workflow_name`, `status`, `total_tokens`, `engine_id`, `detection_enabled`, and (from `run_summary.json.job_details`) the `agent` job's `conclusion` and the `detection` job's `conclusion`.
+
+**Flag a workflow as misconfigured** when any of the following apply:
+1. `gh-aw-detection: false` on a workflow with >3 total runs in the last 7 days
+2. Run has detection enabled **and** the `detection` job in `job_details` itself has a failing `conclusion` (e.g. `failure`) — i.e. the detection job actually ran and a detection-specific step errored. Use `job_details` to attribute the failure precisely:
+   - Look up the `agent` and `detection` jobs by name in `job_details`.
+   - If the `agent` job is absent from `job_details` or has `conclusion: "skipped"`/`"cancelled"` (consistent with `TokenUsage: 0` and `ErrorCount: 0` in the run summary), the agent job never executed — this is **not** a detection-step failure; do not flag under rule 2 (it may indicate a trigger/permission issue worth noting separately, but is out of scope for this rule).
+   - Only flag rule 2 when the `detection` job (or a step within it) itself shows a failing conclusion in `job_details`. This job-level conclusion is the sole signal for rule 2 — do not fall back to `TokenUsage`/`ErrorCount` heuristics, which cannot distinguish a detection-step failure from an agent job that never started.
+3. Workflow alternates between detection-enabled and detection-disabled within the 24h window
+
+Do **not** flag a workflow merely because it lacks an explicit `gh-aw-detection: true` entry — that is the default configuration for most workflows and is not a misconfiguration.
+
+For each misconfigured workflow, record: `workflow_name`, `misconfiguration_type`, `run_count`, `example_run_id`, `recommended_fix`.
+
+**Save** aggregated metrics to `/tmp/gh-aw/python/data/metrics.json`:
+
+```json
+{
+  "regular_runs": <count>,
+  "detection_runs": <count>,
+  "regular_success_rate": <percent>,
+  "detection_success_rate": <percent>,
+  "regular_failure_count": <count>,
+  "detection_failure_count": <count>,
+  "regular_avg_tokens": <mean>,
+  "detection_avg_tokens": <mean>,
+  "misconfigured_count": <count>
+}
 ```
-Use the agentic-workflows MCP tool `logs` with parameters:
-- start_date: "-1d"
-Output is saved to: /tmp/gh-aw/aw-mcp/logs
-```
-
-Each run directory contains `aw_info.json` with fields including `engine_id`, `workflow`, `status`, `tokens`, and feature flags. The `gh-aw-detection` feature flag is stored under the `features` key in `aw_info.json` (e.g., `features.gh-aw-detection: true`). Use this field directly — do not infer detection status by scanning `.lock.yml` files.
-
-### Step 2 — Classify Runs
-
-For each run, classify it as:
-- **Detection-enabled**: `features.gh-aw-detection` is `true` in the run metadata
-- **Regular**: `features.gh-aw-detection` is `false`, absent, or unset
-
-Collect per-run:
-- `workflow_name`
-- `status` (success / failure / cancelled / timed_out)
-- `total_tokens` (from `aw_info.json`)
-- `engine_id`
-- `detection_enabled` (boolean)
-
-### Step 3 — Identify Misconfigured Workflows
-
-Flag a workflow as **misconfigured** when any of the following apply:
-
-1. **Detection explicitly disabled on an active workflow**: `gh-aw-detection: false` on a workflow that has completed more than 3 total runs (any status) in the last 7 days.
-2. **Detection feature absent on a workflow that is a known audit, analysis, or report workflow**: The workflow name contains keywords such as `audit`, `analyzer`, `report`, `detector`, `monitor`, or `inspector`, but lacks `gh-aw-detection: true`.
-3. **Detection job failures**: The run has `gh-aw-detection: true` but its detection-related job step failed or produced errors (check agent logs for detection-related error patterns).
-4. **Inconsistent detection state**: A workflow alternates between detection-enabled and detection-disabled runs within the same 24-hour window.
-
-For each misconfigured workflow, record:
-- `workflow_name`
-- `misconfiguration_type` (one of the four above)
-- `run_count`
-- `example_run_id`
-- `recommended_fix`
-
-### Step 4 — Compute Metrics
-
-Aggregate metrics for the chart and report:
-
-| Metric | Regular Runs | Detection Runs |
-|--------|-------------|----------------|
-| Total runs | count | count |
-| Success rate (%) | % | % |
-| Avg tokens | mean | mean |
-| Failure count | count | count |
-| Misconfigured count | — | count |
 
 ### Step 5 — Generate Chart
 
-Write a Python script to `/tmp/gh-aw/python/detection_comparison.py` that:
+```bash
+python3 .github/scripts/detection_comparison.py \
+  --metrics /tmp/gh-aw/python/data/metrics.json \
+  --output /tmp/gh-aw/python/charts/detection_comparison.png
+```
 
-- Reads aggregated metrics from `/tmp/gh-aw/python/data/metrics.json`
-- Produces a grouped bar chart comparing Regular vs. Detection-enabled runs:
-  - Left y-axis: run counts (stacked success/failure bars)
-  - Right y-axis: success rate % (line with markers)
-  - X-axis labels: "Regular Runs", "Detection Runs"
-  - Title: "Detection Feature Comparison — Last 24h"
-  - A horizontal annotation band highlighting any workflows with detection misconfigurations
-- Saves the chart to `/tmp/gh-aw/python/charts/detection_comparison.png` at 150 DPI
-- Uses a clean style (seaborn `whitegrid`, muted color palette)
+Upload the chart using the `upload_asset` safe-output tool. Record the returned asset URL and embed it in the discussion body.
 
 ### Step 6 — Historical Trending
 
-Append today's aggregated metrics to the cache-memory store so future runs can draw a trend line. Create the directory before writing if it does not exist:
+Use the `update-detection-trending` agent to append today's metrics to the cache-memory trending history and optionally generate a trend chart.
 
-```bash
-mkdir -p /tmp/gh-aw/cache-memory/trending/detection-metrics
-```
-
-- File: `/tmp/gh-aw/cache-memory/trending/detection-metrics/history.jsonl`
-- Fields: `timestamp`, `regular_runs`, `detection_runs`, `regular_success_rate`, `detection_success_rate`, `regular_avg_tokens`, `detection_avg_tokens`, `misconfigured_count`
-
-If history data exists (at least 7 days), generate a second trend chart:
-
-- **Detection Adoption Over Time**: Line chart showing `regular_runs` vs. `detection_runs` per day for the last 30 days, with a shaded area for the detection success rate band.
-- Save to: `/tmp/gh-aw/python/charts/detection_trend.png`
-- Upload with `upload_asset` and include in the report.
+If `/tmp/gh-aw/python/charts/detection_trend.png` was generated, upload it with `upload_asset` and embed in the report under "View Historical Trend".
 
 ---
 
@@ -199,3 +183,29 @@ Call `noop` with a brief explanation when:
 - State the evaluated window in the no-op message
 
 Example: `noop("No workflow runs found in the last 24 full hours (YYYY-MM-DDTHH:MM:SSZ to YYYY-MM-DDTHH:MM:SSZ)")`
+
+---
+
+## agent: `update-detection-trending`
+---
+model: small
+description: Appends detection metrics to cache-memory trending history and generates a trend chart when ≥7 days of data exist
+---
+Append today's detection metrics to the cache-memory trending history store.
+
+Create the directory before writing:
+
+```bash
+mkdir -p /tmp/gh-aw/cache-memory/trending/detection-metrics
+```
+
+Read `/tmp/gh-aw/python/data/metrics.json` and append one JSON line to `/tmp/gh-aw/cache-memory/trending/detection-metrics/history.jsonl`:
+
+```json
+{"timestamp": "<ISO-8601 UTC>", "regular_runs": N, "detection_runs": N, "regular_success_rate": X.X, "detection_success_rate": X.X, "regular_avg_tokens": X, "detection_avg_tokens": X, "misconfigured_count": N}
+```
+
+If the history file has ≥7 entries, generate a 30-day trend chart at `/tmp/gh-aw/python/charts/detection_trend.png`:
+- Line chart: `regular_runs` vs. `detection_runs` per day for the last 30 days
+- Shaded area band for the detection success rate
+- Style: seaborn whitegrid, 12×7 inches, 150 DPI
